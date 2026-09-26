@@ -123,6 +123,60 @@ fn query(db: &fontdb::Database, family: &str) -> Option<fontdb::ID> {
     })
 }
 
+/// Byte offset → cell column for one line of text.
+struct ColumnMap {
+    /// (byte, column, width in cells) per char, plus an end sentinel.
+    starts: Vec<(usize, u16, u16)>,
+}
+
+impl ColumnMap {
+    fn new(text: &str) -> Self {
+        let mut starts = Vec::with_capacity(text.len() + 1);
+        let mut col = 0u16;
+        for (i, ch) in text.char_indices() {
+            let w = char_cells(ch);
+            starts.push((i, col, w));
+            col += w;
+        }
+        starts.push((text.len(), col, 0));
+        Self { starts }
+    }
+
+    fn index(&self, byte: usize) -> usize {
+        match self.starts.binary_search_by_key(&byte, |&(b, _, _)| b) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        }
+    }
+
+    /// Column where the char at `byte` starts.
+    fn col(&self, byte: usize) -> u16 {
+        self.starts[self.index(byte)].1
+    }
+
+    /// Cell a cluster starting at `byte` belongs to, and how many cells its
+    /// pen sits right of that cell.
+    ///
+    /// Shapers normally keep combining marks, ZWJ and variation selectors in
+    /// their base's cluster. If one is split into its own cluster (none found
+    /// on macOS so far: cosmic-text falls back per grapheme), its start column
+    /// is the cell *after* the base. It is attributed to the base cell
+    /// instead (color, clipping at the last column, preedit suppression), and
+    /// the carry keeps the pen after the base's advance, where zero-advance
+    /// marks are designed to be drawn.
+    fn cluster_origin(&self, byte: usize) -> (u16, u16) {
+        let i = self.index(byte);
+        let raw = self.starts[i].1;
+        if self.starts[i].2 != 0 {
+            return (raw, 0);
+        }
+        match self.starts[..i].iter().rev().find(|&&(_, _, w)| w > 0) {
+            Some(&(_, base, _)) => (base, raw - base),
+            None => (raw, 0),
+        }
+    }
+}
+
 impl TextSystem {
     /// Loads system fonts (slow: do once). Falls back to SF Mono / Menlo
     /// when `family` is not installed.
@@ -281,18 +335,7 @@ impl TextSystem {
             self.text = text;
             return out;
         }
-        // Byte offset of every char start → cell column (plus an end sentinel).
-        let mut starts: Vec<(usize, u16)> = Vec::with_capacity(text.len() + 1);
-        let mut col = 0u16;
-        for (i, ch) in text.char_indices() {
-            starts.push((i, col));
-            col += char_cells(ch);
-        }
-        starts.push((text.len(), col));
-        let col_at = |byte: usize| match starts.binary_search_by_key(&byte, |&(b, _)| b) {
-            Ok(i) => starts[i].1,
-            Err(i) => starts[i.saturating_sub(1)].1,
-        };
+        let columns = ColumnMap::new(&text);
 
         let mut list = AttrsList::new(&attrs_for(&self.family, FontAttrs::default()));
         for (range, fa) in spans {
@@ -308,6 +351,8 @@ impl TextSystem {
         let mut cluster_scale = 1.0f32;
         let mut cluster_shift = 0.0f32;
         let mut cluster_skip = false;
+        let mut cluster_col = 0u16;
+        let mut cluster_carry = 0.0f32;
         for span in &shape.spans {
             for word in &span.words {
                 for g in &word.glyphs {
@@ -317,8 +362,11 @@ impl TextSystem {
                         let first = text[g.start..].chars().next().unwrap_or(' ');
                         let end = g.end.max(g.start + first.len_utf8()).min(text.len());
                         let single = end == g.start + first.len_utf8();
-                        let col = col_at(g.start);
-                        let cells = col_at(end).saturating_sub(col).max(1);
+                        let col = columns.col(g.start);
+                        let cells = columns.col(end).saturating_sub(col).max(1);
+                        let (origin, carry) = columns.cluster_origin(g.start);
+                        cluster_col = origin;
+                        cluster_carry = f32::from(carry) * self.cell_w;
                         cluster_skip = false;
                         if single && sprites::is_sprite(first) {
                             out.glyphs.push(ShapedGlyph {
@@ -366,7 +414,7 @@ impl TextSystem {
                     *self.usage.per_font.entry(g.font_id).or_default() += 1;
                     let size = font_px * cluster_scale;
                     out.glyphs.push(ShapedGlyph {
-                        col: col_at(g.start),
+                        col: cluster_col,
                         key: GlyphKey::Font {
                             font: g.font_id,
                             weight: g.font_weight.0,
@@ -374,7 +422,7 @@ impl TextSystem {
                             size_bits: size.to_bits(),
                             fake_italic: g.cache_key_flags.contains(CacheKeyFlags::FAKE_ITALIC),
                         },
-                        x: cluster_shift + (pen + g.x_offset) * size,
+                        x: cluster_carry + cluster_shift + (pen + g.x_offset) * size,
                         y: g.y_offset * size,
                     });
                     pen += g.x_advance;
@@ -558,5 +606,32 @@ mod tests {
             "{:?}",
             shaped.glyphs
         );
+    }
+
+    #[test]
+    fn zero_width_cluster_attaches_to_its_base_cell() {
+        // a + COMBINING ACUTE + b
+        let m = ColumnMap::new("a\u{301}b");
+        assert_eq!(m.cluster_origin(0), (0, 0), "base");
+        assert_eq!(
+            m.cluster_origin(1),
+            (0, 1),
+            "detached mark: base cell, pen one cell right"
+        );
+        assert_eq!(m.cluster_origin(3), (1, 0), "next char unaffected");
+        assert_eq!(m.col(1), 1, "raw column is still the cell after the base");
+        // Wide base: the carry is two cells.
+        let m = ColumnMap::new("中\u{20DD}x");
+        assert_eq!(m.cluster_origin(3), (0, 2));
+        // A run of zero-width chars walks back to the base.
+        let m = ColumnMap::new("ab\u{200D}\u{FE0F}c");
+        assert_eq!(m.cluster_origin(5), (1, 1));
+        // Nothing to attach to at the start of the line.
+        let m = ColumnMap::new("\u{301}a");
+        assert_eq!(m.cluster_origin(0), (0, 0));
+        // Last column: the mark stays on the base cell (119), not 120.
+        let line = format!("{}a\u{301}", "x".repeat(119));
+        let m = ColumnMap::new(&line);
+        assert_eq!(m.cluster_origin(120), (119, 1));
     }
 }
