@@ -305,6 +305,39 @@ fn purge_removes_everything() {
     store.purge_session(meta.id).unwrap();
 }
 
+/// Review #14: files are removed before the rows, so a failing row
+/// deletion never orphans a snapshot; the session stays listed for a retry.
+#[test]
+fn purge_removes_files_before_rows() {
+    let (_dir, store) = setup();
+    let meta = session(WorkspaceId::new(), 0);
+    store.upsert_session(&meta).unwrap();
+    store.write_snapshot(&snapshot(&meta, 10)).unwrap();
+    store.db().execute_batch("DROP TABLE events").unwrap();
+    assert!(store.purge_session(meta.id).is_err());
+    assert!(!store.paths().snapshot_file(&meta.id).exists());
+    assert!(store.get_session(meta.id).unwrap().is_some());
+}
+
+/// Review #14: a file that cannot be removed does not stop the purge.
+#[test]
+fn purge_deletes_rows_even_if_a_file_cannot_be_removed() {
+    let (_dir, store) = setup();
+    let meta = session(WorkspaceId::new(), 0);
+    store.upsert_session(&meta).unwrap();
+    let mut j = store.open_journal(meta.id).unwrap();
+    j.append(1, b"hello").unwrap();
+    j.flush().unwrap();
+    drop(j);
+    let journal = store.paths().journal_dir(&meta.id);
+    std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = store.purge_session(meta.id);
+    std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o700)).unwrap();
+    result.unwrap();
+    assert_eq!(store.get_session(meta.id).unwrap(), None);
+    assert!(journal.exists(), "the undeletable journal was only logged");
+}
+
 #[test]
 fn journal_appends_rotates_and_reopens() {
     let (_dir, store) = setup();

@@ -224,22 +224,30 @@ impl Store {
     }
 
     /// Remove metadata, events, snapshot and journal. Missing files are fine.
+    /// Remove everything stored for a session. Files go first: a file that
+    /// cannot be removed is logged and the rows are deleted anyway, while a
+    /// failing row deletion leaves the session listed (so the purge can be
+    /// retried) instead of leaving snapshot / journal files — possibly with
+    /// sensitive output — that no row points to any more.
     pub fn purge_session(&self, id: SessionId) -> Result<(), StoreError> {
-        {
-            let mut db = self.db();
-            let tx = db.transaction()?;
-            tx.execute(
-                "DELETE FROM events WHERE session = ?1",
-                params![id.to_string()],
-            )?;
-            tx.execute(
-                "DELETE FROM sessions WHERE id = ?1",
-                params![id.to_string()],
-            )?;
-            tx.commit()?;
+        if let Err(e) = self.delete_snapshot(id) {
+            tracing::warn!(session = %id, error = %e, "purge: cannot delete snapshot");
         }
-        self.delete_snapshot(id)?;
-        fsutil::remove_dir_if_exists(&self.paths.journal_dir(&id))?;
+        let journal = self.paths.journal_dir(&id);
+        if let Err(e) = fsutil::remove_dir_if_exists(&journal) {
+            tracing::warn!(session = %id, dir = %journal.display(), error = %e, "purge: cannot delete journal");
+        }
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        tx.execute(
+            "DELETE FROM events WHERE session = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
