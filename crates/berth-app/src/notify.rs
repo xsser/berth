@@ -139,10 +139,13 @@ fn run(
 /// bundle. Unbundled binaries have none; left unset, mac-notification-sys
 /// looks one up on the first notification with the AppleScript `get id of
 /// application "use_default"`, which on current macOS opens a "Where is
-/// use_default?" dialog and blocks the notifier thread for good. Finder is
-/// what that lookup falls back to, so it is named directly.
+/// use_default?" dialog and blocks the notifier thread for good. What that
+/// lookup falls back to, Finder, is refused on macOS 26: usernoted logs
+/// "Legacy client com.apple.finder connecting to modern client" and denies
+/// every notification. Terminal is accepted (the library's own default;
+/// macOS asks the user once whether Terminal may notify).
 #[cfg(target_os = "macos")]
-const IDENTITY: &str = "com.apple.Finder";
+const IDENTITY: &str = "com.apple.Terminal";
 
 #[cfg(target_os = "macos")]
 fn set_identity() {
