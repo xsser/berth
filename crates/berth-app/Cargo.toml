@@ -33,6 +33,8 @@ notify.workspace = true
 unicode-width.workspace = true
 parking_lot.workspace = true
 crossbeam-channel.workspace = true
+png.workspace = true
+rustc-hash.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys.workspace = true
