@@ -177,31 +177,35 @@ fn row_stop_done_then_user_input_idle_and_subagent_stop_counts() {
     assert_eq!(m.info().state, before);
 }
 
+fn pre_compact(trigger: &str) -> Signal {
+    hook(ClaudeHookEvent::PreCompact {
+        trigger: Some(trigger.into()),
+    })
+}
+
+fn session_start(source: &str) -> Signal {
+    hook(ClaudeHookEvent::SessionStart {
+        source: Some(source.into()),
+    })
+}
+
 #[test]
 fn row_pre_compact_and_session_end() {
     let mut m = machine();
-    m.apply(
-        &hook(ClaudeHookEvent::PreCompact {
-            trigger: Some("auto".into()),
-        }),
-        T0,
-    );
+    // `/compact` at the prompt: nothing runs afterwards (a repeated
+    // PreCompact does not count the compaction itself as a turn).
+    m.apply(&pre_compact("manual"), T0);
+    m.apply(&pre_compact("manual"), T0);
     assert_eq!(m.info().state, AgentState::Compacting);
-    // PostCompact is not a core event; SessionStart{compact} (hooks
-    // reference: fires after auto or manual compaction) ends the phase.
-    m.apply(
-        &hook(ClaudeHookEvent::Other {
-            hook_event_name: "PostCompact".into(),
-        }),
-        T0 + 1,
+    let a = m.apply(&other("PostCompact"), T0 + 1).unwrap();
+    assert_eq!(
+        (a.kind.as_str(), a.state_changed),
+        ("hook:PostCompact", true)
     );
-    assert_eq!(m.info().state, AgentState::Compacting);
-    m.apply(
-        &hook(ClaudeHookEvent::SessionStart {
-            source: Some("compact".into()),
-        }),
-        T0 + 1,
-    );
+    assert_eq!(m.info().state, AgentState::Idle);
+    // SessionStart{compact} (fires after a compaction too) finds it over.
+    let a = m.apply(&session_start("compact"), T0 + 1).unwrap();
+    assert!(!a.state_changed);
     assert_eq!(m.info().state, AgentState::Idle);
     let a = m
         .apply(
@@ -504,7 +508,7 @@ fn other_claude_events_are_recorded_but_never_change_state() {
     let running = AgentState::ToolRunning {
         tool: "Bash".into(),
     };
-    for (i, name) in ["PostCompact", "CwdChanged", "InstructionsLoaded", "Brand"]
+    for (i, name) in ["SubagentStart", "CwdChanged", "InstructionsLoaded", "Brand"]
         .into_iter()
         .enumerate()
     {
@@ -862,4 +866,84 @@ fn external_ids_must_be_plain_tokens() {
     assert!(is_valid_external_id(&"a".repeat(128)));
     assert!(is_valid_external_id("thread_1.v2"));
     assert!(!is_valid_external_id(""));
+}
+
+/// M3: an auto-compaction during a turn ends in `Thinking` (the turn goes
+/// on), whichever of `PostCompact` / `SessionStart{compact}` comes first;
+/// the later one changes nothing.
+#[test]
+fn compaction_during_a_turn_resumes_thinking_in_either_order() {
+    for first_post_compact in [true, false] {
+        let mut m = machine();
+        m.apply(&hook(ClaudeHookEvent::UserPromptSubmit), T0);
+        m.apply(&pre("Bash"), T0 + 1);
+        m.apply(&pre_compact("auto"), T0 + 2);
+        // A repeated PreCompact does not forget that a turn was running.
+        m.apply(&pre_compact("auto"), T0 + 3);
+        assert_eq!(m.info().state, AgentState::Compacting);
+        let (a, b) = if first_post_compact {
+            (other("PostCompact"), session_start("compact"))
+        } else {
+            (session_start("compact"), other("PostCompact"))
+        };
+        assert!(m.apply(&a, T0 + 4).unwrap().state_changed);
+        assert_eq!(m.info().state, AgentState::Thinking, "{first_post_compact}");
+        assert!(!m.apply(&b, T0 + 5).unwrap().state_changed);
+        assert_eq!(m.info().state, AgentState::Thinking, "{first_post_compact}");
+        assert_eq!(m.info().source, StateSource::Hook);
+    }
+}
+
+/// M3: without a compaction under way, `PostCompact` and
+/// `SessionStart{compact}` leave the state alone (M1 turned the latter into
+/// `Idle`); other `SessionStart` sources still start at `Idle`.
+#[test]
+fn compact_events_outside_a_compaction_change_nothing() {
+    let mut m = machine();
+    m.apply(
+        &hook(ClaudeHookEvent::Stop {
+            stop_hook_active: false,
+        }),
+        T0,
+    );
+    assert_eq!(m.info().state, AgentState::Done);
+    for (i, s) in [other("PostCompact"), session_start("compact")]
+        .iter()
+        .enumerate()
+    {
+        let a = m.apply(s, T0 + 1 + i as i64).unwrap();
+        assert!(!a.state_changed);
+        assert_eq!(m.info().state, AgentState::Done);
+    }
+    m.apply(&session_start("clear"), T0 + 5);
+    assert_eq!(m.info().state, AgentState::Idle);
+    // A compaction ends where it began; `reset` forgets a running one.
+    m.apply(&hook(ClaudeHookEvent::UserPromptSubmit), T0 + 6);
+    m.apply(&pre_compact("auto"), T0 + 7);
+    let info = m.info().clone();
+    m.reset(info);
+    m.apply(&other("PostCompact"), T0 + 8);
+    assert_eq!(m.info().state, AgentState::Idle);
+}
+
+/// M3: an MCP elicitation waits for the user; its result lets the model
+/// carry on.
+#[test]
+fn elicitation_waits_for_input_and_its_result_resumes() {
+    let mut m = machine();
+    m.apply(&hook(ClaudeHookEvent::UserPromptSubmit), T0);
+    let a = m.apply(&other("Elicitation"), T0 + 1).unwrap();
+    assert_eq!(
+        (a.kind.as_str(), a.detail.as_deref(), a.state_changed),
+        ("hook:Elicitation", None, true)
+    );
+    assert_eq!(m.info().state, AgentState::WaitingInput);
+    assert!(m.info().state.needs_attention());
+    let a = m.apply(&other("ElicitationResult"), T0 + 2).unwrap();
+    assert!(a.state_changed);
+    assert_eq!(m.info().state, AgentState::Thinking);
+    // Sticky like every waiting state: output activity does not end it.
+    m.apply(&other("Elicitation"), T0 + 3);
+    assert_eq!(m.apply(&Signal::OutputActivity, T0 + 4), None);
+    assert_eq!(m.info().state, AgentState::WaitingInput);
 }

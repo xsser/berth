@@ -19,8 +19,15 @@
 //!   hooks are recorded as `hook:late`), only a revive (`reset`) does;
 //! - the nine core Claude hook events, `Notification` types with a clear
 //!   meaning and `PermissionRequest` / `PermissionDenied` /
-//!   `PostToolUseFailure` / `StopFailure` move the state; the other hook
-//!   events (`Other`) are recorded but never change it;
+//!   `PostToolUseFailure` / `StopFailure` / `PostCompact` / `Elicitation` /
+//!   `ElicitationResult` move the state; the other hook events (`Other`:
+//!   `SubagentStart`, `CwdChanged` — whose cwd the manager applies —,
+//!   unknown names) are recorded but never change it;
+//! - compaction ends (`PostCompact` or `SessionStart{compact}`, whichever
+//!   comes first — their order is not documented) in `Thinking` when it
+//!   began during a turn (auto-compact, the turn goes on) and in `Idle`
+//!   otherwise (`/compact` at the prompt: no turn follows, and a hook
+//!   `Thinking` would stay until the next prompt);
 //! - every applied signal is reported as `Applied` so the manager can write
 //!   an `EventRecord` (kind + short detail, never prompt text).
 
@@ -90,6 +97,8 @@ pub struct AgentMachine {
     subagent_stops: u32,
     /// Previous `ForegroundProcess` name, to recognise an agent leaving.
     last_fg: Option<String>,
+    /// The current compaction began while the agent was busy.
+    compact_from_busy: bool,
 }
 
 impl AgentMachine {
@@ -99,6 +108,7 @@ impl AgentMachine {
             last_hook_ms: None,
             subagent_stops: 0,
             last_fg: None,
+            compact_from_busy: false,
         }
     }
 
@@ -112,10 +122,22 @@ impl AgentMachine {
         self.last_hook_ms = None;
         self.subagent_stops = 0;
         self.last_fg = None;
+        self.compact_from_busy = false;
     }
 
     pub fn subagent_stops(&self) -> u32 {
         self.subagent_stops
+    }
+
+    /// Where a compaction ends (see the module rules); `None` when none is
+    /// under way (the other end-of-compaction event already ended it).
+    fn after_compaction(&self) -> Option<AgentState> {
+        let end = if self.compact_from_busy {
+            AgentState::Thinking
+        } else {
+            AgentState::Idle
+        };
+        (self.info.state == AgentState::Compacting).then_some(end)
     }
 
     fn hook_recent(&self, now_ms: i64) -> bool {
@@ -353,6 +375,10 @@ impl AgentMachine {
             self.info.transcript_path = hook.transcript_path.clone();
         }
         let (name, detail, next): (&str, Option<String>, Option<AgentState>) = match &hook.event {
+            // `compact` is the end of a compaction, not a new session.
+            ClaudeHookEvent::SessionStart { source } if source.as_deref() == Some("compact") => {
+                ("SessionStart", source.clone(), self.after_compaction())
+            }
             ClaudeHookEvent::SessionStart { source } => {
                 ("SessionStart", source.clone(), Some(AgentState::Idle))
             }
@@ -395,6 +421,9 @@ impl AgentMachine {
                 ("SubagentStop", Some(self.subagent_stops.to_string()), None)
             }
             ClaudeHookEvent::PreCompact { trigger } => {
+                if self.info.state != AgentState::Compacting {
+                    self.compact_from_busy = self.info.state.is_busy();
+                }
                 ("PreCompact", trigger.clone(), Some(AgentState::Compacting))
             }
             // DESIGN §9: the agent left and the shell lives on (`Exited` is
@@ -434,8 +463,14 @@ impl AgentMachine {
                             message: "turn failed (StopFailure)".into(),
                         }),
                     ),
-                    // Everything else (PostCompact, CwdChanged, ...) is
-                    // recorded but never moves the state.
+                    "PostCompact" => (name, None, self.after_compaction()),
+                    // An MCP server asks the user for input; answered (by
+                    // the user or a hook), the model carries on.
+                    "Elicitation" => (name, None, Some(AgentState::WaitingInput)),
+                    "ElicitationResult" => (name, None, Some(AgentState::Thinking)),
+                    // Everything else (SubagentStart, CwdChanged — the
+                    // manager moves the cwd —, unknown events) is recorded
+                    // but never moves the state.
                     _ => (name, None, None),
                 }
             }
