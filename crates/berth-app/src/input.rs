@@ -266,13 +266,37 @@ pub struct ImeGate {
     pub composing: bool,
 }
 
-/// GUI shortcuts (⌘ chords). They never reach the PTY.
+/// GUI shortcuts (⌘ chords, DESIGN §8.3). They never reach the PTY.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Shortcut {
-    /// ⌘Q / ⌘W: quit the spike.
+    /// ⌘Q.
     Quit,
-    /// Any other ⌘ chord (⌘K palette, ⌘N … arrive in M1+).
+    /// ⌘N: new session in the current workspace.
+    NewSession,
+    /// ⌘⇧N: new workspace (folder picker).
+    NewWorkspace,
+    /// ⌘W: close the focused session.
+    Close,
+    /// ⌘1..⌘9.
+    Jump(u8),
+    /// ⌘K: command palette.
+    Palette,
+    /// ⌘C.
+    Copy,
+    /// ⌘V.
+    Paste,
+    /// Any other ⌘ chord.
     Unbound(String),
+}
+
+/// Local scrollback keys (Shift+PageUp/PageDown/Home/End outside the
+/// alternate screen, as in Alacritty).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollKey {
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
 }
 
 /// What a key press does.
@@ -282,6 +306,8 @@ pub enum KeyAction {
     Forward { desc: String, bytes: Vec<u8> },
     /// ⌘ chord for the app. Passes even while the IME is composing.
     Shortcut(Shortcut),
+    /// Scroll the local view; nothing is sent.
+    Scroll(ScrollKey),
     /// The IME is composing: the key belongs to it (Backspace edits the
     /// preedit, Enter commits it, arrows move within it), not to the PTY.
     SwallowedByIme { desc: String },
@@ -302,7 +328,7 @@ pub fn decide_key(press: &KeyPress, ime: ImeGate, modes: TermModes) -> KeyAction
         return KeyAction::Ignore;
     }
     if press.mods.super_key() {
-        return KeyAction::Shortcut(shortcut_for(press.logical));
+        return KeyAction::Shortcut(shortcut_for(press.logical, press.mods));
     }
     let mods = Mods::from_winit(press.mods, false);
     let Some(key) = key_from_winit(press.logical, press.text) else {
@@ -312,19 +338,56 @@ pub fn decide_key(press: &KeyPress, ime: ImeGate, modes: TermModes) -> KeyAction
     if ime.composing {
         return KeyAction::SwallowedByIme { desc };
     }
+    if mods
+        == (Mods {
+            shift: true,
+            ..Mods::default()
+        })
+        && !modes.contains(TermModes::ALT_SCREEN)
+    {
+        let scroll = match key {
+            KeyInput::PageUp => Some(ScrollKey::PageUp),
+            KeyInput::PageDown => Some(ScrollKey::PageDown),
+            KeyInput::Home => Some(ScrollKey::Top),
+            KeyInput::End => Some(ScrollKey::Bottom),
+            _ => None,
+        };
+        if let Some(k) = scroll {
+            return KeyAction::Scroll(k);
+        }
+    }
     match encode(&key, mods, modes) {
         Some(bytes) => KeyAction::Forward { desc, bytes },
         None => KeyAction::Ignore,
     }
 }
 
-fn shortcut_for(logical: &WinitKey) -> Shortcut {
-    match logical {
-        WinitKey::Character(c) if c.eq_ignore_ascii_case("q") || c.eq_ignore_ascii_case("w") => {
-            Shortcut::Quit
+fn shortcut_for(logical: &WinitKey, mods: ModifiersState) -> Shortcut {
+    let WinitKey::Character(c) = logical else {
+        return Shortcut::Unbound(format!("⌘{logical:?}"));
+    };
+    let key = c.to_lowercase();
+    let plain = !mods.shift_key() && !mods.control_key() && !mods.alt_key();
+    let shift_only = mods.shift_key() && !mods.control_key() && !mods.alt_key();
+    match key.as_str() {
+        "q" if plain => Shortcut::Quit,
+        "n" if plain => Shortcut::NewSession,
+        "n" if shift_only => Shortcut::NewWorkspace,
+        "w" if plain => Shortcut::Close,
+        "k" if plain => Shortcut::Palette,
+        "c" if plain => Shortcut::Copy,
+        "v" if plain => Shortcut::Paste,
+        d if plain && d.len() == 1 && matches!(d.as_bytes()[0], b'1'..=b'9') => {
+            Shortcut::Jump(d.as_bytes()[0] - b'0')
         }
-        WinitKey::Character(c) => Shortcut::Unbound(format!("⌘{}", c.to_uppercase())),
-        other => Shortcut::Unbound(format!("⌘{other:?}")),
+        _ => {
+            let mut chord = String::from("⌘");
+            if mods.shift_key() {
+                chord.push('⇧');
+            }
+            chord.push_str(&c.to_uppercase());
+            Shortcut::Unbound(chord)
+        }
     }
 }
 
@@ -753,13 +816,68 @@ mod tests {
         for ime in [COMPOSING, IME_IDLE] {
             assert_eq!(
                 press_with(&k, Some("k"), ModifiersState::SUPER, ime),
-                KeyAction::Shortcut(Shortcut::Unbound("⌘K".into()))
+                KeyAction::Shortcut(Shortcut::Palette)
             );
             assert_eq!(
                 press_with(&q, Some("q"), ModifiersState::SUPER, ime),
                 KeyAction::Shortcut(Shortcut::Quit)
             );
         }
+    }
+
+    #[test]
+    fn cmd_chords_map_to_gui_shortcuts() {
+        let cmd = ModifiersState::SUPER;
+        let cmd_shift = ModifiersState::SUPER | ModifiersState::SHIFT;
+        let cases: Vec<(&str, ModifiersState, Shortcut)> = vec![
+            ("n", cmd, Shortcut::NewSession),
+            ("N", cmd_shift, Shortcut::NewWorkspace),
+            ("w", cmd, Shortcut::Close),
+            ("c", cmd, Shortcut::Copy),
+            ("v", cmd, Shortcut::Paste),
+            ("1", cmd, Shortcut::Jump(1)),
+            ("9", cmd, Shortcut::Jump(9)),
+            ("0", cmd, Shortcut::Unbound("⌘0".into())),
+            ("W", cmd_shift, Shortcut::Unbound("⌘⇧W".into())),
+        ];
+        for (key, mods, want) in cases {
+            let k = WinitKey::Character(SmolStr::new(key));
+            assert_eq!(
+                press_with(&k, Some(key), mods, IME_IDLE),
+                KeyAction::Shortcut(want),
+                "{key} {mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_page_keys_scroll_locally_outside_the_alternate_screen() {
+        let pgup = WinitKey::Named(NamedKey::PageUp);
+        let p = KeyPress {
+            logical: &pgup,
+            text: None,
+            pressed: true,
+            synthetic: false,
+            mods: ModifiersState::SHIFT,
+        };
+        assert_eq!(
+            decide_key(&p, IME_IDLE, TermModes::SHOW_CURSOR),
+            KeyAction::Scroll(ScrollKey::PageUp)
+        );
+        // In full-screen programs the key goes to the program.
+        assert!(matches!(
+            decide_key(&p, IME_IDLE, TermModes::ALT_SCREEN),
+            KeyAction::Forward { .. }
+        ));
+        // Without Shift PageUp is the program's.
+        let plain = KeyPress {
+            mods: ModifiersState::empty(),
+            ..p
+        };
+        assert!(matches!(
+            decide_key(&plain, IME_IDLE, TermModes::SHOW_CURSOR),
+            KeyAction::Forward { .. }
+        ));
     }
 
     #[test]

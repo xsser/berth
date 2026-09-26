@@ -1,10 +1,20 @@
-//! Left sidebar (DESIGN §8.3): egui + egui-winit + egui-wgpu sharing the
-//! terminal's device, queue, surface and render pass.
+//! Left sidebar and terminal-area overlays (DESIGN §8.3, integrate.md §3):
+//! egui + egui-winit + egui-wgpu sharing the terminal's device, queue,
+//! surface and render pass.
+//!
+//! Data comes read-only from the [`Controller`]; clicks come back as
+//! [`UiAction`]s that the app applies after the frame. Each card reports
+//! whether it is on screen, which drives the preview subscriptions.
+//!
+//! State source styling (DESIGN §9): hook-sourced states are drawn in full
+//! color, shell-integration ones slightly muted, heuristic ones faint with a
+//! dashed preview bar and marked "推断". An agent leaving (kind back to
+//! `Shell`) switches the kind glyph back to the shell's.
 //!
 //! IME ownership: the terminal owns the window IME. egui-winit toggles
 //! `Window::set_ime_allowed` from `PlatformOutput::ime`, so the sidebar clears
-//! that field every frame and is never fed keyboard or IME events. (M0 has no
-//! egui text field; a future search box must arbitrate explicitly.)
+//! that field every frame and is never fed keyboard or IME events; modal
+//! dialogs get Enter / Esc from the app.
 //!
 //! Fonts: egui's bundled fonts have no CJK, so PingFang SC (fallback Hiragino
 //! Sans GB / Heiti SC) is located through cosmic-text's fontdb and handed to
@@ -15,16 +25,19 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use berth_core::{AgentKind, AgentState, SessionId, SessionMeta};
+use berth_core::{
+    AgentKind, AgentState, LineSnapshot, ReviveMode, SessionId, SessionMeta, SessionStatus,
+    StateSource, StyleTable, WorkspaceId,
+};
 use cosmic_text::{fontdb, FontSystem};
-use egui::text::{LayoutJob, TextWrapping};
+use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{
-    Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Margin, Pos2, Rect, Sense,
-    Stroke, Vec2,
+    Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Id, Margin, Order, Pos2, Rect,
+    Sense, Stroke, Vec2,
 };
 use winit::window::Window;
 
-use crate::fixture::SidebarFixture;
+use crate::controller::{Confirm, Controller, NoticeKind, PREVIEW_ROWS};
 use crate::theme::{mix, Rgb, Theme};
 
 const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
@@ -105,6 +118,16 @@ pub fn badge(state: &AgentState, tick: u64) -> &'static str {
     }
 }
 
+/// Glyph of the program kind; an agent leaving switches back to the shell's.
+pub fn kind_glyph(kind: &AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Shell => "›",
+        AgentKind::Claude => "✻",
+        AgentKind::Codex => "◇",
+        AgentKind::Other(_) => "◆",
+    }
+}
+
 fn status_text(state: &AgentState, elapsed: &str) -> String {
     match state {
         AgentState::Idle => elapsed.to_string(),
@@ -120,11 +143,26 @@ fn status_text(state: &AgentState, elapsed: &str) -> String {
     }
 }
 
+/// Status of a session that is not live.
+fn dormant_text(status: &SessionStatus) -> String {
+    match status {
+        SessionStatus::Live => String::new(),
+        SessionStatus::Dormant {
+            exit_code: Some(c), ..
+        } => format!("已退出 {c}"),
+        SessionStatus::Dormant { .. } => "已退出".into(),
+        SessionStatus::Restored => "已恢复 · 只读".into(),
+    }
+}
+
 fn kind_label(meta: &SessionMeta) -> String {
     match &meta.agent.kind {
         AgentKind::Shell => meta
             .command
             .first()
+            .map(|c| c.to_string())
+            .or_else(|| std::env::var("SHELL").ok())
+            .as_deref()
             .and_then(|c| Path::new(c).file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("shell")
@@ -146,6 +184,48 @@ fn tilde(path: &Path) -> String {
         }
     }
     path.display().to_string()
+}
+
+/// Text format of a preview run: the cell's colors, with non-default
+/// backgrounds drawn behind the text (so reverse video, e.g. vim's status
+/// line, stays readable on the dark card).
+fn preview_format(theme: &Theme, style: &berth_core::Style) -> TextFormat {
+    let colors = theme.resolve(style, false);
+    let mut format = TextFormat {
+        font_id: mono(11.0),
+        color: c32(colors.fg).gamma_multiply(colors.fg_alpha),
+        ..Default::default()
+    };
+    if !colors.bg_is_default {
+        format.background = c32(colors.bg);
+    }
+    format
+}
+
+/// A click or a visibility report from the UI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UiAction {
+    Focus(SessionId),
+    Revive(SessionId, ReviveMode),
+    NewSession,
+    NewSessionIn(WorkspaceId),
+    NewWorkspace,
+    Confirm(bool),
+    DismissNotice(usize),
+    ClosePalette,
+    /// Session cards on screen this frame.
+    Visible(Vec<SessionId>),
+}
+
+/// What the app shows besides the controller's data.
+pub struct Chrome<'a> {
+    /// Terminal area in logical points (where overlays go).
+    pub grid_rect: Rect,
+    pub palette_open: bool,
+    /// Connection line (shown when not connected).
+    pub status: Option<&'a str>,
+    /// Centered in the terminal area when there is no screen to show.
+    pub placeholder: Option<&'a str>,
 }
 
 /// A system face handed to egui without copying.
@@ -329,9 +409,10 @@ pub struct Sidebar {
     renderer: egui_wgpu::Renderer,
     fonts: FontDefinitions,
     pub font_setup: FontSetup,
-    fixture: SidebarFixture,
     palette: Palette,
+    theme: Theme,
     width_pt: f32,
+    dormant_open: bool,
     jobs: Vec<egui::ClippedPrimitive>,
     screen: egui_wgpu::ScreenDescriptor,
     to_free: Vec<egui::TextureId>,
@@ -341,6 +422,43 @@ pub struct Sidebar {
 
 /// Strings painted in one pass, with the family used (for the coverage log).
 type Painted = Vec<(FontFamily, String)>;
+
+/// Paint one line of text (truncated to `max_w`) and return its rect.
+#[allow(clippy::too_many_arguments)]
+fn paint_text(
+    ui: &egui::Ui,
+    painted: &mut Option<&mut Painted>,
+    pos: Pos2,
+    anchor: Align2,
+    s: &str,
+    font: FontId,
+    color: Color32,
+    max_w: f32,
+) -> Rect {
+    if let Some(p) = painted.as_deref_mut() {
+        p.push((font.family.clone(), s.to_string()));
+    }
+    let mut job = LayoutJob::simple_singleline(s.to_string(), font, color);
+    job.wrap = TextWrapping::truncate_at_width(max_w.max(1.0));
+    let galley = ui.painter().layout_job(job);
+    let rect = anchor.anchor_size(pos, galley.size());
+    ui.painter().galley(rect.min, galley, color);
+    rect
+}
+
+fn prop(size: f32) -> FontId {
+    FontId::proportional(size)
+}
+
+fn bold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("bold".into()))
+}
+
+fn mono(size: f32) -> FontId {
+    FontId::monospace(size)
+}
+
+const LINE_H: f32 = 14.0;
 
 impl Sidebar {
     pub fn new(
@@ -381,9 +499,10 @@ impl Sidebar {
             renderer,
             fonts,
             font_setup,
-            fixture: SidebarFixture::build(berth_core::now_ms()),
             palette: Palette::from_theme(theme),
+            theme: theme.clone(),
             width_pt,
+            dormant_open: true,
             jobs: Vec::new(),
             screen: egui_wgpu::ScreenDescriptor {
                 size_in_pixels: [1, 1],
@@ -401,6 +520,12 @@ impl Sidebar {
         self.state.on_window_event(window, event).repaint
     }
 
+    /// egui is using the pointer (over the sidebar, an overlay or a dialog,
+    /// or dragging one of its widgets): the terminal must not act on it.
+    pub fn wants_pointer(&self) -> bool {
+        self.ctx.egui_wants_pointer_input()
+    }
+
     /// When egui asked to be repainted (hover animations etc.).
     pub fn repaint_delay(&self) -> Option<Duration> {
         self.repaint_delay
@@ -408,6 +533,7 @@ impl Sidebar {
 
     /// Run egui, tessellate, upload textures and buffers. The returned
     /// command buffers must be submitted before `encoder`'s.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         window: &Window,
@@ -415,20 +541,27 @@ impl Sidebar {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         size_px: [u32; 2],
+        ctl: &Controller,
+        chrome: &Chrome,
         now_ms: i64,
-    ) -> Vec<wgpu::CommandBuffer> {
+    ) -> (Vec<wgpu::CommandBuffer>, Vec<UiAction>) {
         let raw = self.state.take_egui_input(window);
         let ctx = self.ctx.clone();
         let mut painted: Painted = Vec::new();
-        let collect = !self.coverage_done;
-        let mut clicked = None;
+        let collect = !self.coverage_done && ctl.is_loaded();
+        let mut actions = Vec::new();
         let mut full = ctx.run_ui(raw, |ui| {
             painted.clear();
-            clicked = self.ui(ui, now_ms, collect.then_some(&mut painted));
+            actions.clear();
+            self.ui(
+                ui,
+                ctl,
+                chrome,
+                now_ms,
+                collect.then_some(&mut painted),
+                &mut actions,
+            );
         });
-        if let Some(id) = clicked {
-            self.fixture.focused = id;
-        }
         let mut platform = full.platform_output;
         platform.ime = None; // the terminal owns the IME
         self.state.handle_platform_output(window, platform);
@@ -453,8 +586,10 @@ impl Sidebar {
             self.coverage_done = true;
             self.log_coverage(&painted);
         }
-        self.renderer
-            .update_buffers(device, queue, encoder, &self.jobs, &self.screen)
+        let cmds = self
+            .renderer
+            .update_buffers(device, queue, encoder, &self.jobs, &self.screen);
+        (cmds, actions)
     }
 
     pub fn render(&self, pass: &mut wgpu::RenderPass<'static>) {
@@ -490,16 +625,56 @@ impl Sidebar {
         }
     }
 
-    /// Paints the panel; returns a clicked session.
+    fn state_color(&self, state: &AgentState, now_ms: i64) -> Color32 {
+        let pal = self.palette;
+        let pulse =
+            0.55 + 0.45 * ((now_ms as f64 / 1000.0 * std::f64::consts::PI).sin().abs() as f32);
+        match state {
+            AgentState::Idle | AgentState::Exited { .. } => pal.dim,
+            AgentState::Thinking => pal.blue,
+            AgentState::Compacting => pal.magenta,
+            AgentState::ToolRunning { .. } => pal.yellow,
+            AgentState::WaitingPermission { .. } => pal.orange.gamma_multiply(pulse),
+            AgentState::WaitingInput => pal.cyan,
+            AgentState::Done => pal.green,
+            AgentState::Error { .. } => pal.red,
+        }
+    }
+
+    /// Preview line with the session's colors.
+    fn preview_job(&self, line: &LineSnapshot, styles: &StyleTable, max_w: f32) -> LayoutJob {
+        let mut job = LayoutJob::default();
+        let trimmed_end = line.text().trim_end().chars().count();
+        let mut taken = 0usize;
+        for run in &line.runs {
+            if taken >= trimmed_end {
+                break;
+            }
+            let n = run.text.chars().count().min(trimmed_end - taken);
+            let text: String = run.text.chars().take(n).collect();
+            taken += n;
+            job.append(
+                &text,
+                0.0,
+                preview_format(&self.theme, &styles.get(run.style)),
+            );
+        }
+        job.wrap = TextWrapping::truncate_at_width(max_w.max(1.0));
+        job
+    }
+
     fn ui(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
+        ctl: &Controller,
+        chrome: &Chrome,
         now_ms: i64,
         mut painted: Option<&mut Painted>,
-    ) -> Option<SessionId> {
+        actions: &mut Vec<UiAction>,
+    ) {
         let pal = self.palette;
-        let mut clicked = None;
-        let tick = (now_ms.max(0) / 250) as u64;
+        let ctx = ui.ctx().clone();
+        let mut visible: Vec<SessionId> = Vec::new();
         egui::Panel::left("berth-sidebar")
             .exact_size(self.width_pt)
             .resizable(false)
@@ -516,254 +691,711 @@ impl Sidebar {
                     full.top() - 10.0..=full.bottom() + 10.0,
                     Stroke::new(1.0, pal.border),
                 );
-                let mut text = |ui: &egui::Ui,
-                                pos: Pos2,
-                                anchor: Align2,
-                                s: &str,
-                                font: FontId,
-                                color: Color32,
-                                max_w: f32| {
-                    if let Some(p) = painted.as_deref_mut() {
-                        p.push((font.family.clone(), s.to_string()));
-                    }
-                    let mut job = LayoutJob::simple_singleline(s.to_string(), font, color);
-                    job.wrap = TextWrapping::truncate_at_width(max_w);
-                    let galley = ui.painter().layout_job(job);
-                    let rect = anchor.anchor_size(pos, galley.size());
-                    ui.painter().galley(rect.min, galley, color);
-                    rect
-                };
-                let prop = |size: f32| FontId::proportional(size);
-                let bold = |size: f32| FontId::new(size, FontFamily::Name("bold".into()));
-                let mono = |size: f32| FontId::monospace(size);
+                self.header(ui, ctl, chrome, &mut painted);
+                let footer_h = 40.0;
+                let list_h = (ui.available_height() - footer_h).max(40.0);
+                egui::ScrollArea::vertical()
+                    .max_height(list_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.session_list(ui, ctl, now_ms, &mut painted, actions, &mut visible);
+                    });
+                self.footer(ui, ctl, &mut painted, actions);
+            });
+        actions.push(UiAction::Visible(visible));
+        self.overlays(&ctx, ctl, chrome, &mut painted, actions);
+    }
 
-                // Header.
+    fn header(
+        &self,
+        ui: &mut egui::Ui,
+        ctl: &Controller,
+        chrome: &Chrome,
+        painted: &mut Option<&mut Painted>,
+    ) {
+        let pal = self.palette;
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::hover());
+        paint_text(
+            ui,
+            painted,
+            rect.left_center(),
+            Align2::LEFT_CENTER,
+            "berth",
+            bold(15.0),
+            pal.fg,
+            80.0,
+        );
+        let live: Vec<&SessionMeta> = ctl
+            .jump_order()
+            .into_iter()
+            .filter_map(|sid| ctl.session(sid))
+            .filter(|m| m.is_live())
+            .collect();
+        let busy = live.iter().filter(|m| m.agent.state.is_busy()).count();
+        let attention = live
+            .iter()
+            .filter(|m| m.agent.state.needs_attention())
+            .count();
+        paint_text(
+            ui,
+            painted,
+            rect.right_center(),
+            Align2::RIGHT_CENTER,
+            &format!("{busy} 运行 · {attention} 需关注"),
+            prop(11.0),
+            if attention > 0 { pal.orange } else { pal.dim },
+            170.0,
+        );
+        if let Some(status) = chrome.status {
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::hover());
+            ui.painter()
+                .circle_filled(Pos2::new(rect.left() + 4.0, rect.center().y), 3.5, pal.red);
+            paint_text(
+                ui,
+                painted,
+                Pos2::new(rect.left() + 12.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                status,
+                prop(11.0),
+                pal.red,
+                rect.width() - 12.0,
+            );
+        }
+        ui.add_space(4.0);
+    }
+
+    fn session_list(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctl: &Controller,
+        now_ms: i64,
+        painted: &mut Option<&mut Painted>,
+        actions: &mut Vec<UiAction>,
+        visible: &mut Vec<SessionId>,
+    ) {
+        let pal = self.palette;
+        let order = ctl.jump_order();
+        let number = |sid: SessionId| order.iter().position(|s| *s == sid).map(|i| i + 1);
+        for ws in ctl.workspaces() {
+            // Workspace header: ▾ ● name  ~/root             [+]
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+            let y = rect.center().y;
+            paint_text(
+                ui,
+                painted,
+                Pos2::new(rect.left(), y),
+                Align2::LEFT_CENTER,
+                "▾",
+                prop(12.0),
+                pal.dim,
+                12.0,
+            );
+            let dot = ws.color.map(c32).unwrap_or(pal.dim);
+            ui.painter()
+                .circle_filled(Pos2::new(rect.left() + 17.0, y), 3.5, dot);
+            let name = paint_text(
+                ui,
+                painted,
+                Pos2::new(rect.left() + 26.0, y),
+                Align2::LEFT_CENTER,
+                &ws.name,
+                bold(13.0),
+                pal.fg,
+                120.0,
+            );
+            paint_text(
+                ui,
+                painted,
+                Pos2::new(name.right() + 8.0, y),
+                Align2::LEFT_CENTER,
+                &tilde(&ws.root),
+                prop(11.0),
+                pal.faint,
+                (rect.right() - 22.0 - name.right() - 8.0).max(10.0),
+            );
+            let plus = Rect::from_center_size(Pos2::new(rect.right() - 7.0, y), Vec2::splat(18.0));
+            let resp = ui
+                .interact(plus, Id::new(("ws-new", ws.id)), Sense::click())
+                .on_hover_text("在这个 workspace 新建 session（⌘N）");
+            if resp.hovered() {
+                ui.painter().rect_filled(plus, 4.0, pal.hover);
+            }
+            if resp.clicked() {
+                actions.push(UiAction::NewSessionIn(ws.id));
+            }
+            paint_text(
+                ui,
+                painted,
+                plus.center(),
+                Align2::CENTER_CENTER,
+                "+",
+                prop(14.0),
+                pal.dim,
+                14.0,
+            );
+            let sessions = ctl.live_in(ws.id);
+            if sessions.is_empty() {
                 let (rect, _) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::hover());
-                text(
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::hover());
+                paint_text(
                     ui,
-                    rect.left_center(),
+                    painted,
+                    Pos2::new(rect.left() + 24.0, rect.center().y),
                     Align2::LEFT_CENTER,
-                    "berth",
-                    bold(15.0),
-                    pal.fg,
-                    80.0,
-                );
-                let attention = self
-                    .fixture
-                    .sessions
-                    .iter()
-                    .filter(|s| s.agent.state.needs_attention())
-                    .count();
-                let busy = self
-                    .fixture
-                    .sessions
-                    .iter()
-                    .filter(|s| s.agent.state.is_busy())
-                    .count();
-                text(
-                    ui,
-                    rect.right_center(),
-                    Align2::RIGHT_CENTER,
-                    &format!("{busy} 运行 · {attention} 需关注"),
+                    "（没有运行中的 session）",
                     prop(11.0),
-                    if attention > 0 { pal.orange } else { pal.dim },
-                    170.0,
+                    pal.faint,
+                    rect.width() - 24.0,
                 );
-                ui.add_space(4.0);
+            }
+            for m in sessions {
+                self.card(ui, ctl, m, number(m.id), now_ms, painted, actions, visible);
+            }
+            ui.add_space(6.0);
+        }
+        let orphans = ctl.live_orphans();
+        if !orphans.is_empty() {
+            self.group_header(ui, painted, "（workspace 已删除）", None);
+            for m in orphans {
+                self.card(ui, ctl, m, number(m.id), now_ms, painted, actions, visible);
+            }
+        }
+        let dormant = ctl.dormant();
+        if !dormant.is_empty() {
+            let title = format!("休眠 ({})  只读历史 · 可 Revive", dormant.len());
+            if self.group_header(ui, painted, &title, Some(self.dormant_open)) {
+                self.dormant_open = !self.dormant_open;
+            }
+            if self.dormant_open {
+                for m in dormant {
+                    self.card(ui, ctl, m, number(m.id), now_ms, painted, actions, visible);
+                }
+            }
+        }
+        if ctl.is_loaded() && order.is_empty() {
+            ui.add_space(8.0);
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::hover());
+            paint_text(
+                ui,
+                painted,
+                rect.left_center(),
+                Align2::LEFT_CENTER,
+                "没有 session：⌘N 新建",
+                prop(12.0),
+                pal.dim,
+                rect.width(),
+            );
+        }
+    }
 
-                for ws in &self.fixture.workspaces {
-                    // Workspace header: ▾ ● name  ~/root             [+]
-                    let (rect, _) = ui
-                        .allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
-                    let y = rect.center().y;
-                    text(
-                        ui,
-                        Pos2::new(rect.left(), y),
-                        Align2::LEFT_CENTER,
-                        "▾",
-                        prop(12.0),
-                        pal.dim,
-                        12.0,
-                    );
-                    let dot = ws.color.map(c32).unwrap_or(pal.dim);
-                    ui.painter()
-                        .circle_filled(Pos2::new(rect.left() + 17.0, y), 3.5, dot);
-                    let name = text(
-                        ui,
-                        Pos2::new(rect.left() + 26.0, y),
-                        Align2::LEFT_CENTER,
-                        &ws.name,
-                        bold(13.0),
-                        pal.fg,
-                        120.0,
-                    );
-                    text(
-                        ui,
-                        Pos2::new(name.right() + 8.0, y),
-                        Align2::LEFT_CENTER,
-                        &tilde(&ws.root),
-                        prop(11.0),
-                        pal.faint,
-                        (rect.right() - 22.0 - name.right() - 8.0).max(10.0),
-                    );
-                    text(
-                        ui,
-                        Pos2::new(rect.right(), y),
-                        Align2::RIGHT_CENTER,
-                        "+",
-                        prop(14.0),
-                        pal.dim,
-                        14.0,
-                    );
+    /// A collapsible group header; returns true when clicked.
+    fn group_header(
+        &self,
+        ui: &mut egui::Ui,
+        painted: &mut Option<&mut Painted>,
+        title: &str,
+        open: Option<bool>,
+    ) -> bool {
+        let pal = self.palette;
+        let sense = if open.is_some() {
+            Sense::click()
+        } else {
+            Sense::hover()
+        };
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), sense);
+        let y = rect.center().y;
+        let arrow = match open {
+            Some(false) => "▸",
+            _ => "▾",
+        };
+        paint_text(
+            ui,
+            painted,
+            Pos2::new(rect.left(), y),
+            Align2::LEFT_CENTER,
+            arrow,
+            prop(12.0),
+            pal.dim,
+            12.0,
+        );
+        paint_text(
+            ui,
+            painted,
+            Pos2::new(rect.left() + 14.0, y),
+            Align2::LEFT_CENTER,
+            title,
+            bold(12.0),
+            pal.dim,
+            rect.width() - 14.0,
+        );
+        resp.clicked()
+    }
 
-                    let mut sessions: Vec<(usize, &SessionMeta)> = self
-                        .fixture
-                        .sessions
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, s)| s.workspace == ws.id)
-                        .collect();
-                    sessions.sort_by_key(|(_, s)| s.order);
-                    for (idx, s) in sessions {
-                        let height = 4.0 + 18.0 + 16.0 + 3.0 * 14.0 + 6.0 + 6.0;
-                        let (rect, resp) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), height),
-                            Sense::click(),
-                        );
-                        if resp.clicked() {
-                            clicked = Some(s.id);
-                        }
-                        let focused = s.id == self.fixture.focused;
-                        if focused || resp.hovered() {
-                            ui.painter().rect_filled(
-                                rect,
-                                6.0,
-                                if focused { pal.select } else { pal.hover },
-                            );
-                        }
-                        let state = &s.agent.state;
-                        let elapsed = format_elapsed(now_ms - s.agent.since_ms);
-                        let pulse = 0.55
-                            + 0.45
-                                * ((now_ms as f64 / 1000.0 * std::f64::consts::PI).sin().abs()
-                                    as f32);
-                        let color = match state {
-                            AgentState::Idle | AgentState::Exited { .. } => pal.dim,
-                            AgentState::Thinking => pal.blue,
-                            AgentState::Compacting => pal.magenta,
-                            AgentState::ToolRunning { .. } => pal.yellow,
-                            AgentState::WaitingPermission { .. } => {
-                                pal.orange.gamma_multiply(pulse)
-                            }
-                            AgentState::WaitingInput => pal.cyan,
-                            AgentState::Done => pal.green,
-                            AgentState::Error { .. } => pal.red,
+    #[allow(clippy::too_many_arguments)]
+    fn card(
+        &self,
+        ui: &mut egui::Ui,
+        ctl: &Controller,
+        m: &SessionMeta,
+        number: Option<usize>,
+        now_ms: i64,
+        painted: &mut Option<&mut Painted>,
+        actions: &mut Vec<UiAction>,
+        visible: &mut Vec<SessionId>,
+    ) {
+        let pal = self.palette;
+        let live = m.is_live();
+        let resume = !live && m.agent.kind.is_agent() && m.agent.external_id.is_some();
+        let buttons_h = if live { 0.0 } else { 24.0 };
+        let preview_h = PREVIEW_ROWS as f32 * LINE_H + 6.0;
+        let height = 4.0 + 18.0 + 16.0 + preview_h + buttons_h + 8.0;
+        let (rect, resp) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+        if ui.is_rect_visible(rect) {
+            visible.push(m.id);
+        }
+        if resp.clicked() {
+            actions.push(UiAction::Focus(m.id));
+        }
+        let focused = ctl.focused() == Some(m.id);
+        if focused || resp.hovered() {
+            ui.painter()
+                .rect_filled(rect, 6.0, if focused { pal.select } else { pal.hover });
+        }
+        let agent = &m.agent;
+        let state = &agent.state;
+        let source = agent.source;
+        let base = self.state_color(state, now_ms);
+        let color = match source {
+            StateSource::Hook => base,
+            StateSource::ShellIntegration => base.gamma_multiply(0.8),
+            StateSource::Heuristic => base.gamma_multiply(0.5),
+        };
+        let tick = (now_ms.max(0) / 250) as u64;
+        let x0 = rect.left() + 6.0;
+        let y1 = rect.top() + 4.0 + 9.0;
+        if live {
+            paint_text(
+                ui,
+                painted,
+                Pos2::new(x0 + 6.0, y1),
+                Align2::CENTER_CENTER,
+                badge(state, tick),
+                prop(14.0),
+                color,
+                20.0,
+            );
+        } else {
+            paint_text(
+                ui,
+                painted,
+                Pos2::new(x0 + 6.0, y1),
+                Align2::CENTER_CENTER,
+                "⏹",
+                prop(13.0),
+                pal.faint,
+                20.0,
+            );
+        }
+        let glyph = paint_text(
+            ui,
+            painted,
+            Pos2::new(x0 + 16.0, y1),
+            Align2::LEFT_CENTER,
+            kind_glyph(&agent.kind),
+            prop(12.0),
+            if agent.kind.is_agent() {
+                pal.orange
+            } else {
+                pal.dim
+            },
+            14.0,
+        );
+        let kind = paint_text(
+            ui,
+            painted,
+            Pos2::new(glyph.right() + 3.0, y1),
+            Align2::LEFT_CENTER,
+            &kind_label(m),
+            mono(11.0),
+            pal.dim,
+            60.0,
+        );
+        let status = if live {
+            let mut s = status_text(state, &format_elapsed(now_ms - agent.since_ms));
+            if source == StateSource::Heuristic && *state != AgentState::Idle {
+                s.push_str(" ·推断");
+            }
+            s
+        } else {
+            dormant_text(&m.status)
+        };
+        let status_color = if !live {
+            pal.faint
+        } else if state.needs_attention() {
+            color
+        } else {
+            pal.dim
+        };
+        let status_rect = paint_text(
+            ui,
+            painted,
+            Pos2::new(rect.right() - 6.0, y1),
+            Align2::RIGHT_CENTER,
+            &status,
+            prop(11.0),
+            status_color,
+            110.0,
+        );
+        let title_font = if m.unread { bold(13.0) } else { prop(13.0) };
+        let title_x = kind.right().max(x0 + 64.0) + 6.0;
+        let dot_room = if m.unread { 12.0 } else { 0.0 };
+        let mut title = m.title().to_string();
+        if let Some(n) = number.filter(|n| *n <= 9) {
+            title = format!("{title}  ⌘{n}");
+        }
+        let title_rect = paint_text(
+            ui,
+            painted,
+            Pos2::new(title_x, y1),
+            Align2::LEFT_CENTER,
+            &title,
+            title_font,
+            if m.unread { pal.fg } else { pal.preview_fg },
+            (status_rect.left() - 8.0 - dot_room - title_x).max(20.0),
+        );
+        if m.unread {
+            ui.painter()
+                .circle_filled(Pos2::new(title_rect.right() + 6.0, y1), 3.0, pal.blue);
+        }
+        let y2 = rect.top() + 4.0 + 18.0 + 8.0;
+        paint_text(
+            ui,
+            painted,
+            Pos2::new(x0 + 18.0, y2),
+            Align2::LEFT_CENTER,
+            &tilde(&m.cwd),
+            prop(11.0),
+            pal.faint,
+            rect.width() - 36.0,
+        );
+
+        // Preview: the focused session from its full view, others from
+        // their Preview subscription.
+        let top = rect.top() + 4.0 + 18.0 + 16.0 + 2.0;
+        let preview = Rect::from_min_max(
+            Pos2::new(x0 + 16.0, top),
+            Pos2::new(rect.right() - 6.0, top + preview_h),
+        );
+        ui.painter().rect_filled(preview, 4.0, pal.preview_bg);
+        let bar = [
+            Pos2::new(preview.left() + 1.0, preview.top() + 3.0),
+            Pos2::new(preview.left() + 1.0, preview.bottom() - 3.0),
+        ];
+        let bar_color = if live { color } else { pal.faint };
+        if live && source == StateSource::Heuristic {
+            ui.painter().extend(egui::Shape::dashed_line(
+                &bar,
+                Stroke::new(2.0, bar_color),
+                3.0,
+                3.0,
+            ));
+        } else {
+            ui.painter().line_segment(bar, Stroke::new(2.0, bar_color));
+        }
+        let focused_tail;
+        let (lines, styles): (&[LineSnapshot], Option<&StyleTable>) = match ctl.view() {
+            Some(v) if focused && v.has_screen() => {
+                focused_tail = v.tail(PREVIEW_ROWS);
+                (&focused_tail, Some(v.styles()))
+            }
+            _ => match ctl.preview(m.id) {
+                Some(p) => (&p.lines, Some(&p.styles)),
+                None => (&[], None),
+            },
+        };
+        let skip = lines.len().saturating_sub(PREVIEW_ROWS);
+        for (i, line) in lines[skip..].iter().enumerate() {
+            let pos = Pos2::new(
+                preview.left() + 8.0,
+                preview.top() + 3.0 + i as f32 * LINE_H,
+            );
+            let job = match styles {
+                Some(st) => self.preview_job(line, st, preview.width() - 12.0),
+                None => LayoutJob::default(),
+            };
+            if let Some(p) = painted.as_deref_mut() {
+                p.push((FontFamily::Monospace, line.text_trimmed()));
+            }
+            let galley = ui.painter().layout_job(job);
+            ui.painter().galley(pos, galley, pal.preview_fg);
+        }
+        if !live {
+            let y = preview.bottom() + 4.0;
+            let mut x = preview.left();
+            let mut button = |label: &str, mode: ReviveMode, tip: &str| {
+                let w = 12.0 + label.chars().count() as f32 * 7.5;
+                let r = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, 20.0));
+                x += w + 6.0;
+                let b = egui::Button::new(egui::RichText::new(label).size(11.0));
+                if ui.put(r, b).on_hover_text(tip).clicked() {
+                    actions.push(UiAction::Revive(m.id, mode));
+                }
+            };
+            button(
+                "Revive",
+                ReviveMode::Shell,
+                "在原目录启动新的 shell，历史保留在上方",
+            );
+            if resume {
+                let label = format!("Resume {}", kind_label(m));
+                button(
+                    &label,
+                    ReviveMode::ResumeAgent,
+                    "恢复 agent 会话（id 由 berthd 校验）",
+                );
+            }
+        }
+        ui.add_space(2.0);
+    }
+
+    fn footer(
+        &self,
+        ui: &mut egui::Ui,
+        ctl: &Controller,
+        painted: &mut Option<&mut Painted>,
+        actions: &mut Vec<UiAction>,
+    ) {
+        let pal = self.palette;
+        ui.add_space(4.0);
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 16.0), Sense::hover());
+        // Focused agent details (model · context · cost) when known.
+        let detail = ctl
+            .focused_meta()
+            .map(|m| {
+                let a = &m.agent;
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(model) = &a.model {
+                    parts.push(model.clone());
+                }
+                if let Some(ctx) = a.context_pct {
+                    parts.push(format!("ctx {ctx:.0}%"));
+                }
+                if let Some(cost) = a.cost_usd {
+                    parts.push(format!("${cost:.2}"));
+                }
+                parts.join(" · ")
+            })
+            .unwrap_or_default();
+        paint_text(
+            ui,
+            painted,
+            rect.left_center(),
+            Align2::LEFT_CENTER,
+            &detail,
+            prop(11.0),
+            pal.dim,
+            rect.width(),
+        );
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::hover());
+        let mut x = rect.left();
+        for (label, action, tip) in [
+            ("+ session", UiAction::NewSession, "⌘N"),
+            ("+ workspace", UiAction::NewWorkspace, "⌘⇧N"),
+        ] {
+            let w = 10.0 + label.len() as f32 * 6.5;
+            let r = Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(w, 18.0));
+            x += w + 6.0;
+            let b = egui::Button::new(egui::RichText::new(label).size(11.0)).frame(false);
+            if ui.put(r, b).on_hover_text(tip).clicked() {
+                actions.push(action);
+            }
+        }
+        paint_text(
+            ui,
+            painted,
+            rect.right_center(),
+            Align2::RIGHT_CENTER,
+            "⌘K 面板",
+            prop(11.0),
+            pal.faint,
+            60.0,
+        );
+    }
+
+    fn overlays(
+        &self,
+        ctx: &egui::Context,
+        ctl: &Controller,
+        chrome: &Chrome,
+        painted: &mut Option<&mut Painted>,
+        actions: &mut Vec<UiAction>,
+    ) {
+        let pal = self.palette;
+        let grid = chrome.grid_rect;
+        if let Some(text) = chrome.placeholder {
+            let painter =
+                ctx.layer_painter(egui::LayerId::new(Order::Middle, Id::new("placeholder")));
+            painter.text(
+                grid.center(),
+                Align2::CENTER_CENTER,
+                text,
+                prop(14.0),
+                pal.dim,
+            );
+            if let Some(p) = painted.as_deref_mut() {
+                p.push((FontFamily::Proportional, text.to_string()));
+            }
+        }
+        let notices = ctl.notices();
+        if !notices.is_empty() {
+            egui::Area::new(Id::new("notices"))
+                .order(Order::Foreground)
+                .pivot(Align2::RIGHT_BOTTOM)
+                .fixed_pos(grid.right_bottom() - Vec2::new(10.0, 10.0))
+                .show(ctx, |ui| {
+                    let width = (grid.width() - 20.0).clamp(120.0, 560.0);
+                    ui.set_max_width(width);
+                    for (i, n) in notices.iter().enumerate() {
+                        let (fill, fg) = match n.kind {
+                            NoticeKind::Error => (Color32::from_rgb(0x5a, 0x1d, 0x1d), pal.fg),
+                            NoticeKind::Info => (Color32::from_rgb(0x26, 0x2c, 0x36), pal.fg),
                         };
-                        let x0 = rect.left() + 6.0;
-                        let y1 = rect.top() + 4.0 + 9.0;
-                        text(
-                            ui,
-                            Pos2::new(x0 + 6.0, y1),
-                            Align2::CENTER_CENTER,
-                            badge(state, tick),
-                            prop(14.0),
-                            color,
-                            20.0,
-                        );
-                        let kind = text(
-                            ui,
-                            Pos2::new(x0 + 18.0, y1),
-                            Align2::LEFT_CENTER,
-                            &kind_label(s),
-                            mono(11.0),
-                            pal.dim,
-                            60.0,
-                        );
-                        let status = status_text(state, &elapsed);
-                        let status_rect = text(
-                            ui,
-                            Pos2::new(rect.right() - 6.0, y1),
-                            Align2::RIGHT_CENTER,
-                            &status,
-                            prop(11.0),
-                            if state.needs_attention() {
-                                color
-                            } else {
-                                pal.dim
-                            },
-                            110.0,
-                        );
-                        let title_font = if s.unread { bold(13.0) } else { prop(13.0) };
-                        let title_x = kind.right().max(x0 + 58.0) + 6.0;
-                        let dot_room = if s.unread { 12.0 } else { 0.0 };
-                        let title = text(
-                            ui,
-                            Pos2::new(title_x, y1),
-                            Align2::LEFT_CENTER,
-                            s.title(),
-                            title_font,
-                            if s.unread { pal.fg } else { pal.preview_fg },
-                            (status_rect.left() - 8.0 - dot_room - title_x).max(20.0),
-                        );
-                        if s.unread {
-                            ui.painter().circle_filled(
-                                Pos2::new(title.right() + 6.0, y1),
-                                3.0,
-                                pal.blue,
-                            );
-                        }
-                        let y2 = rect.top() + 4.0 + 18.0 + 8.0;
-                        text(
-                            ui,
-                            Pos2::new(x0 + 18.0, y2),
-                            Align2::LEFT_CENTER,
-                            &tilde(&s.cwd),
-                            prop(11.0),
-                            pal.faint,
-                            rect.width() - 36.0,
-                        );
-
-                        // 3-line monospace preview.
-                        let top = rect.top() + 4.0 + 18.0 + 16.0 + 2.0;
-                        let preview = Rect::from_min_max(
-                            Pos2::new(x0 + 16.0, top),
-                            Pos2::new(rect.right() - 6.0, top + 3.0 * 14.0 + 6.0),
-                        );
-                        ui.painter().rect_filled(preview, 4.0, pal.preview_bg);
-                        ui.painter().vline(
-                            preview.left() + 1.0,
-                            preview.top() + 3.0..=preview.bottom() - 3.0,
-                            Stroke::new(2.0, color),
-                        );
-                        if let Some(lines) = self.fixture.previews.get(idx) {
-                            for (i, line) in lines.iter().take(3).enumerate() {
-                                text(
-                                    ui,
-                                    Pos2::new(
-                                        preview.left() + 8.0,
-                                        preview.top() + 3.0 + i as f32 * 14.0,
-                                    ),
-                                    Align2::LEFT_TOP,
-                                    &line.text_trimmed(),
-                                    mono(11.0),
-                                    pal.preview_fg,
-                                    preview.width() - 12.0,
-                                );
-                            }
-                        }
-                        ui.add_space(2.0);
+                        egui::Frame::new()
+                            .fill(fill)
+                            .corner_radius(6.0)
+                            .inner_margin(Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.set_width(width - 20.0);
+                                ui.horizontal(|ui| {
+                                    let mut text = n.text.clone();
+                                    if n.count > 1 {
+                                        text.push_str(&format!("（×{}）", n.count));
+                                    }
+                                    if let Some(p) = painted.as_deref_mut() {
+                                        p.push((FontFamily::Proportional, text.clone()));
+                                    }
+                                    let close = ui
+                                        .add(egui::Button::new("×").frame(false))
+                                        .on_hover_text("关闭");
+                                    if close.clicked() {
+                                        actions.push(UiAction::DismissNotice(i));
+                                    }
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(text).color(fg).size(12.0),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                            });
+                        ui.add_space(4.0);
                     }
-                    ui.add_space(6.0);
+                });
+        }
+        if let Some(confirm) = ctl.confirm() {
+            let (title, body, yes) = match confirm {
+                Confirm::Kill { title, what, .. } => (
+                    format!("关闭「{title}」？"),
+                    format!("{what}。关闭会结束其中的进程，历史保留在休眠组。"),
+                    "关闭",
+                ),
+                Confirm::Delete { title, .. } => (
+                    format!("删除「{title}」？"),
+                    "这会删除这个 session 的全部历史（快照与记录），不可撤销。".to_string(),
+                    "删除",
+                ),
+            };
+            let resp = egui::Modal::new(Id::new("confirm")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.label(egui::RichText::new(&title).size(15.0).strong());
+                ui.add_space(6.0);
+                ui.label(&body);
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(format!("{yes}（Enter）")).clicked() {
+                        actions.push(UiAction::Confirm(true));
+                    }
+                    if ui.button("取消（Esc）").clicked() {
+                        actions.push(UiAction::Confirm(false));
+                    }
+                });
+            });
+            if resp.should_close() && !actions.iter().any(|a| matches!(a, UiAction::Confirm(_))) {
+                actions.push(UiAction::Confirm(false));
+            }
+            if let Some(p) = painted.as_deref_mut() {
+                p.push((FontFamily::Proportional, format!("{title}{body}")));
+            }
+        }
+        if chrome.palette_open {
+            let resp = egui::Modal::new(Id::new("palette")).show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.label(egui::RichText::new("命令面板").size(15.0).strong());
+                ui.label(
+                    egui::RichText::new("搜索与命令在 M3 实现；目前可用的快捷键：").color(pal.dim),
+                );
+                ui.add_space(6.0);
+                for (keys, what) in [
+                    ("⌘N", "当前 workspace 新建 session"),
+                    ("⌘⇧N", "新建 workspace（选择目录）"),
+                    ("⌘W", "关闭 session（agent 运行时二次确认）"),
+                    ("⌘1…⌘9", "跳到第 n 个 session"),
+                    ("⌘C / ⌘V", "复制选区 / 粘贴"),
+                    ("⇧PgUp / ⇧PgDn", "翻看历史"),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(keys).monospace().color(pal.fg));
+                        ui.label(egui::RichText::new(what).color(pal.dim));
+                    });
+                }
+                ui.add_space(6.0);
+                if ui.button("关闭（Esc）").clicked() {
+                    actions.push(UiAction::ClosePalette);
                 }
             });
-        clicked
+            if resp.should_close() {
+                actions.push(UiAction::ClosePalette);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reverse_video_previews_keep_a_readable_background() {
+        use berth_core::{CellFlags, Color, Style};
+        let theme = Theme::ghostty_default();
+        let plain = preview_format(&theme, &Style::default());
+        assert_eq!(plain.background, Color32::TRANSPARENT);
+        assert_eq!(plain.color, c32(theme.foreground));
+        let inverse = preview_format(
+            &theme,
+            &Style {
+                flags: CellFlags::INVERSE,
+                ..Style::default()
+            },
+        );
+        assert_eq!(inverse.background, c32(theme.foreground));
+        assert_eq!(inverse.color, c32(theme.background));
+        let red_bg = preview_format(
+            &theme,
+            &Style {
+                bg: Color::Indexed(1),
+                ..Style::default()
+            },
+        );
+        assert_eq!(red_bg.background, c32(theme.palette[1]));
+    }
 
     #[test]
     fn elapsed_labels() {

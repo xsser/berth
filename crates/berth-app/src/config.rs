@@ -1,10 +1,12 @@
-//! User configuration (`~/.config/berth/config.toml`, DESIGN §8.4).
+//! User configuration (DESIGN §8.4): `Paths::config_file`, i.e.
+//! `$BERTH_CONFIG`, else `$XDG_CONFIG_HOME/berth/config.toml`, else
+//! `~/.config/berth/config.toml` — the file the daemon reads too.
 //!
-//! Only the sections the M0 spike needs are parsed; unknown keys are ignored
-//! so a config written for later milestones still loads.
+//! Only the sections the GUI needs are parsed; unknown keys are ignored so
+//! the daemon's sections and later additions still load.
 
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const DEFAULT_FONT_FAMILY: &str = "SF Mono";
 pub const DEFAULT_FONT_SIZE: f32 = 13.0;
@@ -31,6 +33,8 @@ pub struct Config {
     pub font: FontConfig,
     /// Sidebar width in logical points.
     pub sidebar_width: f32,
+    /// Agent states (`AgentState::name`) that raise a desktop notification.
+    pub notify_on: Vec<String>,
 }
 
 impl Default for Config {
@@ -38,6 +42,10 @@ impl Default for Config {
         Self {
             font: FontConfig::default(),
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            notify_on: crate::notify::DEFAULT_ON
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 }
@@ -48,7 +56,17 @@ struct FileConfig {
     font: FileFont,
     #[serde(default)]
     sidebar: FileSidebar,
+    #[serde(default)]
+    notify: FileNotify,
 }
+
+#[derive(Debug, Default, Deserialize)]
+struct FileNotify {
+    on: Option<Vec<String>>,
+}
+
+/// States `[notify].on` may list.
+const NOTIFY_STATES: [&str; 4] = ["waiting_permission", "waiting_input", "done", "error"];
 
 #[derive(Debug, Default, Deserialize)]
 struct FileFont {
@@ -83,32 +101,34 @@ impl Config {
             );
             cfg.sidebar_width = width;
         }
+        if let Some(on) = file.notify.on {
+            if let Some(bad) = on.iter().find(|s| !NOTIFY_STATES.contains(&s.as_str())) {
+                anyhow::bail!(
+                    "notify.on: unknown state {bad:?} (expected some of {NOTIFY_STATES:?})"
+                );
+            }
+            cfg.notify_on = on;
+        }
         Ok(cfg)
     }
 
-    /// `~/.config/berth/config.toml` (same path on macOS and Linux, per DESIGN §8.4).
-    pub fn default_path() -> Option<PathBuf> {
-        std::env::var_os("HOME").map(|home| Path::new(&home).join(".config/berth/config.toml"))
-    }
-
-    /// Load the user config if present. A missing file yields defaults; a
-    /// malformed file is reported and ignored so the terminal still starts.
-    pub fn load() -> Self {
-        let Some(path) = Self::default_path() else {
-            return Self::default();
-        };
-        match std::fs::read_to_string(&path) {
+    /// Load `path` if present. A missing file yields defaults; an unreadable
+    /// or malformed one yields defaults plus a message for the user.
+    pub fn load_from(path: &Path) -> (Self, Option<String>) {
+        match std::fs::read_to_string(path) {
             Ok(src) => match Self::from_toml_str(&src) {
-                Ok(cfg) => cfg,
+                Ok(cfg) => (cfg, None),
                 Err(err) => {
-                    tracing::warn!(path = %path.display(), "ignoring invalid config: {err:#}");
-                    Self::default()
+                    let msg = format!("配置文件 {} 无效，已使用默认值：{err:#}", path.display());
+                    tracing::warn!("{msg}");
+                    (Self::default(), Some(msg))
                 }
             },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (Self::default(), None),
             Err(err) => {
-                tracing::warn!(path = %path.display(), "cannot read config: {err}");
-                Self::default()
+                let msg = format!("无法读取配置文件 {}：{err}", path.display());
+                tracing::warn!("{msg}");
+                (Self::default(), Some(msg))
             }
         }
     }
@@ -133,6 +153,28 @@ mod tests {
         assert_eq!(cfg.font.family, "Menlo");
         assert_eq!(cfg.font.size, 14.5);
         assert_eq!(cfg.sidebar_width, 300.0);
+    }
+
+    #[test]
+    fn notify_states_are_configurable_and_checked() {
+        assert_eq!(Config::default().notify_on.len(), 4);
+        let cfg = Config::from_toml_str("[notify]\non = [\"done\"]\n").unwrap();
+        assert_eq!(cfg.notify_on, ["done"]);
+        let off = Config::from_toml_str("[notify]\non = []\n").unwrap();
+        assert!(off.notify_on.is_empty());
+        assert!(Config::from_toml_str("[notify]\non = [\"thinking\"]\n").is_err());
+    }
+
+    #[test]
+    fn missing_and_invalid_files_fall_back_with_a_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, msg) = Config::load_from(&dir.path().join("none.toml"));
+        assert_eq!((cfg, msg), (Config::default(), None));
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "[font]\nsize = 0\n").unwrap();
+        let (cfg, msg) = Config::load_from(&bad);
+        assert_eq!(cfg, Config::default());
+        assert!(msg.unwrap().contains("bad.toml"));
     }
 
     #[test]
