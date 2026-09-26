@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use berth_core::{DaemonMsg, Event, ScreenUpdate};
+use berth_core::{DaemonMsg, Event, ScreenUpdate, SessionId};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
@@ -97,59 +97,51 @@ impl Outbox {
     }
 }
 
-/// Merge `msg` into a queued message of the same kind and session; returns
-/// the message back when it has to be queued separately.
+/// Merge `msg` into the latest queued message of the same kind and session;
+/// returns the message back when it has to be queued separately. A reply
+/// (`reply_to: Some`) may absorb or be absorbed by an unsolicited update —
+/// the merged message keeps the reply id — but two replies are never merged,
+/// so every request still gets its answer.
 fn coalesce(queue: &mut VecDeque<DaemonMsg>, msg: DaemonMsg) -> Option<DaemonMsg> {
-    match msg.event {
-        Event::Screen(new) => {
-            let slot = queue.iter_mut().rev().find_map(|m| match &mut m.event {
-                Event::Screen(old) if old.session == new.session => Some(old),
-                _ => None,
-            });
-            match slot {
-                Some(old) => {
-                    merge_screen(old, new);
-                    None
-                }
-                None => Some(DaemonMsg {
-                    reply_to: msg.reply_to,
-                    event: Event::Screen(new),
-                }),
-            }
+    let Some(key) = merge_key(&msg.event) else {
+        return Some(msg);
+    };
+    let Some(old) = queue
+        .iter_mut()
+        .rev()
+        .find(|m| merge_key(&m.event) == Some(key))
+    else {
+        return Some(msg);
+    };
+    let reply_to = match (old.reply_to, msg.reply_to) {
+        (Some(_), Some(_)) => return Some(msg),
+        (prev, next) => next.or(prev),
+    };
+    old.reply_to = reply_to;
+    match (&mut old.event, msg.event) {
+        (Event::Screen(prev), Event::Screen(next)) => merge_screen(prev, next),
+        (
+            Event::Preview {
+                lines: prev_lines,
+                styles: prev_styles,
+                ..
+            },
+            Event::Preview { lines, styles, .. },
+        ) => {
+            *prev_lines = lines;
+            prev_styles.extend(styles);
         }
-        Event::Preview {
-            session,
-            lines,
-            styles,
-        } => {
-            let slot = queue.iter_mut().rev().find_map(|m| match &mut m.event {
-                Event::Preview {
-                    session: s,
-                    lines: l,
-                    styles: st,
-                } if *s == session => Some((l, st)),
-                _ => None,
-            });
-            match slot {
-                Some((old_lines, old_styles)) => {
-                    *old_lines = lines;
-                    old_styles.extend(styles);
-                    None
-                }
-                None => Some(DaemonMsg {
-                    reply_to: msg.reply_to,
-                    event: Event::Preview {
-                        session,
-                        lines,
-                        styles,
-                    },
-                }),
-            }
-        }
-        event => Some(DaemonMsg {
-            reply_to: msg.reply_to,
-            event,
-        }),
+        _ => unreachable!("merge_key matched"),
+    }
+    None
+}
+
+/// Mergeable messages: `Screen` and `Preview`, per session.
+fn merge_key(event: &Event) -> Option<(bool, SessionId)> {
+    match event {
+        Event::Screen(u) => Some((true, u.session)),
+        Event::Preview { session, .. } => Some((false, *session)),
+        _ => None,
     }
 }
 
@@ -181,7 +173,7 @@ pub(crate) fn merge_screen(old: &mut ScreenUpdate, new: ScreenUpdate) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use berth_core::{Dims, LineSnapshot, SessionId, Style, StyleId};
+    use berth_core::{Dims, LineSnapshot, Style, StyleId};
 
     fn line(t: &str) -> LineSnapshot {
         let mut l = LineSnapshot::blank();
@@ -283,6 +275,63 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(q[1].reply_to, Some(9));
+    }
+
+    /// Review #12: merging never loses a reply id; two replies stay apart.
+    #[test]
+    fn merged_updates_keep_reply_ids() {
+        let with_reply = |mut m: DaemonMsg, id| {
+            m.reply_to = Some(id);
+            m
+        };
+        let s = SessionId::new();
+        // Unsolicited update, then an Attach reply: one message, the reply.
+        let ob = Outbox::new();
+        ob.push(screen(s, 1, false, &[(0, "old")], 1));
+        ob.push(with_reply(screen(s, 2, true, &[(0, "new")], 2), 7));
+        let q: Vec<DaemonMsg> = ob.inner.lock().queue.drain(..).collect();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].reply_to, Some(7));
+        // A reply absorbs later deltas and keeps its id.
+        let ob = Outbox::new();
+        ob.push(with_reply(screen(s, 1, true, &[(0, "a")], 1), 5));
+        ob.push(screen(s, 2, false, &[(0, "b")], 2));
+        let q: Vec<DaemonMsg> = ob.inner.lock().queue.drain(..).collect();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].reply_to, Some(5));
+        // Detach → Attach on a slow client: both Attach replies arrive, in
+        // order; later deltas merge into the newer one.
+        let ob = Outbox::new();
+        ob.push(with_reply(screen(s, 1, true, &[(0, "first")], 1), 5));
+        ob.push(DaemonMsg {
+            reply_to: Some(6),
+            event: Event::Ok,
+        });
+        ob.push(with_reply(screen(s, 2, true, &[(0, "second")], 2), 7));
+        ob.push(screen(s, 3, false, &[(1, "delta")], 3));
+        let q: Vec<DaemonMsg> = ob.inner.lock().queue.drain(..).collect();
+        let ids: Vec<Option<u32>> = q.iter().map(|m| m.reply_to).collect();
+        assert_eq!(ids, vec![Some(5), Some(6), Some(7)]);
+        match &q[2].event {
+            Event::Screen(u) => assert_eq!((u.seq, u.lines.len()), (3, 2)),
+            other => panic!("{other:?}"),
+        }
+        // Previews follow the same rule.
+        let preview = |reply_to| DaemonMsg {
+            reply_to,
+            event: Event::Preview {
+                session: s,
+                lines: vec![line("p")],
+                styles: vec![],
+            },
+        };
+        let ob = Outbox::new();
+        ob.push(preview(None));
+        ob.push(preview(Some(8)));
+        ob.push(preview(Some(9)));
+        let q: Vec<DaemonMsg> = ob.inner.lock().queue.drain(..).collect();
+        let ids: Vec<Option<u32>> = q.iter().map(|m| m.reply_to).collect();
+        assert_eq!(ids, vec![Some(8), Some(9)]);
     }
 
     #[test]
