@@ -87,9 +87,9 @@ impl FrameTiming {
         self.prepare + self.encode
     }
 
-    /// CPU + GPU work for the frame when both were measured.
-    pub fn total(&self) -> Duration {
-        self.cpu() + self.gpu.unwrap_or_default()
+    /// CPU + GPU work for the frame; `None` when the GPU was not measured.
+    pub fn total(&self) -> Option<Duration> {
+        self.gpu.map(|gpu| self.cpu() + gpu)
     }
 }
 
@@ -133,14 +133,18 @@ impl FrameStats {
         if let Some(gpu) = t.gpu {
             self.gpu.push(gpu);
         }
-        self.total.push(t.total());
+        // Only frames with GPU timing count towards the per-frame budget.
+        if let Some(total) = t.total() {
+            self.total.push(total);
+        }
     }
 
     pub fn frames(&self) -> usize {
         self.cpu.len()
     }
 
-    /// Worst total frame time (steady state), for pass/fail.
+    /// CPU + GPU frame time over the frames whose GPU time was measured;
+    /// `None` when no frame was GPU-timed (no pass/fail possible).
     pub fn total_summary(&self) -> Option<Summary> {
         self.total.summary()
     }
@@ -190,12 +194,28 @@ impl FrameStats {
         line("frame total (cpu + gpu)", &self.total);
         line("acquire wait (vsync, not work)", &self.acquire);
         line("frame interval (wall clock)", &self.interval);
-        if let Some(sum) = self.total_summary() {
-            let verdict = if sum.p99 <= target_ms { "PASS" } else { "FAIL" };
+        let gpu_frames = self.gpu.len();
+        if gpu_frames == 0 {
+            out.push_str("[stats]   gpu: not measured (use --bench)\n");
+        } else if gpu_frames < self.frames() {
             out.push_str(&format!(
-                "[stats]   target ≤ {target_ms} ms/frame: {verdict} (avg {:.3} ms, p99 {:.3} ms, max {:.3} ms)\n",
-                sum.avg, sum.p99, sum.max
+                "[stats]   gpu measured for {gpu_frames} of {} frames; the verdict uses those frames only\n",
+                self.frames()
             ));
+        }
+        match (self.total_summary(), self.cpu.summary()) {
+            (Some(sum), _) => {
+                let verdict = if sum.p99 <= target_ms { "PASS" } else { "FAIL" };
+                out.push_str(&format!(
+                    "[stats]   target ≤ {target_ms} ms/frame (cpu + gpu, p99): {verdict} (avg {:.3} ms, p99 {:.3} ms, max {:.3} ms)\n",
+                    sum.avg, sum.p99, sum.max
+                ));
+            }
+            (None, Some(cpu)) => out.push_str(&format!(
+                "[stats]   target ≤ {target_ms} ms/frame: not judged, cpu-only numbers (avg {:.3} ms, p99 {:.3} ms, max {:.3} ms); run --bench for GPU-inclusive timing\n",
+                cpu.avg, cpu.p99, cpu.max
+            )),
+            (None, None) => {}
         }
         out
     }
@@ -250,5 +270,55 @@ mod tests {
         let report = st.report("test", 8.0);
         assert!(report.contains("PASS"), "{report}");
         assert!(report.contains("first frame"), "{report}");
+    }
+
+    fn cpu_only_frame() -> FrameTiming {
+        FrameTiming {
+            prepare: Duration::from_millis(1),
+            encode: Duration::from_millis(1),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cpu_only_report_says_gpu_not_measured_and_gives_no_verdict() {
+        let mut st = FrameStats::default();
+        let t0 = Instant::now();
+        for i in 0..10 {
+            st.record(t0 + Duration::from_millis(8 * i), cpu_only_frame());
+        }
+        assert!(st.total_summary().is_none());
+        let report = st.report("default path", 8.0);
+        assert!(
+            report.contains("gpu: not measured (use --bench)"),
+            "{report}"
+        );
+        assert!(report.contains("not judged, cpu-only"), "{report}");
+        assert!(
+            !report.contains("PASS") && !report.contains("FAIL"),
+            "{report}"
+        );
+        assert!(!report.contains("frame total"), "{report}");
+    }
+
+    #[test]
+    fn partial_gpu_timing_judges_only_timed_frames() {
+        let mut st = FrameStats::default();
+        let t0 = Instant::now();
+        for i in 0..11 {
+            let mut t = cpu_only_frame();
+            if i % 2 == 1 {
+                t.gpu = Some(Duration::from_millis(20));
+            }
+            st.record(t0 + Duration::from_millis(8 * i), t);
+        }
+        let total = st.total_summary().unwrap();
+        assert_eq!(total.n, 5);
+        let report = st.report("mixed", 8.0);
+        assert!(
+            report.contains("gpu measured for 5 of 10 frames"),
+            "{report}"
+        );
+        assert!(report.contains("FAIL"), "{report}");
     }
 }
