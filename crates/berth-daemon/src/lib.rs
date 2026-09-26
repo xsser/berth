@@ -17,6 +17,7 @@ pub mod manager;
 pub mod outbox;
 pub mod server;
 mod session;
+pub mod shell_integration;
 pub mod view;
 
 use std::os::unix::fs::PermissionsExt;

@@ -28,6 +28,7 @@ use crate::config::Config;
 use crate::hooks;
 use crate::outbox::Outbox;
 use crate::session::{self, ActorConfig, ActorHandle, SessionCmd, MAX_PENDING_INPUT};
+use crate::shell_integration;
 use crate::view::ConnId;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -439,6 +440,7 @@ impl Manager {
             "BERTH_SOCKET".into(),
             self.paths.socket.to_string_lossy().into_owned(),
         ));
+        let command = self.with_shell_integration(meta.id, command, &mut env);
         PtySpawn {
             command,
             cwd,
@@ -446,6 +448,38 @@ impl Manager {
             cols: meta.cols.max(2),
             rows: meta.rows.max(1),
         }
+    }
+
+    /// `command` as spawned, plus the zsh integration's environment when
+    /// it is enabled and `command` runs an interactive zsh (then the login
+    /// shell is made explicit, see `shell_integration::interactive_zsh`).
+    /// Anything going wrong leaves the shell as it would start without it.
+    fn with_shell_integration(
+        &self,
+        sid: SessionId,
+        command: Vec<String>,
+        env: &mut Vec<(String, String)>,
+    ) -> Vec<String> {
+        if !self.config.shell_integration() {
+            return command;
+        }
+        let Some(zsh) = shell_integration::interactive_zsh(&command, env) else {
+            return command;
+        };
+        let dir = match shell_integration::install_zsh(&self.paths.data_dir) {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::warn!(session = %sid, error = %e, "cannot install zsh integration; starting without it");
+                return command;
+            }
+        };
+        let Some(vars) = shell_integration::zsh_env(&dir, env) else {
+            tracing::warn!(session = %sid, "ZDOTDIR is not UTF-8; starting zsh without integration");
+            return command;
+        };
+        env.extend(vars);
+        tracing::debug!(session = %sid, "zsh integration enabled");
+        zsh
     }
 
     // -- workspaces -----------------------------------------------------------
