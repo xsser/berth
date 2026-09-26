@@ -16,6 +16,16 @@ fn hook(event: ClaudeHookEvent) -> Signal {
     })
 }
 
+fn hook_from(session_id: &str, event: ClaudeHookEvent) -> Signal {
+    Signal::Hook(ClaudeHook {
+        session_id: session_id.into(),
+        cwd: None,
+        transcript_path: None,
+        permission_mode: None,
+        event,
+    })
+}
+
 fn notification(kind: &str) -> Signal {
     hook(ClaudeHookEvent::Notification {
         notification_type: Some(kind.into()),
@@ -510,4 +520,49 @@ fn statusline_updates_model_context_cost() {
         ..Default::default()
     }));
     assert_eq!(m.info().cost_usd, Some(1.5));
+}
+
+/// Review high #1: ids that are not plain tokens never become the external
+/// id, whichever channel they arrive on.
+#[test]
+fn external_ids_must_be_plain_tokens() {
+    let long = "a".repeat(129);
+    for bad in [
+        "\u{15}touch /tmp/x #",
+        "a b",
+        "$(id)",
+        "x;y",
+        "ünï",
+        long.as_str(),
+    ] {
+        let mut m = machine();
+        m.apply(&hook_from(bad, ClaudeHookEvent::UserPromptSubmit), T0);
+        m.apply(
+            &Signal::Codex(CodexNotify {
+                event_type: "agent-turn-complete".into(),
+                thread_id: Some(bad.into()),
+                cwd: None,
+                last_message: None,
+            }),
+            T0,
+        );
+        m.apply_statusline(&StatuslineUpdate {
+            session_id: bad.into(),
+            ..Default::default()
+        });
+        assert_eq!(m.info().external_id, None, "{bad:?}");
+    }
+    let good = "0f8c2e1a-1111-2222-3333-444455556666";
+    let mut m = machine();
+    m.apply(&hook_from(good, ClaudeHookEvent::UserPromptSubmit), T0);
+    assert_eq!(m.info().external_id.as_deref(), Some(good));
+    // A later invalid id does not replace a valid one.
+    m.apply(
+        &hook_from("\u{15}rm -rf ~", ClaudeHookEvent::UserPromptSubmit),
+        T0 + 1,
+    );
+    assert_eq!(m.info().external_id.as_deref(), Some(good));
+    assert!(is_valid_external_id(&"a".repeat(128)));
+    assert!(is_valid_external_id("thread_1.v2"));
+    assert!(!is_valid_external_id(""));
 }

@@ -26,12 +26,12 @@ struct Daemon {
 }
 
 fn start_daemon(paths: &Paths) -> Daemon {
+    start_daemon_with(paths, berth_daemon::Config::default())
+}
+
+fn start_daemon_with(paths: &Paths, config: berth_daemon::Config) -> Daemon {
     let (stop, rx) = watch::channel(false);
-    let task = tokio::spawn(berth_daemon::run(
-        paths.clone(),
-        berth_daemon::Config::default(),
-        rx,
-    ));
+    let task = tokio::spawn(berth_daemon::run(paths.clone(), config, rx));
     Daemon { stop, task }
 }
 
@@ -302,12 +302,17 @@ async fn exited(c: &mut Client, sid: SessionId) -> Option<i32> {
 }
 
 fn claude(sid: SessionId, event: ClaudeHookEvent) -> Request {
+    claude_as(sid, "claude-e2e", event)
+}
+
+/// A Claude hook event carrying `session_id` (the agent's own session id).
+fn claude_as(sid: SessionId, session_id: &str, event: ClaudeHookEvent) -> Request {
     Request::Hook(HookEnvelope {
         berth_session: Some(sid),
         pid: std::process::id(),
         sent_at_ms: now_ms(),
         signal: AgentSignal::Claude(ClaudeHook {
-            session_id: "claude-e2e".into(),
+            session_id: session_id.into(),
             cwd: None,
             transcript_path: None,
             permission_mode: Some("default".into()),
@@ -833,6 +838,137 @@ async fn fetch_lines_with_absurd_range_is_harmless() {
     .await;
     c.screen_until(sid, &mut screen, "ok-<pid>", |s| s.has("ok-"))
         .await;
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
+
+async fn session_meta(c: &mut Client, sid: SessionId) -> SessionMeta {
+    match c.request(Request::ListSessions).await {
+        Event::Sessions(all) => all.into_iter().find(|m| m.id == sid).expect("listed"),
+        other => panic!("ListSessions answered {other:?}"),
+    }
+}
+
+async fn all_text(c: &mut Client, sid: SessionId) -> Vec<String> {
+    let req = Request::FetchLines {
+        session: sid,
+        start: 0,
+        count: 1000,
+    };
+    match c.request(req).await {
+        Event::Lines { lines, .. } => lines.iter().map(|l| l.text()).collect(),
+        other => panic!("FetchLines answered {other:?}"),
+    }
+}
+
+/// Review high #1 (b): `Revive { ResumeAgent }` executes the configured
+/// resume argv itself. Typed into a shell, the command line would be echoed
+/// and the shell would outlive the program; executed, only the program's
+/// output appears and the session ends with it (Dormant, not stuck Live).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resume_agent_execs_the_resume_argv_without_a_shell() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let config = berth_daemon::Config::parse(
+        "[agents.claude]\nresume_command = \"/bin/echo resumed-by {id}\"\n",
+    )
+    .unwrap();
+    let daemon = start_daemon_with(&paths, config);
+    let mut c = Client::connect(&paths.socket).await;
+    let (_ws, meta) = workspace_and_shell(&mut c, root.path()).await;
+    let sid = meta.id;
+    let id = "0f8c2e1a-1111-2222-3333-444455556666";
+    c.send(claude_as(sid, id, ClaudeHookEvent::UserPromptSubmit))
+        .await;
+    c.wait_for("external id", |m| {
+        matches!(&m.event, Event::AgentChanged { session, agent }
+            if *session == sid && agent.external_id.as_deref() == Some(id))
+    })
+    .await;
+    assert_eq!(c.request(Request::Kill { session: sid }).await, Event::Ok);
+    exited(&mut c, sid).await;
+
+    match c
+        .request(Request::Revive {
+            session: sid,
+            mode: ReviveMode::ResumeAgent,
+        })
+        .await
+    {
+        Event::SessionUpdated(m) => assert_eq!(m.agent.external_id.as_deref(), Some(id)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        exited(&mut c, sid).await,
+        Some(0),
+        "the program is the session"
+    );
+    let text = all_text(&mut c, sid).await;
+    let want = format!("resumed-by {id}");
+    assert!(text.iter().any(|t| t.trim_end() == want), "{text:#?}");
+    assert!(
+        !text.iter().any(|t| t.contains("/bin/echo")),
+        "the command line went through a shell: {text:#?}"
+    );
+    assert!(
+        matches!(
+            session_meta(&mut c, sid).await.status,
+            SessionStatus::Dormant {
+                exit_code: Some(0),
+                ..
+            }
+        ),
+        "a fast-exiting resume must leave the session Dormant"
+    );
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
+
+/// Review high #1 (a): an agent session id that is not a plain token
+/// (here: Ctrl-U, which erases a typed line, then a command) is dropped at
+/// the hook entry, so there is nothing to resume and nothing runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hostile_agent_session_id_is_never_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let config = berth_daemon::Config::parse(
+        "[agents.claude]\nresume_command = \"/bin/echo resumed-by {id}\"\n",
+    )
+    .unwrap();
+    let daemon = start_daemon_with(&paths, config);
+    let mut c = Client::connect(&paths.socket).await;
+    let (_ws, meta) = workspace_and_shell(&mut c, root.path()).await;
+    let sid = meta.id;
+    let pwned = root.path().join("pwned");
+    let hostile = format!("\u{15}touch {} #", pwned.display());
+    c.send(claude_as(sid, &hostile, ClaudeHookEvent::UserPromptSubmit))
+        .await;
+    agent_state(&mut c, sid, AgentState::Thinking).await;
+    let stored = session_meta(&mut c, sid).await.agent.external_id;
+    assert_eq!(c.request(Request::Kill { session: sid }).await, Event::Ok);
+    exited(&mut c, sid).await;
+
+    let answer = c
+        .request(Request::Revive {
+            session: sid,
+            mode: ReviveMode::ResumeAgent,
+        })
+        .await;
+    if !matches!(answer, Event::Error { .. }) {
+        // Show what the id would have done before failing.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pwned.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!(
+            "ResumeAgent with a hostile id answered {answer:?}; injected command ran: {}",
+            pwned.exists()
+        );
+    }
+    assert!(!pwned.exists());
+    assert_eq!(stored, None, "the hostile id was stored");
     assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
     daemon.join().await;
 }

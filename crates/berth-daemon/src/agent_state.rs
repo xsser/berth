@@ -134,14 +134,27 @@ impl AgentMachine {
         true
     }
 
+    /// Only plain tokens become the external id: it ends up in the argv of
+    /// `Revive { ResumeAgent }`, and it comes from any local process that
+    /// can reach the socket.
     fn set_external_id(&mut self, id: Option<&str>) -> bool {
-        match id {
-            Some(id) if !id.is_empty() && self.info.external_id.as_deref() != Some(id) => {
-                self.info.external_id = Some(id.to_owned());
-                true
-            }
-            _ => false,
+        let Some(id) = id.filter(|id| !id.is_empty()) else {
+            return false;
+        };
+        if !is_valid_external_id(id) {
+            let preview: String = id.chars().take(64).collect();
+            tracing::debug!(
+                len = id.len(),
+                id = %preview.escape_debug(),
+                "agent session id rejected: not [A-Za-z0-9._-]{{1,128}}"
+            );
+            return false;
         }
+        if self.info.external_id.as_deref() == Some(id) {
+            return false;
+        }
+        self.info.external_id = Some(id.to_owned());
+        true
     }
 
     pub fn apply(&mut self, signal: &Signal, now_ms: i64) -> Option<Applied> {
@@ -378,6 +391,15 @@ impl AgentMachine {
         }
         changed
     }
+}
+
+/// Agent session ids (Claude `session_id`, Codex `thread-id`) are UUID-like:
+/// `[A-Za-z0-9._-]{1,128}`. Anything else is refused.
+pub fn is_valid_external_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// `claude*` (the native build reports `claude.exe`) and `codex` foreground

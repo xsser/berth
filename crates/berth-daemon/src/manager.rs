@@ -22,7 +22,7 @@ use crossbeam_channel::Sender;
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, watch};
 
-use crate::agent_state::{AgentMachine, Signal, HEURISTIC_CONFIDENCE};
+use crate::agent_state::{is_valid_external_id, AgentMachine, Signal, HEURISTIC_CONFIDENCE};
 use crate::config::Config;
 use crate::hooks;
 use crate::outbox::Outbox;
@@ -679,30 +679,16 @@ impl Manager {
 }
 
 impl Manager {
-    /// New PTY under the session's history: `Shell` starts a shell in the
-    /// original cwd; `ResumeAgent` does the same and types the configured
-    /// resume command into it (so the user's interactive shell environment,
-    /// PATH included, applies, and the shell remains when the agent exits).
+    /// New PTY under the session's history, in the original cwd: `Shell`
+    /// starts a shell; `ResumeAgent` executes the agent's resume command
+    /// directly (see `revive_argv`). When the agent exits the session goes
+    /// Dormant; `Revive { Shell }` then continues in a shell.
     pub async fn revive(self: &Arc<Self>, sid: SessionId, mode: ReviveMode) -> Result<SessionMeta> {
         let meta = self.meta(sid).ok_or_else(|| unknown(sid))?;
         if meta.is_live() {
             return Err("session is live".into());
         }
-        let typed = match mode {
-            ReviveMode::Shell => None,
-            ReviveMode::ResumeAgent => {
-                let id = meta
-                    .agent
-                    .external_id
-                    .clone()
-                    .ok_or("no agent session id to resume")?;
-                let template = self
-                    .config
-                    .resume_command(&meta.agent.kind)
-                    .ok_or("no resume command for this agent kind")?;
-                Some(format!("{}\r", template.replace("{id}", &shell_quote(&id))))
-            }
-        };
+        let command = revive_argv(&self.config, &meta, mode)?;
         let root = self
             .reg
             .lock()
@@ -710,18 +696,19 @@ impl Manager {
             .get(&meta.workspace)
             .map(|w| w.root.clone());
         let cwd = usable_cwd(&meta.cwd, root.as_deref());
-        let spawn = self.pty_spawn(&meta, revive_command(&meta.command), cwd.clone());
+        let spawn = self.pty_spawn(&meta, command, cwd.clone());
         let tx = self.actor_tx(sid)?;
-        let (reply, rx) = oneshot::channel();
-        tx.send(SessionCmd::Revive { spawn, reply })
-            .map_err(|_| stopped())?;
-        rx.await.map_err(|_| stopped())??;
-        if let Some(cmd) = typed {
-            tx.send(SessionCmd::Input(cmd.into_bytes()))
-                .map_err(|_| stopped())?;
-        }
+        // Live *before* the PTY starts (registry only, committed below): the
+        // actor reports the new child's exit only after it started, so an
+        // agent that exits within milliseconds (a stale resume id) is never
+        // overwritten with Live — and a concurrent revive sees "live".
         let now = now_ms();
-        let meta = self.update(sid, |e| {
+        let revived = {
+            let mut reg = self.reg.lock();
+            let e = reg.sessions.get_mut(&sid).ok_or_else(|| unknown(sid))?;
+            if e.meta.is_live() {
+                return Err("session is live".into());
+            }
             e.meta.status = SessionStatus::Live;
             e.meta.cwd = cwd;
             e.meta.last_active_ms = now;
@@ -731,14 +718,33 @@ impl Manager {
             agent.source = StateSource::Heuristic;
             agent.confidence = HEURISTIC_CONFIDENCE;
             e.machine.reset(agent.clone());
-            e.meta.agent = agent;
-            Ok(())
-        })?;
+            e.meta.agent = agent.clone();
+            agent
+        };
+        let (reply, rx) = oneshot::channel();
+        let started = match tx.send(SessionCmd::Revive { spawn, reply }) {
+            Ok(()) => rx.await.unwrap_or_else(|_| Err(stopped())),
+            Err(_) => Err(stopped()),
+        };
+        if let Err(err) = started {
+            // Nothing started: put the previous state back.
+            let _ = self.update(sid, |e| {
+                e.meta.status = meta.status.clone();
+                e.meta.cwd = meta.cwd.clone();
+                e.meta.last_active_ms = meta.last_active_ms;
+                e.machine.reset(meta.agent.clone());
+                e.meta.agent = meta.agent.clone();
+                Ok(())
+            });
+            return Err(err);
+        }
         let kind = match mode {
             ReviveMode::Shell => "revive:shell",
             ReviveMode::ResumeAgent => "revive:resume",
         };
-        self.record(sid, now, kind.into(), &meta.agent.state, None);
+        self.record(sid, now, kind.into(), &revived.state, None);
+        // Current state, which already includes an exit that raced us.
+        let meta = self.commit(self.meta(sid).ok_or_else(|| unknown(sid))?);
         self.broadcast(Event::AgentChanged {
             session: sid,
             agent: meta.agent.clone(),
@@ -935,15 +941,25 @@ fn revive_command(original: &[String]) -> Vec<String> {
     }
 }
 
-/// Quote for POSIX shells unless the id is a plain token (UUIDs are).
-fn shell_quote(s: &str) -> String {
-    if !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c))
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
+/// argv of a revive. `Shell`: the original plain shell, else the login
+/// shell. `ResumeAgent`: the agent's resume command, executed directly —
+/// never typed into or parsed by a shell — with the word `{id}` replaced by
+/// the external id, which must be a plain token (ids stored before that
+/// check existed are refused here too).
+fn revive_argv(config: &Config, meta: &SessionMeta, mode: ReviveMode) -> Result<Vec<String>> {
+    match mode {
+        ReviveMode::Shell => Ok(revive_command(&meta.command)),
+        ReviveMode::ResumeAgent => {
+            let id = meta
+                .agent
+                .external_id
+                .as_deref()
+                .ok_or("no agent session id to resume")?;
+            if !is_valid_external_id(id) {
+                return Err("agent session id is not a plain token; refusing to resume".into());
+            }
+            config.resume_argv(&meta.agent.kind, id)
+        }
     }
 }
 
@@ -960,6 +976,7 @@ fn usable_cwd(cwd: &Path, workspace_root: Option<&Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use berth_core::AgentKind;
 
     #[test]
     fn revive_reuses_plain_shells_only() {
@@ -970,11 +987,54 @@ mod tests {
         assert!(revive_command(&[]).is_empty());
     }
 
+    /// Review high #1: `ResumeAgent` runs the agent's argv itself, no shell.
     #[test]
-    fn shell_quote_keeps_uuids_and_neutralises_metachars() {
-        assert_eq!(shell_quote("0f8c-11aa"), "0f8c-11aa");
-        assert_eq!(shell_quote("$(rm -rf ~)"), "'$(rm -rf ~)'");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    fn resume_agent_argv_is_exec_ready_and_shell_free() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut meta = SessionMeta {
+            id: SessionId::new(),
+            workspace: WorkspaceId::new(),
+            title_auto: String::new(),
+            title_user: None,
+            cwd: PathBuf::from("/"),
+            command: v(&["/bin/zsh"]),
+            env: Vec::new(),
+            status: SessionStatus::Restored,
+            agent: AgentInfo::default(),
+            created_at_ms: 0,
+            last_active_ms: 0,
+            unread: false,
+            persist: PersistPolicy {
+                snapshot: true,
+                journal: false,
+            },
+            order: 0,
+            cols: 80,
+            rows: 24,
+        };
+        let config = Config::default();
+        meta.agent.kind = AgentKind::Claude;
+        meta.agent.external_id = Some("0f8c2e1a-1111-2222-3333-444455556666".into());
+        let argv = revive_argv(&config, &meta, ReviveMode::ResumeAgent).unwrap();
+        assert_eq!(
+            argv,
+            v(&["claude", "--resume", "0f8c2e1a-1111-2222-3333-444455556666"])
+        );
+        assert!(!SHELLS.contains(&argv[0].as_str()));
+        meta.agent.kind = AgentKind::Codex;
+        assert_eq!(
+            revive_argv(&config, &meta, ReviveMode::ResumeAgent).unwrap(),
+            v(&["codex", "resume", "0f8c2e1a-1111-2222-3333-444455556666"])
+        );
+        // A hostile id stored by an older daemon is refused, not quoted.
+        meta.agent.external_id = Some("\u{15}touch /tmp/x #".into());
+        assert!(revive_argv(&config, &meta, ReviveMode::ResumeAgent).is_err());
+        meta.agent.external_id = None;
+        assert!(revive_argv(&config, &meta, ReviveMode::ResumeAgent).is_err());
+        assert_eq!(
+            revive_argv(&config, &meta, ReviveMode::Shell).unwrap(),
+            v(&["/bin/zsh"])
+        );
     }
 
     /// Review high #2: a panicking actor leaves a Dormant session that a
