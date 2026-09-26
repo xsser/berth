@@ -155,6 +155,9 @@ impl AgentMachine {
         self.info.kind = AgentKind::Shell;
         let before = self.info.state.clone();
         self.enter(state, source, confidence, now_ms);
+        // A shell from now on: a new state even when it is `Idle` again
+        // (the usual `/exit` from Claude's idle prompt).
+        self.info.since_ms = now_ms;
         before != self.info.state
     }
 
