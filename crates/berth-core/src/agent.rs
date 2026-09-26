@@ -28,15 +28,23 @@ pub enum AgentState {
     Idle,
     /// Model is generating (or a plain shell command is running).
     Thinking,
-    ToolRunning { tool: String },
-    WaitingPermission { tool: Option<String> },
+    ToolRunning {
+        tool: String,
+    },
+    WaitingPermission {
+        tool: Option<String>,
+    },
     WaitingInput,
     /// Turn finished; cleared to `Idle` when the user interacts again.
     Done,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     Compacting,
     /// Child process exited.
-    Exited { code: Option<i32> },
+    Exited {
+        code: Option<i32>,
+    },
 }
 
 impl AgentState {
@@ -109,16 +117,33 @@ pub struct AgentInfo {
 /// hook CLI maps unknown events to `Other`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClaudeHookEvent {
-    SessionStart { source: Option<String> },
+    SessionStart {
+        source: Option<String>,
+    },
     UserPromptSubmit,
-    PreToolUse { tool_name: String },
-    PostToolUse { tool_name: String },
-    Notification { notification_type: Option<String>, message: String },
-    Stop { stop_hook_active: bool },
+    PreToolUse {
+        tool_name: String,
+    },
+    PostToolUse {
+        tool_name: String,
+    },
+    Notification {
+        notification_type: Option<String>,
+        message: String,
+    },
+    Stop {
+        stop_hook_active: bool,
+    },
     SubagentStop,
-    PreCompact { trigger: Option<String> },
-    SessionEnd { reason: Option<String> },
-    Other { hook_event_name: String },
+    PreCompact {
+        trigger: Option<String>,
+    },
+    SessionEnd {
+        reason: Option<String>,
+    },
+    Other {
+        hook_event_name: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -52,7 +52,11 @@ impl LineSnapshot {
                 run.text.push(ch);
                 run.cells += cells;
             }
-            _ => self.runs.push(Run { text: ch.to_string(), style, cells }),
+            _ => self.runs.push(Run {
+                text: ch.to_string(),
+                style,
+                cells,
+            }),
         }
     }
 
@@ -78,7 +82,9 @@ impl LineSnapshot {
     }
 
     pub fn is_blank(&self) -> bool {
-        self.runs.iter().all(|r| r.text.chars().all(char::is_whitespace))
+        self.runs
+            .iter()
+            .all(|r| r.text.chars().all(char::is_whitespace))
     }
 
     /// Drop trailing runs that are only spaces in the default style.

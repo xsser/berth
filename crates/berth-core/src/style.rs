@@ -55,7 +55,9 @@ pub struct Style {
     pub flags: CellFlags,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub struct StyleId(pub u32);
 
 impl StyleId {
@@ -76,7 +78,9 @@ impl Default for StyleTable {
 
 impl StyleTable {
     pub fn new() -> Self {
-        Self { styles: vec![Style::default()] }
+        Self {
+            styles: vec![Style::default()],
+        }
     }
 
     /// Unknown ids resolve to the default style rather than panicking, so a
@@ -109,7 +113,10 @@ impl StyleTable {
     }
 
     pub fn entries(&self) -> impl Iterator<Item = (StyleId, Style)> + '_ {
-        self.styles.iter().enumerate().map(|(i, s)| (StyleId(i as u32), *s))
+        self.styles
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (StyleId(i as u32), *s))
     }
 }
 
@@ -127,7 +134,11 @@ impl StyleInterner {
         let table = StyleTable::new();
         let mut index = HashMap::new();
         index.insert(Style::default(), StyleId::DEFAULT);
-        Self { table, index, pending: Vec::new() }
+        Self {
+            table,
+            index,
+            pending: Vec::new(),
+        }
     }
 
     pub fn intern(&mut self, style: Style) -> StyleId {
@@ -148,7 +159,10 @@ impl StyleInterner {
     /// Styles added since the previous call (for incremental sync).
     pub fn take_pending(&mut self) -> Vec<(StyleId, Style)> {
         let pending = std::mem::take(&mut self.pending);
-        pending.into_iter().map(|id| (id, self.table.get(id))).collect()
+        pending
+            .into_iter()
+            .map(|id| (id, self.table.get(id)))
+            .collect()
     }
 
     /// Every style (for a full sync on attach).
@@ -159,7 +173,11 @@ impl StyleInterner {
     /// Rebuild an interner from a persisted table (after daemon restart).
     pub fn from_table(table: StyleTable) -> Self {
         let index = table.entries().map(|(id, s)| (s, id)).collect();
-        Self { table, index, pending: Vec::new() }
+        Self {
+            table,
+            index,
+            pending: Vec::new(),
+        }
     }
 }
 
@@ -171,7 +189,10 @@ mod tests {
     fn interner_dedups_and_tracks_pending() {
         let mut i = StyleInterner::new();
         assert_eq!(i.intern(Style::default()), StyleId::DEFAULT);
-        let red = Style { fg: Color::Indexed(1), ..Default::default() };
+        let red = Style {
+            fg: Color::Indexed(1),
+            ..Default::default()
+        };
         let a = i.intern(red);
         let b = i.intern(red);
         assert_eq!(a, b);
@@ -186,7 +207,10 @@ mod tests {
     #[test]
     fn table_grows_on_sparse_insert() {
         let mut t = StyleTable::new();
-        let s = Style { flags: CellFlags::BOLD, ..Default::default() };
+        let s = Style {
+            flags: CellFlags::BOLD,
+            ..Default::default()
+        };
         t.insert(StyleId(5), s);
         assert_eq!(t.len(), 6);
         assert_eq!(t.get(StyleId(5)), s);

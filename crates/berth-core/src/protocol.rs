@@ -51,12 +51,24 @@ pub enum ReviveMode {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Request {
-    Hello { role: ClientRole, protocol: u32, client_version: String },
+    Hello {
+        role: ClientRole,
+        protocol: u32,
+        client_version: String,
+    },
 
     ListWorkspaces,
-    CreateWorkspace { name: String, root: PathBuf },
-    RenameWorkspace { id: WorkspaceId, name: String },
-    DeleteWorkspace { id: WorkspaceId },
+    CreateWorkspace {
+        name: String,
+        root: PathBuf,
+    },
+    RenameWorkspace {
+        id: WorkspaceId,
+        name: String,
+    },
+    DeleteWorkspace {
+        id: WorkspaceId,
+    },
 
     ListSessions,
     CreateSession {
@@ -66,23 +78,62 @@ pub enum Request {
         title: Option<String>,
         dims: Dims,
     },
-    Attach { session: SessionId, dims: Dims },
-    Detach { session: SessionId },
-    Resize { session: SessionId, dims: Dims },
-    Input { session: SessionId, data: Vec<u8> },
+    Attach {
+        session: SessionId,
+        dims: Dims,
+    },
+    Detach {
+        session: SessionId,
+    },
+    Resize {
+        session: SessionId,
+        dims: Dims,
+    },
+    Input {
+        session: SessionId,
+        data: Vec<u8>,
+    },
     /// Fetch lines from the virtual history space: index 0 is the oldest
     /// restored line; the live scrollback follows the restored prefix.
-    FetchLines { session: SessionId, start: u64, count: u32 },
-    Subscribe { session: SessionId, mode: SubscribeMode },
-    Unsubscribe { session: SessionId },
-    Kill { session: SessionId },
-    Revive { session: SessionId, mode: ReviveMode },
+    FetchLines {
+        session: SessionId,
+        start: u64,
+        count: u32,
+    },
+    Subscribe {
+        session: SessionId,
+        mode: SubscribeMode,
+    },
+    Unsubscribe {
+        session: SessionId,
+    },
+    Kill {
+        session: SessionId,
+    },
+    Revive {
+        session: SessionId,
+        mode: ReviveMode,
+    },
     /// Remove the session and purge its files.
-    Delete { session: SessionId },
-    MarkRead { session: SessionId },
-    Rename { session: SessionId, title: Option<String> },
-    MoveSession { session: SessionId, workspace: WorkspaceId, order: u32 },
-    SetPersist { session: SessionId, policy: PersistPolicy },
+    Delete {
+        session: SessionId,
+    },
+    MarkRead {
+        session: SessionId,
+    },
+    Rename {
+        session: SessionId,
+        title: Option<String>,
+    },
+    MoveSession {
+        session: SessionId,
+        workspace: WorkspaceId,
+        order: u32,
+    },
+    SetPersist {
+        session: SessionId,
+        policy: PersistPolicy,
+    },
 
     /// Sent by `berth-hook`.
     Hook(HookEnvelope),
@@ -126,11 +177,18 @@ pub struct DaemonStatus {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Event {
-    Hello { daemon_version: String, protocol: u32 },
-    Incompatible { daemon_protocol: u32 },
+    Hello {
+        daemon_version: String,
+        protocol: u32,
+    },
+    Incompatible {
+        daemon_protocol: u32,
+    },
     /// Generic success for requests without a payload.
     Ok,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 
     Workspaces(Vec<Workspace>),
     WorkspaceUpdated(Workspace),
@@ -141,15 +199,42 @@ pub enum Event {
     SessionRemoved(SessionId),
 
     Screen(ScreenUpdate),
-    Lines { session: SessionId, start: u64, lines: Vec<LineSnapshot>, styles: Vec<(StyleId, Style)> },
-    Preview { session: SessionId, lines: Vec<LineSnapshot>, styles: Vec<(StyleId, Style)> },
+    Lines {
+        session: SessionId,
+        start: u64,
+        lines: Vec<LineSnapshot>,
+        styles: Vec<(StyleId, Style)>,
+    },
+    Preview {
+        session: SessionId,
+        lines: Vec<LineSnapshot>,
+        styles: Vec<(StyleId, Style)>,
+    },
 
-    Title { session: SessionId, title: String },
-    Cwd { session: SessionId, path: PathBuf },
-    Bell { session: SessionId },
-    Notify { session: SessionId, title: Option<String>, body: String },
-    AgentChanged { session: SessionId, agent: AgentInfo },
-    Exited { session: SessionId, code: Option<i32> },
+    Title {
+        session: SessionId,
+        title: String,
+    },
+    Cwd {
+        session: SessionId,
+        path: PathBuf,
+    },
+    Bell {
+        session: SessionId,
+    },
+    Notify {
+        session: SessionId,
+        title: Option<String>,
+        body: String,
+    },
+    AgentChanged {
+        session: SessionId,
+        agent: AgentInfo,
+    },
+    Exited {
+        session: SessionId,
+        code: Option<i32>,
+    },
 
     Status(DaemonStatus),
 }
@@ -225,10 +310,16 @@ mod tests {
 
     #[test]
     fn frame_roundtrip_split_across_pushes() {
-        let m1 = ClientMsg { id: 1, req: Request::ListSessions };
+        let m1 = ClientMsg {
+            id: 1,
+            req: Request::ListSessions,
+        };
         let m2 = ClientMsg {
             id: 2,
-            req: Request::Input { session: SessionId::new(), data: b"ls\n".to_vec() },
+            req: Request::Input {
+                session: SessionId::new(),
+                data: b"ls\n".to_vec(),
+            },
         };
         let mut stream = encode_frame(&m1).unwrap();
         stream.extend(encode_frame(&m2).unwrap());
@@ -236,7 +327,10 @@ mod tests {
         let mut r = FrameReader::new();
         let (a, b) = stream.split_at(stream.len() / 2 + 1);
         r.push(a);
-        let first = r.next_frame().unwrap().map(|p| decode_payload::<ClientMsg>(&p).unwrap());
+        let first = r
+            .next_frame()
+            .unwrap()
+            .map(|p| decode_payload::<ClientMsg>(&p).unwrap());
         r.push(b);
         let first = first.or_else(|| r.next_frame().unwrap().map(|p| decode_payload(&p).unwrap()));
         let second: ClientMsg = decode_payload(&r.next_frame().unwrap().unwrap()).unwrap();
