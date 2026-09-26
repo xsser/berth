@@ -142,6 +142,8 @@ pub struct Controller {
     grid: Dims,
     sent_dims: Option<Dims>,
     resize_due: Option<Instant>,
+    /// The one paste in progress. Known v1 limit: pasting into another
+    /// session cancels it (with an error notice naming the bytes not sent).
     paste: Option<(SessionId, PasteJob)>,
     policy: Policy,
     window_focused: bool,
@@ -313,10 +315,24 @@ impl Controller {
         (!text.is_empty()).then_some(text)
     }
 
-    /// Earliest instant `tick` has work (resize debounce, paste retry).
+    /// Earliest instant `tick` has work (resize debounce, paste retry,
+    /// history fetches waiting on a timer). None while disconnected: `tick`
+    /// does nothing until the connection is back, so an expired timer would
+    /// only spin the event loop.
     pub fn next_deadline(&self) -> Option<Instant> {
+        if !self.connected {
+            return None;
+        }
         let paste = self.paste.as_ref().and_then(|(_, j)| j.deadline());
-        [self.resize_due, paste].into_iter().flatten().min()
+        let history = self
+            .view
+            .as_ref()
+            .filter(|_| self.attach_id.is_none())
+            .and_then(SessionView::next_deadline);
+        [self.resize_due, paste, history]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     // -- notices ---------------------------------------------------------
@@ -1516,6 +1532,71 @@ mod tests {
     }
 
     #[test]
+    fn history_fetch_timers_wake_the_loop_only_while_connected() {
+        let w = ws(0);
+        let s = session(&w, 0, true);
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        let sent = listed(&mut c, &mut out, vec![w], vec![s.clone()]);
+        let id = attach_id(&sent, s.id);
+        let t0 = Instant::now() + Duration::from_secs(1);
+        let mut u = screen(s.id, 1, "$ ");
+        u.history_len = 5_000;
+        c.handle(&mut out, reply(id, Event::Screen(u.clone())), t0);
+        c.tick(&mut out, t0); // past the resize debounce of `listed`
+        out.take();
+        c.scroll(&mut out, 10, t0);
+        assert!(matches!(
+            out.take().as_slice(),
+            [(
+                _,
+                Request::FetchLines {
+                    start: 2_992,
+                    count: 2_000,
+                    ..
+                }
+            )]
+        ));
+        assert_eq!(c.next_deadline(), None, "nothing waits on a timer");
+        // A full redraw at the scrollback limit: the visible rows are asked
+        // for again at once, the rest once the history has stayed put.
+        u.seq = 2;
+        c.handle(&mut out, push(Event::Screen(u.clone())), t0);
+        c.tick(&mut out, t0);
+        assert!(matches!(
+            out.take().as_slice(),
+            [(
+                _,
+                Request::FetchLines {
+                    start: 4_990,
+                    count: 2,
+                    ..
+                }
+            )]
+        ));
+        let settled = t0 + crate::session_view::REFRESH_INTERVAL;
+        assert_eq!(c.next_deadline(), Some(settled));
+        c.tick(&mut out, settled);
+        assert!(matches!(
+            out.take().as_slice(),
+            [(
+                _,
+                Request::FetchLines {
+                    start: 2_990,
+                    count: 2_000,
+                    ..
+                }
+            )]
+        ));
+        assert_eq!(c.next_deadline(), None);
+        // Disconnected: no timer at all, even with a resize waiting.
+        c.set_grid(Dims { cols: 50, rows: 20 }, t0);
+        assert!(c.next_deadline().is_some());
+        c.on_disconnected("test");
+        assert_eq!(c.next_deadline(), None);
+    }
+
+    #[test]
     fn paste_waits_for_each_barrier_and_keys_typed_meanwhile_follow_it() {
         let w = ws(0);
         let s = session(&w, 0, true);
@@ -1939,6 +2020,192 @@ mod tests {
         // The old output is still above the new shell.
         let hist = c.view().unwrap().history_len();
         assert!(hist > top, "history {hist} kept across revive");
+        assert!(c.notices().is_empty(), "{:?}", c.notices());
+    }
+
+    /// Lines cached while scrolled up, then shifted by output at the
+    /// scrollback limit, are fetched again: what the view shows matches the
+    /// daemon's own answer for the same indices.
+    #[test]
+    fn real_daemon_history_shifted_at_the_scrollback_limit_is_fetched_again() {
+        use crate::client::ClientEvent;
+        use crate::testutil::TestDaemon;
+        use crossbeam_channel::Receiver;
+        use std::os::unix::net::UnixStream;
+
+        fn pump(
+            c: &mut Controller,
+            client: &mut Client,
+            rx: &Receiver<ClientEvent>,
+            until: &dyn Fn(&Controller) -> bool,
+            what: &str,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !until(c) {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {what}; notices: {:?}",
+                    c.notices()
+                );
+                match rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(ClientEvent::Msg(m)) => {
+                        c.handle(client, *m, Instant::now());
+                    }
+                    Ok(ClientEvent::Closed(r)) => panic!("connection closed: {r}"),
+                    Err(_) => {}
+                }
+                c.tick(client, Instant::now());
+            }
+        }
+
+        /// The daemon's answer for `[start, start + count)`, asked directly.
+        fn daemon_lines(
+            c: &mut Controller,
+            client: &mut Client,
+            rx: &Receiver<ClientEvent>,
+            session: SessionId,
+            start: u64,
+            count: u32,
+        ) -> Vec<String> {
+            let id = client
+                .send(Request::FetchLines {
+                    session,
+                    start,
+                    count,
+                })
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                assert!(Instant::now() < deadline, "no answer to FetchLines");
+                match rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(ClientEvent::Msg(m)) if m.reply_to == Some(id) => {
+                        let Event::Lines { lines, .. } = m.event else {
+                            panic!("FetchLines answered with another event");
+                        };
+                        return lines.iter().map(LineSnapshot::text).collect();
+                    }
+                    Ok(ClientEvent::Msg(m)) => {
+                        c.handle(client, *m, Instant::now());
+                    }
+                    Ok(ClientEvent::Closed(r)) => panic!("connection closed: {r}"),
+                    Err(_) => {}
+                }
+            }
+        }
+
+        fn on_screen(c: &Controller, text: &str) -> bool {
+            c.view().is_some_and(|v| {
+                v.has_screen()
+                    && (0..u64::from(v.dims().rows)).any(|r| {
+                        v.line(v.history_len() + r)
+                            .is_some_and(|l| l.text().contains(text))
+                    })
+            })
+        }
+
+        fn shown(c: &Controller, start: u64, count: u64) -> Vec<String> {
+            let v = c.view().unwrap();
+            (start..start + count)
+                .map(|n| v.line(n).map(LineSnapshot::text).unwrap_or_default())
+                .collect()
+        }
+
+        let mut config = berth_daemon::Config::default();
+        config.terminal.scrollback = 200;
+        let daemon = TestDaemon::start_with(config);
+        let root = tempfile::tempdir().unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let stream = UnixStream::connect(&daemon.paths.socket).unwrap();
+        let mut client = Client::start(stream, berth_core::ClientRole::Gui, move |ev| {
+            let _ = tx.send(ev);
+        })
+        .unwrap();
+        let mut c = Controller::new(vec![]);
+        c.auto_session = false;
+        // For each "A B" it reads: the numbers A..=B, "done B", then "end B"
+        // without a newline, so once "end B" shows no more output (and no
+        // further scroll) is coming.
+        c.new_session_command = Some(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "stty -echo; printf ready; \
+             while read a b; do echo; seq $a $b; echo \"done $b\"; printf 'end %s' $b; done"
+                .into(),
+        ]);
+        c.set_grid(Dims { cols: 60, rows: 10 }, Instant::now());
+        c.on_connected(&mut client);
+        pump(&mut c, &mut client, &rx, &|c| c.is_loaded(), "listing");
+        c.new_workspace(&mut client, root.path().to_path_buf());
+        pump(
+            &mut c,
+            &mut client,
+            &rx,
+            &|c| on_screen(c, "ready"),
+            "the first screen",
+        );
+        let sid = c.focused().unwrap();
+
+        // Far more than the scrollback holds: history_len sits at the limit.
+        c.input(&mut client, b"1 300\n".to_vec(), Instant::now());
+        pump(
+            &mut c,
+            &mut client,
+            &rx,
+            &|c| on_screen(c, "end 300"),
+            "the first batch",
+        );
+        assert_eq!(c.view().unwrap().history_len(), 200);
+        // Scrolled up: lines from the top of the history get cached (the
+        // prefetch page may follow the visible rows by REFRESH_INTERVAL).
+        c.scroll(&mut client, 100, Instant::now());
+        let cached = |c: &Controller| shown(c, 20, 10).iter().all(|l| !l.is_empty());
+        pump(
+            &mut c,
+            &mut client,
+            &rx,
+            &|c| c.view().unwrap().visible_complete() && cached(c),
+            "the scrolled-up view",
+        );
+        let before = shown(&c, 20, 10);
+        assert_eq!(before, daemon_lines(&mut c, &mut client, &rx, sid, 20, 10));
+
+        // More output at the limit while the view stays scrolled up (sent
+        // directly: typing would snap the view to the bottom): every index
+        // moves while history_len stays put.
+        client
+            .send(Request::Input {
+                session: sid,
+                data: b"301 350\n".to_vec(),
+            })
+            .unwrap();
+        pump(
+            &mut c,
+            &mut client,
+            &rx,
+            &|c| on_screen(c, "end 350"),
+            "the second batch",
+        );
+        assert_eq!(c.view().unwrap().display_offset(), 100, "still scrolled up");
+        assert_eq!(c.view().unwrap().history_len(), 200);
+        pump(
+            &mut c,
+            &mut client,
+            &rx,
+            &|c| c.view().unwrap().visible_complete() && c.next_deadline().is_none() && cached(c),
+            "the history to settle",
+        );
+        // Back to the lines that were cached before the shift.
+        c.scroll(&mut client, 80, Instant::now());
+        pump(
+            &mut c,
+            &mut client,
+            &rx,
+            &|c| c.view().unwrap().visible_complete(),
+            "the view on the old lines",
+        );
+        let truth = daemon_lines(&mut c, &mut client, &rx, sid, 20, 10);
+        assert_ne!(truth, before, "the output did shift the history");
+        assert_eq!(shown(&c, 20, 10), truth);
         assert!(c.notices().is_empty(), "{:?}", c.notices());
     }
 }

@@ -20,14 +20,24 @@ pub struct TestDaemon {
 impl TestDaemon {
     /// A daemon on a fresh temporary directory.
     pub fn start() -> TestDaemon {
+        TestDaemon::start_with(berth_daemon::Config::default())
+    }
+
+    /// Like [`TestDaemon::start`], with this daemon configuration (e.g. a
+    /// small scrollback).
+    pub fn start_with(config: berth_daemon::Config) -> TestDaemon {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut daemon = TestDaemon::start_at(Paths::in_dir(dir.path()));
+        let mut daemon = TestDaemon::spawn(Paths::in_dir(dir.path()), config);
         daemon._dir = Some(dir);
         daemon
     }
 
     /// A daemon on `paths`; returns once its socket accepts connections.
     pub fn start_at(paths: Paths) -> TestDaemon {
+        TestDaemon::spawn(paths, berth_daemon::Config::default())
+    }
+
+    fn spawn(paths: Paths, config: berth_daemon::Config) -> TestDaemon {
         let (stop, rx) = tokio::sync::watch::channel(false);
         let p = paths.clone();
         let thread = std::thread::Builder::new()
@@ -38,9 +48,7 @@ impl TestDaemon {
                     .enable_all()
                     .build()
                     .expect("tokio runtime");
-                if let Err(e) =
-                    rt.block_on(berth_daemon::run(p, berth_daemon::Config::default(), rx))
-                {
+                if let Err(e) = rt.block_on(berth_daemon::run(p, config, rx)) {
                     panic!("test daemon failed: {e:#}");
                 }
             })

@@ -18,11 +18,20 @@
 //! which is a fresh baseline.
 //!
 //! Cache validity: indices shift when the scrollback is reflowed (resize) or
-//! trimmed (`clear`, alternate screen) — both clear the cache. At the
-//! scrollback limit the daemon drops its oldest line on every new one while
-//! `history_len` stays put; that cannot be told apart from an in-place
-//! redraw, so a full redraw with an unchanged `history_len` while scrolled
-//! up re-fetches the visible history rows (throttled).
+//! trimmed (`clear`, ED 3, alternate screen, Revive) — both clear the cache.
+//! At the scrollback limit the daemon drops its oldest line for every new
+//! one while `history_len` stays put, which moves every index; the protocol
+//! cannot tell that apart from an in-place redraw. So a full redraw with an
+//! unchanged `history_len` starts a new cache generation: cached lines and
+//! answers asked for in older generations never count as current. The rows
+//! on screen at that moment keep their content as placeholders until
+//! re-fetched; every other cached line is dropped and fetched again when
+//! scrolled to. While such shifts keep coming only the visible rows are
+//! re-fetched, at most every `REFRESH_INTERVAL`; pages resume once the
+//! indices stay put that long. Growth of `history_len` keeps indices
+//! stable, so it keeps the cache. Known gap: during a flood at the limit a
+//! scrolled-up view cannot stay anchored on its content (the eviction count
+//! is unknown); that needs absolute line numbers from the daemon.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -38,7 +47,10 @@ use crate::selection::{Selection, SelectionSpans, Span};
 pub const FETCH_PAGE: u32 = 2000;
 /// Prefetch once the top of the view is this close to the cache boundary.
 pub const PREFETCH_MARGIN: u64 = 200;
-const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+/// While history indices keep shifting (scrollback at its limit) the
+/// visible rows are re-fetched at most this often, and pages wait until the
+/// indices have stayed put this long.
+pub const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const FETCH_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,8 +58,16 @@ struct Inflight {
     id: u32,
     start: u64,
     count: u32,
-    /// Re-fetch of visible rows (does not count as "available").
+    /// Re-fetch of the visible rows while the history shifts.
     refresh: bool,
+    /// Cache generation when asked; answers of older ones are dropped.
+    gen: u64,
+}
+
+/// A cached history line and the cache generation it was fetched in.
+struct Cached {
+    gen: u64,
+    line: LineSnapshot,
 }
 
 /// A history range the view wants from the daemon.
@@ -68,10 +88,15 @@ pub struct SessionView {
     seq: u64,
     history_len: u64,
     has_screen: bool,
-    cache: BTreeMap<u64, LineSnapshot>,
+    cache: BTreeMap<u64, Cached>,
+    /// Bumped whenever the history indices may have shifted.
+    gen: u64,
+    /// `gen` when `wanted_fetches` last looked, and until when it holds
+    /// pages back after seeing it change.
+    seen_gen: u64,
+    settle_at: Option<Instant>,
     inflight: Vec<Inflight>,
     display_offset: u64,
-    refresh_visible: bool,
     last_refresh: Option<Instant>,
     retry_after: Option<Instant>,
     composed: ScreenSnapshot,
@@ -93,9 +118,11 @@ impl SessionView {
             history_len: 0,
             has_screen: false,
             cache: BTreeMap::new(),
+            gen: 0,
+            seen_gen: 0,
+            settle_at: None,
             inflight: Vec::new(),
             display_offset: 0,
-            refresh_visible: false,
             last_refresh: None,
             retry_after: None,
             composed: ScreenSnapshot::default(),
@@ -150,10 +177,11 @@ impl SessionView {
         self.cursor.blinking
     }
 
-    /// Every visible row is known (no history fetch outstanding for it).
+    /// Every visible row is known and current (no history fetch
+    /// outstanding for it).
     pub fn visible_complete(&self) -> bool {
         let top = self.top_line();
-        self.has_screen && (top..top + u64::from(self.dims.rows)).all(|v| self.line(v).is_some())
+        self.has_screen && (top..top + u64::from(self.dims.rows)).all(|v| self.current(v))
     }
 
     /// Apply a `Screen` update. `baseline`: the answer to our `Attach`
@@ -197,8 +225,10 @@ impl SessionView {
             } else if new > old && self.display_offset > 0 {
                 // Stay on the same content while scrolled up.
                 self.display_offset += new - old;
-            } else if new == old && u.full && self.display_offset > 0 {
-                self.refresh_visible = true;
+            } else if new == old && u.full {
+                // Maybe the scrollback limit: the oldest line was dropped
+                // for each new one and every index moved (module docs).
+                self.invalidate_history();
             }
         }
         self.history_len = new;
@@ -210,7 +240,9 @@ impl SessionView {
     }
 
     /// Lines answering our `FetchLines` request `id`. Answers to requests
-    /// made before the cache was cleared are ignored.
+    /// made before the cache was cleared, or before the history last
+    /// shifted, are dropped: their lines may belong to other indices now
+    /// (each answer carries the styles it uses, so nothing else is lost).
     pub fn apply_lines(
         &mut self,
         id: u32,
@@ -221,14 +253,22 @@ impl SessionView {
         let Some(pos) = self.inflight.iter().position(|f| f.id == id) else {
             return false;
         };
-        self.inflight.remove(pos);
+        if self.inflight.remove(pos).gen != self.gen {
+            return false;
+        }
         self.styles.apply(styles);
         for (i, line) in lines.into_iter().enumerate() {
             let v = start + i as u64;
             if v >= self.history_len {
                 break;
             }
-            self.cache.insert(v, line);
+            self.cache.insert(
+                v,
+                Cached {
+                    gen: self.gen,
+                    line,
+                },
+            );
         }
         self.dirty = true;
         true
@@ -246,50 +286,98 @@ impl SessionView {
             start: fetch.start,
             count: fetch.count,
             refresh: fetch.refresh,
+            gen: self.gen,
         });
     }
 
     fn clear_cache(&mut self) {
         self.cache.clear();
         self.inflight.clear();
-        self.refresh_visible = false;
     }
 
+    /// Start a new cache generation: the history indices may have shifted.
+    /// The rows on screen keep their content as placeholders (not current)
+    /// until re-fetched; every other cached line is dropped, so scrolling
+    /// to it shows nothing stale and fetches it again.
+    fn invalidate_history(&mut self) {
+        self.gen += 1;
+        let (top, end) = self.visible_history();
+        if top >= end {
+            self.cache.clear();
+        } else {
+            let mut shown = self.cache.split_off(&top);
+            shown.split_off(&end);
+            self.cache = shown;
+        }
+    }
+
+    /// The history rows on screen, `[top, end)` (empty at the bottom).
+    fn visible_history(&self) -> (u64, u64) {
+        let top = self.top_line();
+        (top, self.history_len.min(top + u64::from(self.dims.rows)))
+    }
+
+    /// Line `v` is known for the current generation (screen rows are).
+    fn current(&self, v: u64) -> bool {
+        if v >= self.history_len {
+            self.line(v).is_some()
+        } else {
+            self.cache.get(&v).is_some_and(|c| c.gen == self.gen)
+        }
+    }
+
+    /// Current, or asked for in the current generation.
     fn available(&self, v: u64) -> bool {
-        self.cache.contains_key(&v)
+        self.current(v)
             || self
                 .inflight
                 .iter()
-                .any(|f| !f.refresh && v >= f.start && v < f.start + u64::from(f.count))
+                .any(|f| f.gen == self.gen && v >= f.start && v < f.start + u64::from(f.count))
+    }
+
+    /// A visible-rows refresh of the current generation is in flight.
+    fn refresh_pending(&self) -> bool {
+        self.inflight.iter().any(|f| f.refresh && f.gen == self.gen)
     }
 
     /// History ranges to request now (visible rows plus the prefetch
-    /// margin; each at most [`FETCH_PAGE`] lines).
+    /// margin; each at most [`FETCH_PAGE`] lines). While the history
+    /// indices keep shifting only the visible rows are asked for, at most
+    /// every `REFRESH_INTERVAL`; pages resume once they have stayed put
+    /// that long.
     pub fn wanted_fetches(&mut self, now: Instant) -> Vec<Fetch> {
         let mut out = Vec::new();
+        if self.seen_gen != self.gen {
+            self.seen_gen = self.gen;
+            self.settle_at = Some(now + REFRESH_INTERVAL);
+        }
+        let settling = self.settle_at.is_some_and(|t| now < t);
+        if !settling {
+            self.settle_at = None;
+        }
         if !self.has_screen || self.display_offset == 0 {
             return out;
         }
         if self.retry_after.is_some_and(|t| now < t) {
             return out;
         }
-        let top = self.top_line();
-        let rows = u64::from(self.dims.rows);
-        let visible_end = self.history_len.min(top + rows);
-        if self.refresh_visible
-            && self
-                .last_refresh
-                .is_none_or(|t| now >= t + REFRESH_INTERVAL)
-            && !self.inflight.iter().any(|f| f.refresh)
-            && visible_end > top
-        {
-            self.refresh_visible = false;
-            self.last_refresh = Some(now);
-            out.push(Fetch {
-                start: top,
-                count: (visible_end - top) as u32,
-                refresh: true,
-            });
+        self.retry_after = None;
+        let (top, visible_end) = self.visible_history();
+        if settling {
+            if !self.refresh_pending()
+                && self
+                    .last_refresh
+                    .is_none_or(|t| now >= t + REFRESH_INTERVAL)
+                && (top..visible_end).any(|v| !self.current(v))
+            {
+                self.last_refresh = Some(now);
+                out.push(Fetch {
+                    start: top,
+                    count: (visible_end - top) as u32,
+                    refresh: true,
+                });
+            }
+            return out;
         }
         let lo = top.saturating_sub(PREFETCH_MARGIN);
         let mut v = visible_end;
@@ -312,6 +400,26 @@ impl SessionView {
             v = start;
         }
         out
+    }
+
+    /// When `wanted_fetches` next has work waiting on a timer: the failure
+    /// back-off, the next visible refresh while the history shifts, or the
+    /// end of the settling period. Read it right after `wanted_fetches`,
+    /// which retires timers that have passed.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        if !self.has_screen || self.display_offset == 0 {
+            return None;
+        }
+        if self.retry_after.is_some() {
+            return self.retry_after;
+        }
+        let (top, end) = self.visible_history();
+        let refresh = self
+            .last_refresh
+            .filter(|_| self.settle_at.is_some() && !self.refresh_pending())
+            .filter(|_| (top..end).any(|v| !self.current(v)))
+            .map(|t| t + REFRESH_INTERVAL);
+        [self.settle_at, refresh].into_iter().flatten().min()
     }
 
     /// Scroll by `lines` (positive: up into the history).
@@ -341,12 +449,14 @@ impl SessionView {
         i64::from(self.dims.rows.saturating_sub(1).max(1))
     }
 
-    /// Content of virtual line `v` if known (screen or cache).
+    /// Content of virtual line `v` if known (screen or cache; right after a
+    /// history shift the rows that were on screen show their last content
+    /// until re-fetched, see [`Self::visible_complete`]).
     pub fn line(&self, v: u64) -> Option<&LineSnapshot> {
         if v >= self.history_len {
             self.screen.get((v - self.history_len) as usize)
         } else {
-            self.cache.get(&v)
+            self.cache.get(&v).map(|c| &c.line)
         }
     }
 
@@ -459,6 +569,26 @@ mod tests {
 
     fn texts(v: &mut SessionView) -> Vec<String> {
         v.screen().lines.iter().map(LineSnapshot::text).collect()
+    }
+
+    fn text(v: &SessionView, n: u64) -> Option<String> {
+        v.line(n).map(LineSnapshot::text)
+    }
+
+    /// `history` lines of scrollback, scrolled `up`, with every history line
+    /// up to the bottom of the view cached as "h{index}".
+    fn scrolled_with_cache(history: u64, up: i64) -> SessionView {
+        let mut v = SessionView::new(SessionId::nil());
+        v.apply_screen(&update(1, true, &[(0, "s0")], history), true);
+        v.scroll_by(up);
+        for (id, f) in (1..).zip(v.wanted_fetches(Instant::now())) {
+            v.note_fetch(id, f);
+            let lines = (f.start..f.start + u64::from(f.count))
+                .map(|n| line(&format!("h{n}")))
+                .collect();
+            assert!(v.apply_lines(id, f.start, lines, &[]));
+        }
+        v
     }
 
     #[test]
@@ -591,6 +721,159 @@ mod tests {
         assert!(f
             .iter()
             .any(|f| f.refresh && f.start == v.top_line() && f.count == 2));
+    }
+
+    #[test]
+    fn a_shift_at_the_scrollback_limit_invalidates_cached_lines_off_screen() {
+        let mut v = scrolled_with_cache(100, 10);
+        assert_eq!(v.top_line(), 90);
+        assert_eq!(text(&v, 50).as_deref(), Some("h50"));
+        let t = Instant::now();
+        // At the limit a new line evicts the oldest: every index moves while
+        // history_len stays put, and the scroll arrives as a full redraw.
+        assert!(v.apply_screen(&update(2, true, &[(0, "s1")], 100), false));
+        // Lines off screen read as missing, not as their old text...
+        assert_eq!(text(&v, 50), None);
+        assert_eq!(text(&v, 0), None);
+        assert_eq!(text(&v, 89), None);
+        // ...the rows on screen keep their content until re-fetched, which
+        // is asked for right away (only them while the history shifts).
+        assert_eq!(texts(&mut v), ["h90", "h91", "h92", "h93"]);
+        assert!(!v.visible_complete());
+        assert_eq!(
+            v.wanted_fetches(t),
+            vec![Fetch {
+                start: 90,
+                count: 4,
+                refresh: true
+            }]
+        );
+        // Scrolling to lines that were cached fetches them again once the
+        // history stays put.
+        v.set_display_offset(50);
+        assert_eq!(text(&v, 50), None);
+        assert!(v.wanted_fetches(t + Duration::from_millis(10)).is_empty());
+        let f = v.wanted_fetches(t + REFRESH_INTERVAL);
+        assert_eq!(
+            f,
+            vec![Fetch {
+                start: 0,
+                count: 54,
+                refresh: false
+            }]
+        );
+    }
+
+    #[test]
+    fn growing_history_keeps_the_cache() {
+        let mut v = scrolled_with_cache(100, 10);
+        let cached = v.cached_lines();
+        // Below the limit new lines are appended: indices are stable.
+        assert!(v.apply_screen(&update(2, true, &[(0, "s1")], 103), false));
+        assert_eq!(v.cached_lines(), cached);
+        assert_eq!(text(&v, 50).as_deref(), Some("h50"));
+        assert_eq!(v.top_line(), 90, "the view stays on the same lines");
+        assert!(v.visible_complete());
+        assert!(v.wanted_fetches(Instant::now()).is_empty());
+        assert_eq!(v.next_deadline(), None);
+    }
+
+    #[test]
+    fn answers_asked_before_a_shift_do_not_enter_the_new_generation() {
+        let mut v = SessionView::new(SessionId::nil());
+        v.apply_screen(&update(1, true, &[], 100), true);
+        v.scroll_by(10);
+        let t = Instant::now();
+        let f = v.wanted_fetches(t);
+        assert_eq!(
+            f,
+            vec![Fetch {
+                start: 0,
+                count: 94,
+                refresh: false
+            }]
+        );
+        v.note_fetch(1, f[0]);
+        // The history shifts while the request is in flight.
+        v.apply_screen(&update(2, true, &[], 100), false);
+        let old = (0..94).map(|n| line(&format!("old{n}"))).collect();
+        assert!(!v.apply_lines(1, 0, old, &[]), "asked before the shift");
+        assert_eq!(v.cached_lines(), 0);
+        assert_eq!((text(&v, 50), text(&v, 92)), (None, None));
+        // A refresh asked after the shift is current.
+        let r = v.wanted_fetches(t);
+        assert_eq!(
+            r,
+            vec![Fetch {
+                start: 90,
+                count: 4,
+                refresh: true
+            }]
+        );
+        v.note_fetch(2, r[0]);
+        let new = (90..94).map(|n| line(&format!("new{n}"))).collect();
+        assert!(v.apply_lines(2, 90, new, &[]));
+        assert_eq!(texts(&mut v), ["new90", "new91", "new92", "new93"]);
+        assert!(v.visible_complete());
+        // The rest waits until the history has stayed put, then is fetched.
+        assert!(v.wanted_fetches(t + Duration::from_millis(10)).is_empty());
+        assert_eq!(v.next_deadline(), Some(t + REFRESH_INTERVAL));
+        assert_eq!(
+            v.wanted_fetches(t + REFRESH_INTERVAL),
+            vec![Fetch {
+                start: 0,
+                count: 90,
+                refresh: false
+            }]
+        );
+        assert_eq!(v.next_deadline(), None);
+    }
+
+    #[test]
+    fn shifts_keep_refreshing_the_visible_rows_at_the_throttle() {
+        let mut v = SessionView::new(SessionId::nil());
+        v.apply_screen(&update(1, true, &[], 100), true);
+        v.scroll_by(10);
+        let t = Instant::now();
+        let ms = Duration::from_millis;
+        let mut seq = 1;
+        let mut shift = |v: &mut SessionView| {
+            seq += 1;
+            v.apply_screen(&update(seq, true, &[], 100), false);
+        };
+        shift(&mut v);
+        let r = v.wanted_fetches(t);
+        assert!(matches!(r.as_slice(), [Fetch { refresh: true, .. }]));
+        v.note_fetch(1, r[0]);
+        // Shifts keep coming: the refresh in flight is outdated, but a new
+        // one waits for the interval and no pages are asked for.
+        for i in 1..25 {
+            shift(&mut v);
+            assert!(v.wanted_fetches(t + ms(i * 10)).is_empty(), "{i}");
+        }
+        shift(&mut v);
+        let r = v.wanted_fetches(t + REFRESH_INTERVAL);
+        assert_eq!(
+            r,
+            vec![Fetch {
+                start: 90,
+                count: 4,
+                refresh: true
+            }]
+        );
+        assert!(!v.apply_lines(1, 90, vec![line("late")], &[]));
+        assert_eq!(texts(&mut v), ["", "", "", ""]);
+    }
+
+    #[test]
+    fn at_the_bottom_a_shift_only_drops_the_cache() {
+        let mut v = scrolled_with_cache(100, 10);
+        v.scroll_to_bottom();
+        assert!(v.apply_screen(&update(2, true, &[(0, "s1")], 100), false));
+        assert_eq!(v.cached_lines(), 0);
+        assert!(v.wanted_fetches(Instant::now()).is_empty());
+        assert_eq!(v.next_deadline(), None);
+        assert_eq!(texts(&mut v), ["s1", "", "", ""]);
     }
 
     #[test]
