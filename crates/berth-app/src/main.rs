@@ -6,8 +6,10 @@
 //! `setup_hooks`.
 
 mod config;
+mod fixture;
 mod ime;
 mod input;
+mod terminal;
 mod theme;
 
 use clap::{Parser, Subcommand};
