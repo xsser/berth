@@ -1216,48 +1216,76 @@ impl ApplicationHandler<UserEvent> for App {
                 ));
             }
             Mode::Interactive => {
-                let offscreen_ok = self.live_stats.is_some();
-                if gfx.occluded && !offscreen_ok {
-                    // Nothing is visible: sleep until an event (e.g. un-occlusion).
-                    let mut next = self.reconnect_at;
-                    if let Some(d) = self.ctl.next_deadline() {
-                        next = Some(next.map_or(d, |n| n.min(d)));
-                    }
-                    event_loop.set_control_flow(match next {
-                        Some(t) => ControlFlow::WaitUntil(t),
-                        None => ControlFlow::Wait,
-                    });
-                    return;
-                }
-                let mut next = gfx.next_deadline();
-                if let Some(d) = self.ctl.next_deadline() {
-                    next = next.min(d);
-                }
-                if let Some(t) = self.reconnect_at {
-                    next = next.min(t);
-                }
-                if let Some(t) = self.exit_at {
-                    next = next.min(t);
-                }
-                if gfx.dirty {
-                    let earliest = if gfx.presented_last {
-                        now
-                    } else {
-                        gfx.last_frame + OFFSCREEN_INTERVAL
-                    };
-                    if now >= earliest {
+                let timers = [self.ctl.next_deadline(), self.reconnect_at, self.exit_at]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                let pace = if gfx.occluded && self.live_stats.is_none() {
+                    // Nothing is visible: sleep until an event (e.g.
+                    // un-occlusion) or a controller timer.
+                    Pace::Sleep(timers)
+                } else {
+                    let frame_deadline = gfx.next_deadline();
+                    pace(
+                        now,
+                        gfx.dirty || now >= frame_deadline,
+                        gfx.presented_last,
+                        gfx.last_frame,
+                        frame_deadline,
+                        timers,
+                    )
+                };
+                event_loop.set_control_flow(match pace {
+                    Pace::Redraw => {
                         gfx.window.request_redraw();
-                    } else {
-                        next = next.min(earliest);
+                        ControlFlow::Wait
                     }
-                } else if now >= gfx.next_deadline() {
-                    gfx.window.request_redraw();
-                }
-                event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    next.max(now + Duration::from_millis(1)),
-                ));
+                    Pace::Sleep(Some(t)) => {
+                        ControlFlow::WaitUntil(t.max(now + Duration::from_millis(1)))
+                    }
+                    Pace::Sleep(None) => ControlFlow::Wait,
+                });
             }
         }
+    }
+}
+
+/// What the interactive loop does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pace {
+    Redraw,
+    /// Until this instant (`None`: until an event).
+    Sleep(Option<Instant>),
+}
+
+/// `frame_due`: something changed, or a frame timer (cursor blink, sidebar
+/// tick, an egui animation) fired; `frame_deadline` is that timer when it
+/// has not. Presented frames are paced by vsync; frames that were not
+/// presented (offscreen while occluded) have no back-pressure, so they are
+/// spaced by [`OFFSCREEN_INTERVAL`] whatever asked for them — egui
+/// animations advance by wall-clock time and would otherwise ask for
+/// hundreds of back-to-back frames.
+fn pace(
+    now: Instant,
+    frame_due: bool,
+    presented_last: bool,
+    last_frame: Instant,
+    frame_deadline: Instant,
+    timers: Option<Instant>,
+) -> Pace {
+    let wake = |t: Instant| Some(timers.map_or(t, |o| o.min(t)));
+    if !frame_due {
+        return Pace::Sleep(wake(frame_deadline));
+    }
+    let earliest = if presented_last {
+        now
+    } else {
+        last_frame + OFFSCREEN_INTERVAL
+    };
+    if now >= earliest {
+        Pace::Redraw
+    } else {
+        Pace::Sleep(wake(earliest))
     }
 }
 
@@ -2100,6 +2128,34 @@ mod tests {
         assert_eq!(size, PhysicalSize::new(560 + 8 + 120 * 16, 8 + 40 * 31));
         let small = content_size(&m, 2.0, 280.0, (80, 24));
         assert_eq!(small, PhysicalSize::new(560 + 8 + 80 * 16, 8 + 24 * 31));
+    }
+
+    #[test]
+    fn offscreen_frames_are_spaced_whatever_requested_them() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        // An egui animation (due now) right after an offscreen frame waits.
+        assert_eq!(
+            pace(t0 + ms(2), true, false, t0, t0, None),
+            Pace::Sleep(Some(t0 + OFFSCREEN_INTERVAL))
+        );
+        assert_eq!(pace(t0 + ms(9), true, false, t0, t0, None), Pace::Redraw);
+        // Presented frames are paced by vsync instead.
+        assert_eq!(pace(t0 + ms(1), true, true, t0, t0, None), Pace::Redraw);
+        // Nothing due: sleep until the frame timer or an earlier controller timer.
+        assert_eq!(
+            pace(t0, false, true, t0, t0 + ms(250), Some(t0 + ms(50))),
+            Pace::Sleep(Some(t0 + ms(50)))
+        );
+        assert_eq!(
+            pace(t0, false, true, t0, t0 + ms(250), None),
+            Pace::Sleep(Some(t0 + ms(250)))
+        );
+        // Throttled, but a controller timer comes first.
+        assert_eq!(
+            pace(t0 + ms(1), true, false, t0, t0, Some(t0 + ms(3))),
+            Pace::Sleep(Some(t0 + ms(3)))
+        );
     }
 
     #[test]
