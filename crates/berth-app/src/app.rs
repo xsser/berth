@@ -39,6 +39,7 @@ use winit::window::{ImePurpose, Window, WindowId};
 use crate::client::{self, Client, ClientEvent};
 use crate::config::Config;
 use crate::controller::{Controller, Effect, Outbound};
+use crate::dock::DockBadge;
 use crate::fixture::{Fixture, COLS, ROWS};
 use crate::ime::{ImeOutcome, ImeState};
 use crate::input::{self, ImeGate, KeyAction, KeyPress, Mods, ScrollKey, Shortcut};
@@ -84,6 +85,9 @@ pub struct GuiOptions {
     /// Inject a synthetic `Ime::Preedit` at startup (screenshot check of the
     /// preedit overlay; real IME events go through the same handler).
     pub demo_preedit: Option<String>,
+    /// Show this session's hover details without a pointer (screenshot
+    /// check; a screenshot waits for its events).
+    pub demo_hover: Option<String>,
 }
 
 /// Events from other threads.
@@ -267,6 +271,8 @@ struct App {
     attempts: u32,
     last_connect_error: Option<String>,
     notifier: Option<Notifier>,
+    /// Dock badge (not in bench runs, which have no daemon).
+    dock: Option<DockBadge>,
     mode: Mode,
     palette_open: bool,
     picking_folder: bool,
@@ -330,6 +336,7 @@ impl App {
             _ => None,
         };
         let exit_at = opts.exit_after.map(|d| t0 + d);
+        let dock = (!matches!(mode, Mode::Bench { .. })).then(DockBadge::default);
         Self {
             live_stats: opts.stats.then(LiveStats::new),
             pending_scroll: opts.scroll.map(i64::from),
@@ -350,6 +357,7 @@ impl App {
             attempts: 0,
             last_connect_error: None,
             notifier,
+            dock,
             mode,
             palette_open: false,
             picking_folder: false,
@@ -501,6 +509,26 @@ impl App {
                 self.schedule_reconnect();
             }
         }
+        self.update_dock();
+    }
+
+    /// Dock badge: sessions needing attention (none while disconnected:
+    /// the list may be out of date).
+    fn update_dock(&mut self) {
+        let count = if self.ctl.is_connected() {
+            self.ctl.attention_count()
+        } else {
+            0
+        };
+        if let Some(dock) = self.dock.as_mut() {
+            dock.update(count);
+        }
+    }
+
+    /// `--demo-hover` resolved against the session list.
+    fn demo_hover(&self) -> Option<berth_core::SessionId> {
+        let want = self.opts.demo_hover.as_deref()?;
+        self.ctl.find_session(want).ok()
     }
 
     // -- keyboard ----------------------------------------------------------
@@ -810,6 +838,7 @@ impl App {
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let start = Instant::now();
+        let demo_hover = self.demo_hover();
         let placeholder = self.placeholder();
         let status = self.status_line();
         let title = self.window_title();
@@ -859,6 +888,7 @@ impl App {
             palette_open: self.palette_open,
             status: status.as_deref(),
             placeholder: placeholder.as_deref(),
+            demo_hover,
         };
         let fixture = match &self.mode {
             Mode::Bench { fixture, .. } => Some(fixture.as_ref()),
@@ -947,9 +977,15 @@ impl App {
         let now = Instant::now();
         let mut changed = false;
         for a in actions {
-            changed |= !matches!(a, UiAction::Visible(_));
+            // Reported every frame: no redraw of their own.
+            changed |= !matches!(a, UiAction::Visible(_) | UiAction::Hover(_));
             match a {
                 UiAction::Focus(sid) => self.ctl.focus(out!(self), sid, now),
+                UiAction::Hover(sid) => {
+                    if !self.is_bench() {
+                        self.ctl.hover(out!(self), sid)
+                    }
+                }
                 UiAction::Revive(sid, mode) => self.ctl.revive(out!(self), sid, mode, now),
                 UiAction::NewSession => self.ctl.new_session(out!(self)),
                 UiAction::NewSessionIn(ws) => self.ctl.new_session_in(out!(self), ws),
@@ -977,6 +1013,17 @@ impl App {
                 None => true,
                 Some(_) => self.ctl.view().is_some_and(|v| v.visible_complete()),
             }
+            && self.demo_hover_ready()
+    }
+
+    /// `--demo-hover`: the session is listed and its events arrived.
+    fn demo_hover_ready(&self) -> bool {
+        if self.opts.demo_hover.is_none() {
+            return true;
+        }
+        self.demo_hover()
+            .and_then(|sid| self.ctl.recent_events(sid))
+            .is_some_and(|r| r.events.is_some() || r.error.is_some())
     }
 }
 
@@ -1183,10 +1230,12 @@ impl ApplicationHandler<UserEvent> for App {
         } = &mut self.mode
         {
             if now > *deadline {
-                let what = if self.ctl.is_connected() {
-                    "the session list or the focused screen did not arrive"
-                } else {
+                let what = if !self.ctl.is_connected() {
                     "berthd could not be reached"
+                } else if self.opts.demo_hover.is_some() && self.ctl.is_loaded() {
+                    "the --demo-hover session (a live one, by id prefix) or its events did not arrive"
+                } else {
+                    "the session list or the focused screen did not arrive"
                 };
                 self.fail(
                     event_loop,

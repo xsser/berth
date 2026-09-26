@@ -26,6 +26,7 @@ use crate::config::Config;
 use crate::session_view::SessionView;
 use crate::setup_hooks::{self, Agent};
 use crate::sidebar::format_elapsed;
+use crate::timefmt::local_time;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest `Input` the debug sender puts in one request.
@@ -1187,27 +1188,6 @@ pub fn debug(paths: &Paths, cmd: DebugCmd) -> Result<()> {
     Ok(())
 }
 
-/// `ms` since the epoch as local `YYYY-MM-DD HH:MM:SS.mmm`.
-fn local_time(ms: i64) -> String {
-    let secs = ms.div_euclid(1000) as libc::time_t;
-    // SAFETY: an all-zero `tm` is valid; localtime_r only writes into it.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: both pointers are to live locals for the call's duration.
-    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
-        return format!("{ms} ms");
-    }
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-        tm.tm_year + 1900,
-        tm.tm_mon + 1,
-        tm.tm_mday,
-        tm.tm_hour,
-        tm.tm_min,
-        tm.tm_sec,
-        ms.rem_euclid(1000)
-    )
-}
-
 /// `berth debug events`: the daemon's list (newest first) as a table,
 /// oldest first.
 pub fn render_events(events: &[EventEntry]) -> String {
@@ -1576,13 +1556,6 @@ mod tests {
         assert!(lines[1].contains("hook:PreToolUse") && lines[1].contains("Write?[2J"));
         assert!(lines[2].contains("hook:Stop") && lines[2].contains(".345"));
         assert_eq!(render_events(&[]), "（没有事件）\n");
-        let t = local_time(1_790_000_002_345);
-        let shape: String = t
-            .chars()
-            .map(|c| if c.is_ascii_digit() { '9' } else { c })
-            .collect();
-        assert_eq!(shape, "9999-99-99 99:99:99.999", "{t}");
-        assert!(t.ends_with(".345"));
     }
 
     #[test]

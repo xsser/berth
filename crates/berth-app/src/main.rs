@@ -7,14 +7,16 @@
 //! connection), `controller` (protocol state), `session_view` (screen and
 //! history mirror), `renderer/{grid, atlas, text, metrics, sprites,
 //! shaders.wgsl}`, `sidebar` (egui), `input` (key encoding), `ime`, `mouse`,
-//! `paste`, `selection`, `notify`, `cli` (list / doctor / debug), `fixture`
-//! (`--bench` data), `theme`, `config`, `stats`.
+//! `paste`, `selection`, `notify`, `dock` (Dock badge), `cli` (list / doctor
+//! / debug), `setup_hooks`, `fixture` (`--bench` data), `theme`, `timefmt`,
+//! `config`, `stats`.
 
 mod app;
 mod cli;
 mod client;
 mod config;
 mod controller;
+mod dock;
 mod fixture;
 mod ime;
 mod input;
@@ -30,6 +32,7 @@ mod stats;
 #[cfg(test)]
 mod testutil;
 mod theme;
+mod timefmt;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -98,6 +101,10 @@ struct GuiArgs {
     /// Inject a synthetic IME preedit at startup (screenshot check only).
     #[arg(long, hide = true, value_name = "TEXT")]
     demo_preedit: Option<String>,
+    /// Show this live session's hover details without a pointer
+    /// (screenshot check only; id or unique prefix).
+    #[arg(long, hide = true, value_name = "ID")]
+    demo_hover: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -208,6 +215,7 @@ fn gui_options(gui: GuiArgs) -> app::GuiOptions {
         no_vsync: gui.no_vsync,
         cursor_style: gui.cursor_style.map(CursorShape::from),
         demo_preedit: gui.demo_preedit,
+        demo_hover: gui.demo_hover,
     }
 }
 

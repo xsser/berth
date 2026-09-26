@@ -43,6 +43,10 @@ similar = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys.workspace = true
+# Dock badge (`NSApp.dockTile.badgeLabel`); the versions winit already uses.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSDockTile"] }
 
 [dev-dependencies]
 # Client tests run the real daemon in-process on a temporary `Paths::in_dir`.

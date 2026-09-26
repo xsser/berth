@@ -125,8 +125,9 @@ impl Notifier {
 fn deliver(title: &str, body: &str) {
     // Unbundled binaries notify under the library's default identity until
     // berth ships as an app bundle.
-    if let Err(e) = mac_notification_sys::send_notification(title, None, body, None) {
-        tracing::warn!(title, "desktop notification failed: {e}");
+    match mac_notification_sys::send_notification(title, None, body, None) {
+        Ok(_) => tracing::info!(title, body, "desktop notification handed to macOS"),
+        Err(e) => tracing::warn!(title, "desktop notification failed: {e}"),
     }
 }
 

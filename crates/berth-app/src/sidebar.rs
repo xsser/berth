@@ -9,7 +9,13 @@
 //! State source styling (DESIGN §9): hook-sourced states are drawn in full
 //! color, shell-integration ones slightly muted, heuristic ones faint with a
 //! dashed preview bar and marked "推断". An agent leaving (kind back to
-//! `Shell`) switches the kind glyph back to the shell's.
+//! `Shell`) switches the kind glyph back to the shell's. A shell's busy
+//! state (OSC 133 C: a command runs) reads "运行".
+//!
+//! Hovering a live card shows its details: state, since when, source and
+//! confidence, and its newest events (fetched on hover). A dormant card
+//! that can resume its agent shows the command berthd would run (display
+//! only; nothing runs until "Resume" is clicked).
 //!
 //! IME ownership: the terminal owns the window IME. egui-winit toggles
 //! `Window::set_ime_allowed` from `PlatformOutput::ime`, so the sidebar clears
@@ -37,8 +43,10 @@ use egui::{
 };
 use winit::window::Window;
 
-use crate::controller::{Confirm, Controller, NoticeKind, PREVIEW_ROWS};
+use crate::controller::{self, Confirm, Controller, NoticeKind, ResumePreview, PREVIEW_ROWS};
+use crate::setup_hooks::command_line;
 use crate::theme::{mix, Rgb, Theme};
+use crate::timefmt::local_clock;
 
 const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
 const ORANGE: Rgb = [0xde, 0x93, 0x5f];
@@ -128,9 +136,10 @@ pub fn kind_glyph(kind: &AgentKind) -> &'static str {
     }
 }
 
-fn status_text(state: &AgentState, elapsed: &str) -> String {
+fn status_text(kind: &AgentKind, state: &AgentState, elapsed: &str) -> String {
     match state {
         AgentState::Idle => elapsed.to_string(),
+        AgentState::Thinking if *kind == AgentKind::Shell => format!("运行 {elapsed}"),
         AgentState::Thinking => format!("思考 {elapsed}"),
         AgentState::ToolRunning { tool } => format!("{tool} {elapsed}"),
         AgentState::WaitingPermission { .. } => format!("等授权 {elapsed}"),
@@ -153,6 +162,39 @@ fn dormant_text(status: &SessionStatus) -> String {
         SessionStatus::Dormant { .. } => "已退出".into(),
         SessionStatus::Restored => "已恢复 · 只读".into(),
     }
+}
+
+/// The state in words, for the hover details.
+fn state_label(kind: &AgentKind, state: &AgentState) -> String {
+    match state {
+        AgentState::Idle => "空闲".into(),
+        AgentState::Thinking if *kind == AgentKind::Shell => "运行命令".into(),
+        AgentState::Thinking => "思考".into(),
+        AgentState::ToolRunning { tool } => format!("运行工具 {tool}"),
+        AgentState::WaitingPermission { tool: Some(t) } => format!("等授权：{t}"),
+        AgentState::WaitingPermission { tool: None } => "等授权".into(),
+        AgentState::WaitingInput => "等输入".into(),
+        AgentState::Done => "完成".into(),
+        AgentState::Error { message } if message.is_empty() => "出错".into(),
+        AgentState::Error { message } => format!("出错：{message}"),
+        AgentState::Compacting => "压缩上下文".into(),
+        AgentState::Exited { code: Some(c) } => format!("已退出 {c}"),
+        AgentState::Exited { code: None } => "已退出".into(),
+    }
+}
+
+fn source_text(source: StateSource) -> &'static str {
+    match source {
+        StateSource::Hook => "hook",
+        StateSource::ShellIntegration => "shell 集成（OSC 133）",
+        StateSource::Heuristic => "推断（输出活动）",
+    }
+}
+
+fn clean(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 fn kind_label(meta: &SessionMeta) -> String {
@@ -206,6 +248,8 @@ fn preview_format(theme: &Theme, style: &berth_core::Style) -> TextFormat {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiAction {
     Focus(SessionId),
+    /// A live card is hovered (its details want its newest events).
+    Hover(SessionId),
     Revive(SessionId, ReviveMode),
     NewSession,
     NewSessionIn(WorkspaceId),
@@ -226,6 +270,8 @@ pub struct Chrome<'a> {
     pub status: Option<&'a str>,
     /// Centered in the terminal area when there is no screen to show.
     pub placeholder: Option<&'a str>,
+    /// Show this card's hover details without a pointer (`--demo-hover`).
+    pub demo_hover: Option<SessionId>,
 }
 
 /// A system face handed to egui without copying.
@@ -418,6 +464,8 @@ pub struct Sidebar {
     to_free: Vec<egui::TextureId>,
     repaint_delay: Option<Duration>,
     coverage_done: bool,
+    /// `Chrome::demo_hover` of the frame being built.
+    demo_hover: Option<SessionId>,
 }
 
 /// Strings painted in one pass, with the family used (for the coverage log).
@@ -511,6 +559,7 @@ impl Sidebar {
             to_free: Vec::new(),
             repaint_delay: None,
             coverage_done: false,
+            demo_hover: None,
         }
     }
 
@@ -675,6 +724,7 @@ impl Sidebar {
         let pal = self.palette;
         let ctx = ui.ctx().clone();
         let mut visible: Vec<SessionId> = Vec::new();
+        self.demo_hover = chrome.demo_hover;
         egui::Panel::left("berth-sidebar")
             .exact_size(self.width_pt)
             .resizable(false)
@@ -949,8 +999,13 @@ impl Sidebar {
     ) {
         let pal = self.palette;
         let live = m.is_live();
-        let resume = !live && m.agent.kind.is_agent() && m.agent.external_id.is_some();
-        let buttons_h = if live { 0.0 } else { 24.0 };
+        let resume = controller::resumable(m);
+        let resume_line = resume && ctl.card_details();
+        let buttons_h = match (live, resume_line) {
+            (true, _) => 0.0,
+            (false, false) => 24.0,
+            (false, true) => 24.0 + 16.0,
+        };
         let preview_h = PREVIEW_ROWS as f32 * LINE_H + 6.0;
         let height = 4.0 + 18.0 + 16.0 + preview_h + buttons_h + 8.0;
         let (rect, resp) =
@@ -1026,7 +1081,7 @@ impl Sidebar {
             60.0,
         );
         let status = if live {
-            let mut s = status_text(state, &format_elapsed(now_ms - agent.since_ms));
+            let mut s = status_text(&agent.kind, state, &format_elapsed(now_ms - agent.since_ms));
             if source == StateSource::Heuristic && *state != AgentState::Idle {
                 s.push_str(" ·推断");
             }
@@ -1153,14 +1208,138 @@ impl Sidebar {
             );
             if resume {
                 let label = format!("Resume {}", kind_label(m));
-                button(
-                    &label,
-                    ReviveMode::ResumeAgent,
-                    "恢复 agent 会话（id 由 berthd 校验）",
+                let tip = match ctl.resume_preview(m.id) {
+                    Some(ResumePreview {
+                        cwd,
+                        command: Ok(argv),
+                    }) => format!(
+                        "在 {} 运行：\n{}\n（berthd 执行前再校验 id）",
+                        tilde(cwd),
+                        clean(&command_line(argv))
+                    ),
+                    Some(ResumePreview {
+                        command: Err(e), ..
+                    }) => {
+                        format!("berthd 会拒绝：{}", clean(e))
+                    }
+                    None => "恢复 agent 会话（id 由 berthd 校验）".to_string(),
+                };
+                button(&label, ReviveMode::ResumeAgent, &tip);
+            }
+            if resume_line {
+                let (text, color) = match ctl.resume_preview(m.id) {
+                    Some(ResumePreview {
+                        command: Ok(argv), ..
+                    }) => (format!("$ {}", clean(&command_line(argv))), pal.dim),
+                    Some(ResumePreview {
+                        command: Err(e), ..
+                    }) => (format!("不能恢复：{}", clean(e)), pal.orange),
+                    None => ("$ …".to_string(), pal.faint),
+                };
+                paint_text(
+                    ui,
+                    painted,
+                    Pos2::new(preview.left(), y + 20.0 + 4.0 + 7.0),
+                    Align2::LEFT_CENTER,
+                    &text,
+                    mono(10.5),
+                    color,
+                    preview.width(),
                 );
             }
         }
+        if live {
+            let demo = self.demo_hover == Some(m.id);
+            if demo || resp.hovered() {
+                actions.push(UiAction::Hover(m.id));
+            }
+            if demo {
+                egui::Tooltip::for_widget(&resp).show(|ui| self.hover_details(ui, ctl, m, now_ms));
+            } else {
+                resp.on_hover_ui(|ui| self.hover_details(ui, ctl, m, now_ms));
+            }
+        }
         ui.add_space(2.0);
+    }
+
+    /// A live card's details: state, since, source, newest events.
+    fn hover_details(&self, ui: &mut egui::Ui, ctl: &Controller, m: &SessionMeta, now_ms: i64) {
+        let pal = self.palette;
+        let a = &m.agent;
+        ui.set_max_width(340.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "{} {} · {}",
+                kind_glyph(&a.kind),
+                kind_label(m),
+                clean(&state_label(&a.kind, &a.state))
+            ))
+            .font(bold(13.0))
+            .color(self.state_color(&a.state, now_ms)),
+        );
+        let small =
+            |text: String, color: Color32| egui::RichText::new(text).font(prop(11.5)).color(color);
+        ui.label(small(
+            format!(
+                "自 {}（{}前）",
+                local_clock(a.since_ms),
+                format_elapsed(now_ms - a.since_ms)
+            ),
+            pal.fg,
+        ));
+        ui.label(small(
+            format!(
+                "来源：{}（置信度 {:.2}）",
+                source_text(a.source),
+                a.confidence
+            ),
+            pal.fg,
+        ));
+        let mut extra: Vec<String> = Vec::new();
+        if let Some(model) = &a.model {
+            extra.push(clean(model));
+        }
+        if let Some(ctx) = a.context_pct {
+            extra.push(format!("ctx {ctx:.0}%"));
+        }
+        if let Some(cost) = a.cost_usd {
+            extra.push(format!("${cost:.2}"));
+        }
+        if !extra.is_empty() {
+            ui.label(small(extra.join(" · "), pal.dim));
+        }
+        ui.separator();
+        let recent = ctl.recent_events(m.id);
+        match recent.map(|r| (&r.events, &r.error)) {
+            Some((_, Some(e))) => {
+                ui.label(small(format!("读取事件失败：{}", clean(e)), pal.orange));
+            }
+            Some((Some(events), None)) if events.is_empty() => {
+                ui.label(small("（还没有事件）".into(), pal.dim));
+            }
+            Some((Some(events), None)) => {
+                ui.label(small(format!("最近 {} 个事件", events.len()), pal.dim));
+                for e in events.iter().rev() {
+                    let mut line = format!(
+                        "{}  {} → {}",
+                        local_clock(e.at_ms),
+                        clean(&e.kind),
+                        clean(&e.state)
+                    );
+                    if let Some(d) = e.detail.as_deref().filter(|d| !d.is_empty()) {
+                        line.push_str("  ");
+                        line.push_str(&clean(d));
+                    }
+                    ui.label(egui::RichText::new(line).font(mono(11.0)).color(pal.fg));
+                }
+            }
+            _ if !ctl.card_details() => {
+                ui.label(small("（berthd 较旧：没有事件列表）".into(), pal.dim));
+            }
+            _ => {
+                ui.label(small("读取事件…".into(), pal.dim));
+            }
+        }
     }
 
     fn footer(
@@ -1434,6 +1613,31 @@ mod tests {
             assert_eq!(badge(&state, 0), glyph, "{state:?}");
         }
         assert_eq!(badge(&AgentState::Thinking, 1), "◓", "spinner advances");
+    }
+
+    #[test]
+    fn a_shell_running_a_command_reads_running() {
+        let shell = AgentKind::Shell;
+        let claude = AgentKind::Claude;
+        assert_eq!(status_text(&shell, &AgentState::Thinking, "3s"), "运行 3s");
+        assert_eq!(status_text(&claude, &AgentState::Thinking, "3s"), "思考 3s");
+        assert_eq!(status_text(&shell, &AgentState::Idle, "3s"), "3s");
+        assert_eq!(state_label(&shell, &AgentState::Thinking), "运行命令");
+        assert_eq!(state_label(&claude, &AgentState::Thinking), "思考");
+        assert_eq!(
+            state_label(
+                &claude,
+                &AgentState::WaitingPermission {
+                    tool: Some("Write".into())
+                }
+            ),
+            "等授权：Write"
+        );
+        assert_eq!(
+            source_text(StateSource::ShellIntegration),
+            "shell 集成（OSC 133）"
+        );
+        assert_eq!(clean("a\u{1b}[2Jb"), "a?[2Jb");
     }
 
     #[test]

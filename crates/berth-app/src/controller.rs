@@ -15,6 +15,15 @@
 //!   it is visible.
 //! - The answer to `Attach` is the first full screen and the new `seq`
 //!   baseline; other screens for the session are ignored until it arrives.
+//!
+//! Card details are fetched on demand and cached: a hovered card's newest
+//! events (`ListEvents`, again after the session's agent changed) and, for
+//! a visible dormant card whose agent can be resumed, the command
+//! `Revive { ResumeAgent }` would run (`ResumeCommand`, again when the
+//! session's agent id, transcript or cwd changed). Answers are matched to
+//! the request that is still wanted by id. A berthd from before these
+//! requests answers them with an undecodable-message error: then they are
+//! no longer sent on this connection, with one info notice.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -22,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use berth_core::{
-    DaemonMsg, Dims, Event, LineSnapshot, Request, ReviveMode, ScreenUpdate, SessionId,
-    SessionMeta, StyleTable, SubscribeMode, Workspace, WorkspaceId,
+    AgentKind, DaemonMsg, Dims, Event, EventEntry, LineSnapshot, Request, ReviveMode, ScreenUpdate,
+    SessionId, SessionMeta, StyleTable, SubscribeMode, Workspace, WorkspaceId,
 };
 
 use crate::client::Client;
@@ -39,6 +48,10 @@ pub const RESIZE_DEBOUNCE: Duration = Duration::from_millis(50);
 /// (no subscribe/unsubscribe churn while scrolling).
 pub const UNSUBSCRIBE_AFTER: Duration = Duration::from_secs(1);
 const INFO_TTL: Duration = Duration::from_secs(6);
+/// Events shown on a hovered card.
+pub const HOVER_EVENTS: u32 = 5;
+/// How an older berthd answers a request it cannot decode.
+const UNDECODABLE: &str = "undecodable message";
 const MAX_NOTICES: usize = 6;
 const FALLBACK_DIMS: Dims = Dims { cols: 80, rows: 24 };
 
@@ -75,6 +88,51 @@ pub struct Notice {
 pub struct Preview {
     pub lines: Vec<LineSnapshot>,
     pub styles: StyleTable,
+}
+
+/// A card's newest events (`ListEvents`), for its hover details.
+#[derive(Clone, Debug, Default)]
+pub struct RecentEvents {
+    /// Newest first, as berthd sends them; `None` until the first answer.
+    pub events: Option<Vec<EventEntry>>,
+    /// Why the last request failed.
+    pub error: Option<String>,
+    /// The agent changed since the request was sent.
+    stale: bool,
+    /// The request whose answer is wanted.
+    in_flight: Option<u32>,
+}
+
+/// What `Revive { ResumeAgent }` would run for a session (display only).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumePreview {
+    pub cwd: PathBuf,
+    /// The argv, or why berthd would refuse.
+    pub command: std::result::Result<Vec<String>, String>,
+}
+
+/// What a resume command is computed from.
+type ResumeKey = (AgentKind, Option<String>, Option<PathBuf>, PathBuf);
+
+fn resume_key(m: &SessionMeta) -> ResumeKey {
+    (
+        m.agent.kind.clone(),
+        m.agent.external_id.clone(),
+        m.agent.transcript_path.clone(),
+        m.cwd.clone(),
+    )
+}
+
+/// A dormant card offers "Resume" when its agent left an id to resume.
+pub fn resumable(m: &SessionMeta) -> bool {
+    !m.is_live() && m.agent.kind.is_agent() && m.agent.external_id.is_some()
+}
+
+#[derive(Clone, Debug)]
+struct ResumeEntry {
+    key: ResumeKey,
+    preview: Option<ResumePreview>,
+    in_flight: Option<u32>,
 }
 
 /// A question the UI must ask before acting.
@@ -117,6 +175,10 @@ enum Awaiting {
     Attach,
     Subscribe,
     Fetch(SessionId),
+    /// `ListEvents` for a hovered card.
+    Events(SessionId),
+    /// `ResumeCommand` for a dormant card.
+    Resume(SessionId),
     /// Only errors matter; the label says what failed.
     Command(&'static str),
 }
@@ -159,6 +221,10 @@ pub struct Controller {
     /// Command for new sessions (`None`: the daemon's login shell).
     pub new_session_command: Option<Vec<String>>,
     counters: Counters,
+    recent: HashMap<SessionId, RecentEvents>,
+    resume: HashMap<SessionId, ResumeEntry>,
+    /// berthd did not understand `ListEvents` / `ResumeCommand`.
+    details_unsupported: bool,
 }
 
 impl Controller {
@@ -190,6 +256,9 @@ impl Controller {
             auto_created: false,
             new_session_command: None,
             counters: Counters::default(),
+            recent: HashMap::new(),
+            resume: HashMap::new(),
+            details_unsupported: false,
         }
     }
 
@@ -226,6 +295,32 @@ impl Controller {
 
     pub fn preview(&self, sid: SessionId) -> Option<&Preview> {
         self.previews.get(&sid)
+    }
+
+    /// The hovered card's newest events, once asked for ([`Self::hover`]).
+    pub fn recent_events(&self, sid: SessionId) -> Option<&RecentEvents> {
+        self.recent.get(&sid)
+    }
+
+    /// The resume command of a dormant card, once berthd answered.
+    pub fn resume_preview(&self, sid: SessionId) -> Option<&ResumePreview> {
+        self.resume
+            .get(&sid)
+            .filter(|e| self.sessions.get(&sid).map(resume_key).as_ref() == Some(&e.key))
+            .and_then(|e| e.preview.as_ref())
+    }
+
+    /// Whether berthd answers `ListEvents` / `ResumeCommand`.
+    pub fn card_details(&self) -> bool {
+        !self.details_unsupported
+    }
+
+    /// Live sessions whose agent state needs attention (Dock badge).
+    pub fn attention_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|m| m.is_live() && m.agent.state.needs_attention())
+            .count()
     }
 
     pub fn notices(&self) -> &[Notice] {
@@ -396,6 +491,9 @@ impl Controller {
         self.attach_id = None;
         self.sent_dims = None;
         self.mark_read_sent.clear();
+        self.recent.clear();
+        self.resume.clear();
+        self.details_unsupported = false;
         self.loaded_workspaces = false;
         self.loaded_sessions = false;
         self.send(out, Request::ListWorkspaces, Some(Awaiting::ListWorkspaces));
@@ -562,6 +660,9 @@ impl Controller {
                 if let Some(m) = self.sessions.get_mut(&session) {
                     m.agent = agent;
                 }
+                if let Some(r) = self.recent.get_mut(&session) {
+                    r.stale = true;
+                }
             }
             Event::Exited { session, .. } => {
                 if self.paste.as_ref().is_some_and(|(s, _)| *s == session) {
@@ -577,8 +678,27 @@ impl Controller {
                 }
             }
             Event::Ok => {}
-            // Only requested by the CLI so far.
-            Event::Events { .. } | Event::ResumeCommand { .. } => {}
+            Event::Events { session, events } => {
+                if let Some(r) = self.recent.get_mut(&session) {
+                    if reply_to.is_some() && r.in_flight == reply_to {
+                        r.in_flight = None;
+                        r.events = Some(events);
+                        r.error = None;
+                    }
+                }
+            }
+            Event::ResumeCommand {
+                session,
+                cwd,
+                command,
+            } => {
+                if let Some(e) = self.resume.get_mut(&session) {
+                    if reply_to.is_some() && e.in_flight == reply_to {
+                        e.in_flight = None;
+                        e.preview = Some(ResumePreview { cwd, command });
+                    }
+                }
+            }
             Event::Hello { .. } | Event::Incompatible { .. } => {
                 tracing::debug!("unexpected handshake message after Hello");
             }
@@ -608,8 +728,32 @@ impl Controller {
                 }
             }
         }
+        if reply_to.is_none() && message.starts_with(UNDECODABLE) && self.drop_details() {
+            return;
+        }
         let awaiting = reply_to.and_then(|id| self.pending.remove(&id));
         let text = match awaiting {
+            Some(Awaiting::Events(sid)) => {
+                if let Some(r) = self.recent.get_mut(&sid) {
+                    if r.in_flight == reply_to {
+                        r.in_flight = None;
+                        r.error = Some(message);
+                    }
+                }
+                return;
+            }
+            Some(Awaiting::Resume(sid)) => {
+                if let Some(e) = self.resume.get_mut(&sid) {
+                    if e.in_flight == reply_to {
+                        e.in_flight = None;
+                        e.preview = Some(ResumePreview {
+                            cwd: PathBuf::new(),
+                            command: Err(message),
+                        });
+                    }
+                }
+                return;
+            }
             Some(Awaiting::Attach) => {
                 self.attach_id = None;
                 self.attached_to = None;
@@ -667,7 +811,8 @@ impl Controller {
         }
     }
 
-    fn find_session(&self, want: &str) -> std::result::Result<SessionId, String> {
+    /// A session id or unique prefix (with or without dashes).
+    pub fn find_session(&self, want: &str) -> std::result::Result<SessionId, String> {
         let want = want.to_ascii_lowercase();
         let hits: Vec<SessionId> = self
             .sessions
@@ -724,6 +869,8 @@ impl Controller {
         self.subs.remove(&sid);
         self.policy.forget(sid);
         self.mark_read_sent.remove(&sid);
+        self.recent.remove(&sid);
+        self.resume.remove(&sid);
         if self.paste.as_ref().is_some_and(|(s, _)| *s == sid) {
             self.paste = None;
         }
@@ -834,6 +981,9 @@ impl Controller {
             return;
         }
         for &sid in visible {
+            if self.sessions.get(&sid).is_some_and(resumable) {
+                self.want_resume(out, sid);
+            }
             if Some(sid) == self.focused || !self.sessions.contains_key(&sid) {
                 continue;
             }
@@ -869,6 +1019,88 @@ impl Controller {
                 );
             }
         }
+    }
+
+    /// A card is hovered: fetch its newest events unless they are current
+    /// or on their way.
+    pub fn hover(&mut self, out: &mut dyn Outbound, sid: SessionId) {
+        if !self.connected || self.details_unsupported || !self.sessions.contains_key(&sid) {
+            return;
+        }
+        let r = self.recent.entry(sid).or_default();
+        let current = (r.events.is_some() || r.error.is_some()) && !r.stale;
+        if current || r.in_flight.is_some() {
+            return;
+        }
+        r.stale = false;
+        let req = Request::ListEvents {
+            session: sid,
+            limit: HOVER_EVENTS,
+        };
+        let id = self.send(out, req, Some(Awaiting::Events(sid)));
+        if let Some(r) = self.recent.get_mut(&sid) {
+            r.in_flight = id;
+        }
+    }
+
+    /// Ask berthd for a dormant card's resume command unless it is known
+    /// for the session as it is now, or on its way.
+    fn want_resume(&mut self, out: &mut dyn Outbound, sid: SessionId) {
+        if self.details_unsupported {
+            return;
+        }
+        let Some(key) = self.sessions.get(&sid).map(resume_key) else {
+            return;
+        };
+        if let Some(e) = self.resume.get(&sid) {
+            if e.key == key && (e.preview.is_some() || e.in_flight.is_some()) {
+                return;
+            }
+        }
+        let id = self.send(
+            out,
+            Request::ResumeCommand { session: sid },
+            Some(Awaiting::Resume(sid)),
+        );
+        self.resume.insert(
+            sid,
+            ResumeEntry {
+                key,
+                preview: None,
+                in_flight: id,
+            },
+        );
+    }
+
+    /// An undecodable-message error while card details were asked for:
+    /// berthd predates them. Stop asking on this connection (one notice).
+    /// Returns whether the error was about them.
+    fn drop_details(&mut self) -> bool {
+        let asked: Vec<u32> = self
+            .pending
+            .iter()
+            .filter(|(_, a)| matches!(a, Awaiting::Events(_) | Awaiting::Resume(_)))
+            .map(|(id, _)| *id)
+            .collect();
+        if asked.is_empty() && !self.details_unsupported {
+            return false;
+        }
+        for id in &asked {
+            self.pending.remove(id);
+        }
+        for r in self.recent.values_mut() {
+            r.in_flight = None;
+        }
+        for e in self.resume.values_mut() {
+            e.in_flight = None;
+        }
+        if self.details_unsupported {
+            tracing::debug!("undecodable-message error after card details were turned off");
+        } else {
+            self.details_unsupported = true;
+            self.info("berthd 版本较旧，不支持事件列表与恢复命令预览（重启 berthd 后可用）");
+        }
+        true
     }
 
     /// The grid size the window fits; sent as `Resize` after
@@ -1363,6 +1595,239 @@ mod tests {
             .find(|(_, r)| matches!(r, Request::Attach { session, .. } if *session == sid))
             .map(|(id, _)| *id)
             .expect("Attach sent")
+    }
+
+    fn claude_dormant(ws: &Workspace, order: u32, id: &str) -> SessionMeta {
+        let mut m = session(ws, order, false);
+        m.agent.kind = AgentKind::Claude;
+        m.agent.external_id = Some(id.into());
+        m.cwd = PathBuf::from("/tmp/proj");
+        m
+    }
+
+    fn event_entry(at_ms: i64, kind: &str) -> EventEntry {
+        EventEntry {
+            at_ms,
+            kind: kind.into(),
+            state: "thinking".into(),
+            detail: None,
+        }
+    }
+
+    fn requests<'a>(
+        sent: &'a [(u32, Request)],
+        pick: impl Fn(&Request) -> bool + 'a,
+    ) -> Vec<(u32, &'a Request)> {
+        sent.iter()
+            .filter(|(_, r)| pick(r))
+            .map(|(id, r)| (*id, r))
+            .collect()
+    }
+
+    #[test]
+    fn hover_fetches_events_once_until_the_agent_changes() {
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        let w = ws(0);
+        let s = session(&w, 0, true);
+        let sid = s.id;
+        listed(&mut c, &mut out, vec![w], vec![s.clone()]);
+        let now = Instant::now();
+        c.hover(&mut out, sid);
+        let sent = out.take();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(
+            sent[0].1,
+            Request::ListEvents {
+                session: sid,
+                limit: HOVER_EVENTS
+            }
+        );
+        let first = sent[0].0;
+        c.hover(&mut out, sid);
+        assert!(out.take().is_empty(), "in flight: no second request");
+        let events = |ids: &[&str]| Event::Events {
+            session: sid,
+            events: ids.iter().map(|k| event_entry(1, k)).collect(),
+        };
+        // An answer to some other request is not taken.
+        c.handle(&mut out, reply(first + 100, events(&["hook:Other"])), now);
+        assert!(c.recent_events(sid).unwrap().events.is_none());
+        c.handle(&mut out, reply(first, events(&["hook:Stop"])), now);
+        let got = c.recent_events(sid).unwrap();
+        assert_eq!(got.events.as_ref().unwrap()[0].kind, "hook:Stop");
+        c.hover(&mut out, sid);
+        assert!(out.take().is_empty(), "current: no request");
+        // The agent changed: the next hover asks again.
+        let mut agent = s.agent.clone();
+        agent.state = AgentState::WaitingInput;
+        c.handle(
+            &mut out,
+            push(Event::AgentChanged {
+                session: sid,
+                agent,
+            }),
+            now,
+        );
+        c.hover(&mut out, sid);
+        let sent = out.take();
+        assert_eq!(
+            requests(&sent, |r| matches!(r, Request::ListEvents { .. })).len(),
+            1
+        );
+        // A failure is kept for the details, not raised as a notice.
+        c.handle(
+            &mut out,
+            DaemonMsg {
+                reply_to: Some(sent[0].0),
+                event: Event::Error {
+                    message: "cannot read events: disk".into(),
+                },
+            },
+            now,
+        );
+        assert_eq!(
+            c.recent_events(sid).unwrap().error.as_deref(),
+            Some("cannot read events: disk")
+        );
+        assert!(c.notices().is_empty(), "{:?}", c.notices());
+        // Unknown sessions are not asked about.
+        c.hover(&mut out, SessionId::new());
+        assert!(out.take().is_empty());
+    }
+
+    #[test]
+    fn dormant_cards_ask_for_their_resume_command() {
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        let w = ws(0);
+        let d = claude_dormant(&w, 0, "abc");
+        let shell = session(&w, 1, false);
+        let (did, shell_id) = (d.id, shell.id);
+        listed(&mut c, &mut out, vec![w], vec![d.clone(), shell]);
+        let now = Instant::now();
+        c.set_visible(&mut out, &[did, shell_id], now);
+        let sent = out.take();
+        let asked = requests(&sent, |r| matches!(r, Request::ResumeCommand { .. }));
+        assert_eq!(asked.len(), 1, "{sent:?}");
+        assert_eq!(*asked[0].1, Request::ResumeCommand { session: did });
+        let id = asked[0].0;
+        c.set_visible(&mut out, &[did, shell_id], now);
+        assert!(requests(&out.take(), |r| matches!(r, Request::ResumeCommand { .. })).is_empty());
+        let argv = vec!["claude".to_string(), "--resume".into(), "abc".into()];
+        c.handle(
+            &mut out,
+            reply(
+                id,
+                Event::ResumeCommand {
+                    session: did,
+                    cwd: PathBuf::from("/tmp/proj"),
+                    command: Ok(argv.clone()),
+                },
+            ),
+            now,
+        );
+        assert_eq!(
+            c.resume_preview(did),
+            Some(&ResumePreview {
+                cwd: PathBuf::from("/tmp/proj"),
+                command: Ok(argv),
+            })
+        );
+        assert!(c.resume_preview(shell_id).is_none());
+        // Another agent id: the old command no longer applies; asked again.
+        let mut changed = d.clone();
+        changed.agent.external_id = Some("def".into());
+        c.handle(&mut out, push(Event::SessionUpdated(changed)), now);
+        assert!(c.resume_preview(did).is_none());
+        c.set_visible(&mut out, &[did], now);
+        let sent = out.take();
+        let asked = requests(&sent, |r| matches!(r, Request::ResumeCommand { .. }));
+        assert_eq!(asked.len(), 1, "{sent:?}");
+        // berthd refuses: the reason is shown instead of a command.
+        c.handle(
+            &mut out,
+            reply(
+                asked[0].0,
+                Event::ResumeCommand {
+                    session: did,
+                    cwd: PathBuf::from("/tmp/proj"),
+                    command: Err("no resume_command for claude".into()),
+                },
+            ),
+            now,
+        );
+        assert!(c.resume_preview(did).unwrap().command.is_err());
+    }
+
+    #[test]
+    fn an_older_daemon_turns_card_details_off_with_one_notice() {
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        let w = ws(0);
+        let live = session(&w, 0, true);
+        let d = claude_dormant(&w, 1, "abc");
+        let (lid, did) = (live.id, d.id);
+        listed(&mut c, &mut out, vec![w], vec![live, d]);
+        let now = Instant::now();
+        let undecodable = || {
+            push(Event::Error {
+                message: "undecodable message: Found an enum discriminant that was not valid"
+                    .into(),
+            })
+        };
+        c.hover(&mut out, lid);
+        c.set_visible(&mut out, &[did], now);
+        out.take();
+        c.handle(&mut out, undecodable(), now);
+        c.handle(&mut out, undecodable(), now);
+        assert!(!c.card_details());
+        let kinds: Vec<NoticeKind> = c.notices().iter().map(|n| n.kind).collect();
+        assert_eq!(kinds, [NoticeKind::Info], "{:?}", c.notices());
+        c.hover(&mut out, lid);
+        c.set_visible(&mut out, &[did], now);
+        let sent = out.take();
+        assert!(
+            requests(&sent, |r| matches!(
+                r,
+                Request::ListEvents { .. } | Request::ResumeCommand { .. }
+            ))
+            .is_empty(),
+            "{sent:?}"
+        );
+        // A new connection may reach a newer berthd.
+        c.on_connected(&mut out);
+        assert!(c.card_details());
+
+        // Without card details asked for, the same error is a real one.
+        let mut c = Controller::new(vec![]);
+        let w = ws(0);
+        listed(&mut c, &mut out, vec![w], vec![]);
+        c.handle(&mut out, undecodable(), now);
+        assert_eq!(c.notices()[0].kind, NoticeKind::Error);
+        assert!(c.card_details());
+    }
+
+    #[test]
+    fn attention_count_is_live_sessions_needing_attention() {
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        let w = ws(0);
+        let mut waiting = session(&w, 0, true);
+        waiting.agent.state = AgentState::WaitingPermission { tool: None };
+        let mut done = session(&w, 1, true);
+        done.agent.state = AgentState::Done;
+        let mut busy = session(&w, 2, true);
+        busy.agent.state = AgentState::Thinking;
+        let mut dormant = session(&w, 3, false);
+        dormant.agent.state = AgentState::Done;
+        listed(
+            &mut c,
+            &mut out,
+            vec![w],
+            vec![waiting, done, busy, dormant],
+        );
+        assert_eq!(c.attention_count(), 2);
     }
 
     #[test]
