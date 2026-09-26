@@ -857,11 +857,11 @@ impl Actor {
             self.write_snapshot(true);
         }
         if let Some(mut live) = self.live.take() {
+            // Dropping the handle reaps the child in the background
+            // (SIGKILL after berth-vt's grace period if SIGHUP is ignored).
             if let Err(e) = live.pty.kill() {
                 tracing::debug!(session = %self.id, error = %e, "SIGHUP on stop failed");
             }
-            // Reap briefly so we don't leave zombies behind.
-            let _ = wait_exit(&mut live.pty, Duration::from_millis(200));
         }
         if let Some(mut j) = self.journal.take() {
             if let Err(e) = j.flush() {
@@ -993,8 +993,10 @@ impl Actor {
         }
         if self.kill_deadline.is_some_and(|d| d <= now) {
             self.kill_deadline = None;
-            if let Some(live) = &self.live {
-                force_kill(live.pty.child_pid());
+            if let Some(live) = &mut self.live {
+                if let Err(e) = live.pty.force_kill() {
+                    tracing::warn!(session = %self.id, error = %e, "SIGKILL failed");
+                }
             }
         }
     }
@@ -1046,22 +1048,5 @@ fn wait_exit(pty: &mut PtyHandle, max: Duration) -> Option<i32> {
                 return None;
             }
         }
-    }
-}
-
-/// SIGKILL the child's process group (the child is its session leader)
-/// after SIGHUP was ignored.
-#[allow(unsafe_code)]
-fn force_kill(pid: u32) {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return;
-    };
-    if pid <= 1 {
-        return;
-    }
-    // SAFETY: plain syscalls on a pid we spawned; no memory is shared.
-    unsafe {
-        libc::killpg(pid, libc::SIGKILL);
-        libc::kill(pid, libc::SIGKILL);
     }
 }
