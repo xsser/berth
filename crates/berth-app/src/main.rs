@@ -8,14 +8,28 @@
 //! `keybinds`, `notify`, `setup_hooks`.
 
 mod app;
+#[allow(dead_code)] // wired into the app in the following commits
+mod client;
 mod config;
 mod fixture;
 mod ime;
 mod input;
+#[allow(dead_code)]
+mod mouse;
+#[allow(dead_code)]
+mod notify;
+#[allow(dead_code)]
+mod paste;
 mod renderer;
+#[allow(dead_code)]
+mod selection;
+#[allow(dead_code)]
+mod session_view;
 mod sidebar;
 mod stats;
 mod terminal;
+#[cfg(test)]
+mod testutil;
 mod theme;
 
 use std::path::PathBuf;

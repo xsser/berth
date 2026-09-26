@@ -38,3 +38,9 @@ rustc-hash.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys.workspace = true
+
+[dev-dependencies]
+# Client tests run the real daemon in-process on a temporary `Paths::in_dir`.
+berth-daemon = { path = "../berth-daemon" }
+tokio.workspace = true
+tempfile.workspace = true
