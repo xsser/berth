@@ -67,6 +67,21 @@ pub fn installed_hook(text: &str) -> Option<String> {
     is_berth(&argv).then(|| argv[0].clone())
 }
 
+/// Whether notify goes through berth-hook, its path, and whether the
+/// original program is chained.
+pub fn installed(text: &str) -> Result<super::Installed, String> {
+    let mut out = super::Installed::default();
+    if let Some(argv) = notify(&parse(text)?)?.filter(|a| is_berth(a)) {
+        out.events.push("notify");
+        out.hooks.push(argv[0].clone());
+        out.chained = matches!(
+            argv.get(2).map(String::as_str),
+            Some("--chain") | Some("--")
+        );
+    }
+    Ok(out)
+}
+
 /// `text` with notify going through `hook` (idempotent; an older
 /// berth-hook path is replaced).
 pub fn install(text: &str, hook: &str) -> Result<Change, String> {

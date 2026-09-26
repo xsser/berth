@@ -119,6 +119,12 @@ pub fn quote(s: &str) -> String {
     }
 }
 
+/// `argv` as one `sh` command line (for display: each word quoted as
+/// needed, so what is shown is what would run).
+pub fn command_line(argv: &[String]) -> String {
+    argv.iter().map(|w| quote(w)).collect::<Vec<_>>().join(" ")
+}
+
 /// Whether `word` names a `berth-hook` executable (any directory).
 pub fn is_berth_hook(word: &str) -> bool {
     std::path::Path::new(word)
@@ -153,6 +159,17 @@ pub fn is_plain_command(words: &Words) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_line_quotes_only_what_needs_it() {
+        let argv: Vec<String> = ["claude", "--resume", "a b", "it's", "x-1.2"]
+            .map(String::from)
+            .to_vec();
+        let line = command_line(&argv);
+        assert_eq!(line, r"claude --resume 'a b' 'it'\''s' x-1.2");
+        assert_eq!(split(&line).unwrap().words.len(), 5);
+        assert_eq!(texts(&line), argv);
+    }
 
     fn texts(s: &str) -> Vec<String> {
         split(s)

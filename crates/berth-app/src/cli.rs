@@ -3,9 +3,11 @@
 //!
 //! None of them launches `berthd`. `doctor` only reads: metadata of the
 //! data directory and socket, the daemon's status, the login shell's PATH,
-//! and whether `~/.claude/settings.json` / `~/.codex/config.toml` mention
-//! `berth-hook`. Of those two files it prints event / key names and
-//! booleans only, never their contents (they can hold credentials).
+//! which hook events of `~/.claude/settings.json` and whether the `notify`
+//! of `~/.codex/config.toml` go through `berth-hook` (judged as `berth
+//! setup-hooks` judges them), and the shell integration setting and files.
+//! Of the two agent files it prints event names, berth-hook paths and
+//! booleans only, never their values (they can hold credentials).
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -14,14 +16,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use berth_core::{
-    AgentInfo, AgentKind, AgentState, ClientRole, Dims, Event, Paths, Request, ReviveMode,
-    SessionId, SessionMeta, SessionStatus, StateSource, SubscribeMode, Workspace,
+    AgentInfo, AgentKind, AgentState, ClientRole, Dims, Event, EventEntry, Paths, Request,
+    ReviveMode, SessionId, SessionMeta, SessionStatus, StateSource, SubscribeMode, Workspace,
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::client::{self, LoginEnv, SyncClient};
 use crate::config::Config;
 use crate::session_view::SessionView;
+use crate::setup_hooks::{self, Agent};
 use crate::sidebar::format_elapsed;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -83,6 +86,17 @@ pub enum DebugCmd {
     },
     /// Kill a live session's process (it becomes dormant).
     Kill { session: String },
+    /// The session's agent events (state changes, hooks, OSC 133 marks),
+    /// oldest first, in local time.
+    Events {
+        session: String,
+        /// How many of the newest events (the daemon returns at most 200).
+        #[arg(long, value_name = "N", default_value_t = 50)]
+        limit: u32,
+    },
+    /// What `revive --agent` would run for the session, and in which
+    /// directory (nothing is started).
+    Resume { session: String },
 }
 
 fn connect(paths: &Paths) -> Result<SyncClient> {
@@ -430,72 +444,230 @@ pub fn describe_resolution(name: &str, found: &Option<String>) -> Check {
     }
 }
 
-fn json_mentions(v: &serde_json::Value, needle: &str) -> bool {
-    match v {
-        serde_json::Value::String(s) => s.contains(needle),
-        serde_json::Value::Array(a) => a.iter().any(|x| json_mentions(x, needle)),
-        serde_json::Value::Object(o) => o.values().any(|x| json_mentions(x, needle)),
-        _ => false,
-    }
-}
+const SETUP_CLAUDE_HINT: &str = "`berth setup-hooks claude` 预览安装（加 --yes 才写入）";
+const SETUP_CODEX_HINT: &str = "`berth setup-hooks codex` 预览安装（加 --yes 才写入）";
 
-fn toml_mentions(v: &toml::Value, needle: &str) -> bool {
-    match v {
-        toml::Value::String(s) => s.contains(needle),
-        toml::Value::Array(a) => a.iter().any(|x| toml_mentions(x, needle)),
-        toml::Value::Table(t) => t.values().any(|x| toml_mentions(x, needle)),
-        _ => false,
-    }
-}
-
-/// Which Claude Code hook events call `berth-hook`, and whether the
-/// statusline goes through it. `Ok(None)`: the file does not exist.
-pub fn claude_hooks(path: &Path) -> Result<Option<(Vec<String>, bool)>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => bail!("无法读取：{}", e.kind()),
-    };
-    // serde_json's messages carry no input text; still only keep the position.
-    let v: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| anyhow!("不是有效的 JSON（第 {} 行第 {} 列）", e.line(), e.column()))?;
-    let mut events: Vec<String> = v
-        .get("hooks")
-        .and_then(serde_json::Value::as_object)
-        .map(|hooks| {
-            hooks
-                .iter()
-                .filter(|(_, entries)| json_mentions(entries, "berth-hook"))
-                .map(|(event, _)| clean(event))
-                .collect()
-        })
-        .unwrap_or_default();
-    events.sort();
-    let statusline = v
-        .get("statusLine")
-        .is_some_and(|s| json_mentions(s, "berth-hook"));
-    Ok(Some((events, statusline)))
-}
-
-/// Top-level keys of `~/.codex/config.toml` whose value mentions
-/// `berth-hook` (e.g. `notify`). `Ok(None)`: the file does not exist.
-pub fn codex_hooks(path: &Path) -> Result<Option<Vec<String>>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => bail!("无法读取：{}", e.kind()),
-    };
-    // toml's error messages quote the offending line: never show them.
-    let v: toml::Table = text
-        .parse()
-        .map_err(|_| anyhow!("不是有效的 TOML（错误详情含文件内容，不显示）"))?;
-    let mut keys: Vec<String> = v
+/// The berth-hook paths of an installation, each marked when it is not an
+/// executable file (or is a bare name looked up in PATH); `true` when one
+/// cannot run or they differ (setup-hooks points them all at one path).
+fn hook_paths(paths: &[String]) -> (String, bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut bad = paths.len() > 1;
+    let shown: Vec<String> = paths
         .iter()
-        .filter(|(_, val)| toml_mentions(val, "berth-hook"))
-        .map(|(k, _)| clean(k))
+        .map(|p| {
+            let path = Path::new(p);
+            if !path.is_absolute() {
+                return format!("{}（按 PATH 查找）", clean(p));
+            }
+            let runnable = path
+                .metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+            if runnable {
+                clean(p)
+            } else {
+                bad = true;
+                format!("{}（不存在或不可执行）", clean(p))
+            }
+        })
         .collect();
-    keys.sort();
-    Ok(Some(keys))
+    let mut text = shown.join(", ");
+    if paths.len() > 1 {
+        text.push_str("（路径不一致；重新运行 berth setup-hooks 会统一）");
+    }
+    (text, bad)
+}
+
+/// `~/.claude/settings.json`: how many of the events setup-hooks installs
+/// call berth-hook, which are missing, the paths, the status line.
+fn claude_hooks_check(home: &Path) -> Check {
+    const LABEL: &str = "Claude hooks";
+    let file = setup_hooks::config_file(Agent::Claude, home);
+    let installed = match setup_hooks::installed(Agent::Claude, home) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return Check::new(
+                Level::Info,
+                LABEL,
+                format!("{} 不存在；{SETUP_CLAUDE_HINT}", file.display()),
+            )
+        }
+        Err(e) => return Check::new(Level::Warn, LABEL, format!("{e:#}")),
+    };
+    let line = if installed.statusline {
+        "statusline 经 berth-hook"
+    } else {
+        "statusline 未经 berth-hook"
+    };
+    if installed.events.is_empty() {
+        return Check::new(
+            Level::Info,
+            LABEL,
+            format!("未安装（没有事件调用 berth-hook claude；{line}）；{SETUP_CLAUDE_HINT}"),
+        );
+    }
+    let mut level = Level::Ok;
+    let mut detail = format!(
+        "berth-hook 已挂在 {}/{} 个事件",
+        installed.events.len(),
+        setup_hooks::CLAUDE_EVENTS.len()
+    );
+    if !installed.missing.is_empty() {
+        level = Level::Warn;
+        let _ = write!(
+            detail,
+            "；缺 {}（重新运行 `berth setup-hooks claude` 可补齐）",
+            installed.missing.join(", ")
+        );
+    }
+    let (paths, bad) = hook_paths(&installed.hooks);
+    if bad {
+        level = Level::Warn;
+    }
+    let _ = write!(detail, "；berth-hook：{paths}；{line}");
+    Check::new(level, LABEL, detail)
+}
+
+/// `~/.codex/config.toml`: whether `notify` goes through berth-hook, and
+/// whether the original program is chained.
+fn codex_notify_check(home: &Path) -> Check {
+    const LABEL: &str = "Codex notify";
+    let file = setup_hooks::config_file(Agent::Codex, home);
+    let installed = match setup_hooks::installed(Agent::Codex, home) {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            return Check::new(
+                Level::Info,
+                LABEL,
+                format!("{} 不存在；{SETUP_CODEX_HINT}", file.display()),
+            )
+        }
+        Err(e) => return Check::new(Level::Warn, LABEL, format!("{e:#}")),
+    };
+    if installed.events.is_empty() {
+        return Check::new(
+            Level::Info,
+            LABEL,
+            format!("notify 未经 berth-hook；{SETUP_CODEX_HINT}"),
+        );
+    }
+    let (paths, bad) = hook_paths(&installed.hooks);
+    let chain = if installed.chained {
+        "，转发后执行原 notify 程序"
+    } else {
+        ""
+    };
+    Check::new(
+        if bad { Level::Warn } else { Level::Ok },
+        LABEL,
+        format!("notify 经 berth-hook{chain}；berth-hook：{paths}"),
+    )
+}
+
+/// Where berthd writes the zsh integration files (`berth_daemon::
+/// shell_integration::zsh_dir`; a test keeps the two equal).
+pub fn zsh_integration_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("shell-integration").join("zsh")
+}
+
+/// The files berthd writes into [`zsh_integration_dir`].
+const ZSH_INTEGRATION_FILES: [&str; 2] = [".zshenv", "berth-integration.zsh"];
+
+/// `[terminal] shell_integration` as berthd reads this key (`auto` | `zsh`
+/// on, `none` or anything else off; a missing or unreadable file means the
+/// default `auto`): whether the zsh integration is on, the setting as
+/// shown, and whether it needs attention.
+fn shell_integration_setting(config_file: &Path) -> (bool, String, bool) {
+    let text = match std::fs::read_to_string(config_file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (true, "auto（默认）".into(), false)
+        }
+        Err(e) => {
+            return (
+                true,
+                format!("配置文件无法读取（{}），berthd 使用默认值 auto", e.kind()),
+                true,
+            )
+        }
+    };
+    // toml's error messages quote the file: never show them.
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return (true, "配置文件无效，berthd 使用默认值 auto".into(), true);
+    };
+    match table
+        .get("terminal")
+        .and_then(|t| t.get("shell_integration"))
+    {
+        None => (true, "auto（默认）".into(), false),
+        Some(toml::Value::String(v)) => match v.as_str() {
+            "auto" | "zsh" => (true, v.clone(), false),
+            "none" => (false, "none（已关闭）".into(), false),
+            other => (
+                false,
+                format!(
+                    "{:?} 不认识：berthd 按关闭处理（可选 auto | zsh | none）",
+                    clean(other)
+                ),
+                true,
+            ),
+        },
+        Some(_) => (
+            true,
+            "不是字符串：berthd 忽略整个配置文件、使用默认值 auto".into(),
+            true,
+        ),
+    }
+}
+
+/// The zsh integration: setting, login shell, files, and how many live
+/// sessions have their state from OSC 133 marks.
+fn shell_integration_check(input: &DoctorInput, sessions: Option<&[SessionMeta]>) -> Check {
+    let (on, setting, attention) = shell_integration_setting(&input.paths.config_file);
+    let zsh = input.login.shell.file_name().is_some_and(|n| n == "zsh");
+    let mut detail = format!("[terminal] shell_integration = {setting}");
+    if on {
+        if !zsh {
+            let _ = write!(
+                detail,
+                "；登录 shell 是 {}：目前只有 zsh 有集成",
+                input.login.shell.display()
+            );
+        }
+        let dir = zsh_integration_dir(&input.paths.data_dir);
+        if ZSH_INTEGRATION_FILES.iter().all(|f| dir.join(f).is_file()) {
+            let _ = write!(detail, "；zsh 垫片已写入 {}", dir.display());
+        } else {
+            let _ = write!(
+                detail,
+                "；zsh 垫片尚未写入（berthd 启动 zsh session 时写入并校验 {}）",
+                dir.display()
+            );
+        }
+    }
+    match sessions {
+        Some(ss) => {
+            let live: Vec<&SessionMeta> = ss.iter().filter(|s| s.is_live()).collect();
+            let marked = live
+                .iter()
+                .filter(|s| s.agent.source == StateSource::ShellIntegration)
+                .count();
+            let _ = write!(
+                detail,
+                "；{} 个 live session 中 {marked} 个的状态来自 OSC 133 标记",
+                live.len()
+            );
+        }
+        None => detail.push_str("；berthd 未连上，无法观察运行中的 session"),
+    }
+    let level = if attention {
+        Level::Warn
+    } else if on && zsh {
+        Level::Ok
+    } else {
+        Level::Info
+    };
+    Check::new(level, "shell 集成", detail)
 }
 
 /// Everything `berth doctor` checks, with the environment passed in.
@@ -609,67 +781,11 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<Check> {
         checks.push(describe_resolution("codex", &login.codex));
     }
 
-    // Hooks (read-only; installing them is `berth setup-hooks`, M3).
+    // Hooks (read-only; installing them is `berth setup-hooks`).
     match input.home {
         Some(home) => {
-            let settings = home.join(".claude/settings.json");
-            checks.push(match claude_hooks(&settings) {
-                Ok(None) => Check::new(
-                    Level::Info,
-                    "Claude hooks",
-                    format!("{} 不存在", settings.display()),
-                ),
-                Ok(Some((events, statusline))) => {
-                    let line = if statusline {
-                        "statusline 经 berth-hook"
-                    } else {
-                        "statusline 未经 berth-hook"
-                    };
-                    if events.is_empty() {
-                        Check::new(
-                            Level::Info,
-                            "Claude hooks",
-                            format!(
-                                "未安装（没有事件调用 berth-hook；{line}）；安装属于 M3 `berth setup-hooks`，需显式确认"
-                            ),
-                        )
-                    } else {
-                        Check::new(
-                            Level::Ok,
-                            "Claude hooks",
-                            format!("berth-hook 已挂在：{}；{line}", events.join(", ")),
-                        )
-                    }
-                }
-                Err(e) => Check::new(
-                    Level::Warn,
-                    "Claude hooks",
-                    format!("{}：{e}", settings.display()),
-                ),
-            });
-            let codex = home.join(".codex/config.toml");
-            checks.push(match codex_hooks(&codex) {
-                Ok(None) => Check::new(
-                    Level::Info,
-                    "Codex notify",
-                    format!("{} 不存在", codex.display()),
-                ),
-                Ok(Some(keys)) if keys.is_empty() => Check::new(
-                    Level::Info,
-                    "Codex notify",
-                    "未指向 berth-hook；安装属于 M3 `berth setup-hooks`，需显式确认",
-                ),
-                Ok(Some(keys)) => Check::new(
-                    Level::Ok,
-                    "Codex notify",
-                    format!("berth-hook 出现在键：{}", keys.join(", ")),
-                ),
-                Err(e) => Check::new(
-                    Level::Warn,
-                    "Codex notify",
-                    format!("{}：{e}", codex.display()),
-                ),
-            });
+            checks.push(claude_hooks_check(home));
+            checks.push(codex_notify_check(home));
         }
         None => checks.push(Check::new(
             Level::Warn,
@@ -678,30 +794,7 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<Check> {
         )),
     }
 
-    // Shell integration: berth does not inject OSC 133 yet (M3); report
-    // whether any live session's state came from OSC 133 marks.
-    checks.push(match &sessions {
-        Some(ss) => {
-            let live: Vec<&SessionMeta> = ss.iter().filter(|s| s.is_live()).collect();
-            let marked = live
-                .iter()
-                .filter(|s| s.agent.source == StateSource::ShellIntegration)
-                .count();
-            Check::new(
-                if marked > 0 { Level::Ok } else { Level::Info },
-                "shell 集成",
-                format!(
-                    "berth 尚未自动注入 OSC 133（M3）；{} 个 live session 中 {marked} 个的状态来自 OSC 133 标记",
-                    live.len()
-                ),
-            )
-        }
-        None => Check::new(
-            Level::Info,
-            "shell 集成",
-            "berth 尚未自动注入 OSC 133（M3）；berthd 未连上，无法观察运行中的 session",
-        ),
-    });
+    checks.push(shell_integration_check(input, sessions.as_deref()));
 
     // Config file.
     let config = &paths.config_file;
@@ -1066,8 +1159,76 @@ pub fn debug(paths: &Paths, cmd: DebugCmd) -> Result<()> {
                 other => return Err(unexpected("Kill", other)),
             }
         }
+        DebugCmd::Events { session, limit } => {
+            let meta = session_arg(&mut c, &session)?;
+            let request = Request::ListEvents {
+                session: meta.id,
+                limit,
+            };
+            match c.request(request, TIMEOUT)? {
+                Event::Events { events, .. } => print!("{}", render_events(&events)),
+                other => return Err(unexpected("ListEvents", other)),
+            }
+        }
+        DebugCmd::Resume { session } => {
+            let meta = session_arg(&mut c, &session)?;
+            match c.request(Request::ResumeCommand { session: meta.id }, TIMEOUT)? {
+                Event::ResumeCommand { cwd, command, .. } => {
+                    println!("cwd: {}", cwd.display());
+                    match command {
+                        Ok(argv) => println!("command: {}", setup_hooks::command_line(&argv)),
+                        Err(e) => bail!("不能恢复 agent：{e}"),
+                    }
+                }
+                other => return Err(unexpected("ResumeCommand", other)),
+            }
+        }
     }
     Ok(())
+}
+
+/// `ms` since the epoch as local `YYYY-MM-DD HH:MM:SS.mmm`.
+fn local_time(ms: i64) -> String {
+    let secs = ms.div_euclid(1000) as libc::time_t;
+    // SAFETY: an all-zero `tm` is valid; localtime_r only writes into it.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are to live locals for the call's duration.
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return format!("{ms} ms");
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        ms.rem_euclid(1000)
+    )
+}
+
+/// `berth debug events`: the daemon's list (newest first) as a table,
+/// oldest first.
+pub fn render_events(events: &[EventEntry]) -> String {
+    if events.is_empty() {
+        return "（没有事件）\n".into();
+    }
+    let mut rows = vec![vec![
+        "时间".to_string(),
+        "事件".to_string(),
+        "状态".to_string(),
+        "详情".to_string(),
+    ]];
+    rows.extend(events.iter().rev().map(|e| {
+        vec![
+            local_time(e.at_ms),
+            clean(&e.kind),
+            clean(&e.state),
+            e.detail.as_deref().map(clean).unwrap_or_default(),
+        ]
+    }));
+    table(&rows)
 }
 
 #[cfg(test)]
@@ -1178,42 +1339,250 @@ mod tests {
         assert_eq!(sh.level, Level::Ok);
     }
 
+    /// A fake `berth-hook` (executable) in `dir`.
+    fn fake_hook(dir: &Path) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let hook = dir.join("berth-hook");
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        hook.to_str().unwrap().to_owned()
+    }
+
+    fn setup(home: &Path, agent: Agent, hook: &str) {
+        let args = setup_hooks::Args {
+            agent,
+            statusline: false,
+            yes: true,
+            undo: false,
+            hook_path: Some(PathBuf::from(hook)),
+        };
+        let env = setup_hooks::Env {
+            home: home.to_path_buf(),
+            exe: None,
+            cwd: home.to_path_buf(),
+            claude_config_dir: false,
+            codex_home: false,
+            now: std::time::SystemTime::now(),
+        };
+        setup_hooks::run(&args, &env).unwrap();
+    }
+
     #[test]
-    fn hook_detection_reports_names_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let settings = dir.path().join("settings.json");
+    fn claude_hooks_are_counted_as_setup_hooks_installs_them() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let check = claude_hooks_check(home);
+        assert_eq!(check.level, Level::Info);
+        assert!(check.detail.contains("不存在") && check.detail.contains("setup-hooks claude"));
+
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let settings = home.join(".claude/settings.json");
         std::fs::write(
             &settings,
             r#"{
               "env": {"ANTHROPIC_API_KEY": "sk-not-a-real-key"},
               "hooks": {
-                "Stop": [{"hooks": [{"type": "command", "command": "berth-hook claude"}]}],
-                "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "other"}]}]
+                "Stop": [{"hooks": [{"type": "command", "command": "/gone/berth-hook claude"}]}],
+                "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo berth-hook"}]}]
               },
-              "statusLine": {"type": "command", "command": "berth-hook statusline -- sh s.sh"}
+              "statusLine": {"type": "command", "command": "/gone/berth-hook statusline -- sh s.sh"}
             }"#,
         )
         .unwrap();
-        let (events, statusline) = claude_hooks(&settings).unwrap().unwrap();
-        assert_eq!(events, vec!["Stop".to_string()]);
-        assert!(statusline);
-        assert!(claude_hooks(&dir.path().join("none.json"))
+        let check = claude_hooks_check(home);
+        assert_eq!(check.level, Level::Warn, "{}", check.detail);
+        // "echo berth-hook" is not a berth hook: only Stop counts.
+        assert!(check.detail.contains("1/18"), "{}", check.detail);
+        assert!(check.detail.contains("缺 SessionStart"), "{}", check.detail);
+        let installed = setup_hooks::installed(Agent::Claude, home)
             .unwrap()
-            .is_none());
-        std::fs::write(&settings, "{ \"env\": \"sk-secret\" ").unwrap();
-        let err = claude_hooks(&settings).unwrap_err().to_string();
-        assert!(!err.contains("sk-secret"), "{err}");
+            .unwrap();
+        assert_eq!(installed.events, ["Stop"]);
+        assert_eq!(installed.missing.len(), 17);
+        assert_eq!(installed.hooks, ["/gone/berth-hook"]);
+        assert!(installed.statusline);
+        assert!(
+            check
+                .detail
+                .contains("/gone/berth-hook（不存在或不可执行）"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("statusline 经 berth-hook"));
+        assert!(!check.detail.contains("sk-not"));
 
-        let codex = dir.path().join("config.toml");
-        std::fs::write(
-            &codex,
-            "model = \"x\"\nnotify = [\"berth-hook\", \"codex\", \"--chain\", \"old\"]\n",
-        )
-        .unwrap();
-        assert_eq!(codex_hooks(&codex).unwrap().unwrap(), vec!["notify"]);
-        std::fs::write(&codex, "token = \"sk-secret\nbroken").unwrap();
-        let err = codex_hooks(&codex).unwrap_err().to_string();
-        assert!(!err.contains("sk-secret"), "{err}");
+        // After `berth setup-hooks claude --yes`: all events, one path.
+        let bin = tempfile::tempdir().unwrap();
+        let hook = fake_hook(bin.path());
+        std::fs::write(&settings, "{\"env\": {\"TOKEN\": \"sk-secret\"}}\n").unwrap();
+        setup(home, Agent::Claude, &hook);
+        let check = claude_hooks_check(home);
+        assert_eq!(check.level, Level::Ok, "{}", check.detail);
+        assert!(check.detail.contains("18/18"), "{}", check.detail);
+        assert!(check.detail.contains(&hook) && !check.detail.contains("缺"));
+        assert!(check.detail.contains("statusline 未经 berth-hook"));
+
+        std::fs::write(&settings, "{ \"env\": \"sk-secret\" ").unwrap();
+        let check = claude_hooks_check(home);
+        assert_eq!(check.level, Level::Warn);
+        assert!(!check.detail.contains("sk-secret"), "{}", check.detail);
+        assert!(check.detail.contains("第 1 行"), "{}", check.detail);
+    }
+
+    #[test]
+    fn codex_notify_reports_the_chain_and_never_values() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        assert!(codex_notify_check(home).detail.contains("不存在"));
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        let config = home.join(".codex/config.toml");
+        std::fs::write(&config, "model = \"x\"\nnotify = [\"notify-send\"]\n").unwrap();
+        let check = codex_notify_check(home);
+        assert_eq!(check.level, Level::Info);
+        assert!(check.detail.contains("未经 berth-hook"), "{}", check.detail);
+
+        let bin = tempfile::tempdir().unwrap();
+        let hook = fake_hook(bin.path());
+        setup(home, Agent::Codex, &hook);
+        let check = codex_notify_check(home);
+        assert_eq!(check.level, Level::Ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("转发后执行原 notify 程序"),
+            "{}",
+            check.detail
+        );
+        assert!(!check.detail.contains("notify-send"));
+
+        std::fs::write(&config, "notify = [\"berth-hook\", \"codex\"]\n").unwrap();
+        let check = codex_notify_check(home);
+        assert!(
+            check.detail.contains("berth-hook（按 PATH 查找）"),
+            "{}",
+            check.detail
+        );
+        assert!(!check.detail.contains("转发"));
+
+        std::fs::write(&config, "token = \"sk-secret\nbroken").unwrap();
+        let check = codex_notify_check(home);
+        assert_eq!(check.level, Level::Warn);
+        assert!(!check.detail.contains("sk-secret"), "{}", check.detail);
+    }
+
+    #[test]
+    fn shell_integration_setting_follows_berthd() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        let setting = |text: Option<&str>| {
+            match text {
+                Some(t) => std::fs::write(&file, t).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&file);
+                }
+            }
+            shell_integration_setting(&file)
+        };
+        assert_eq!(setting(None), (true, "auto（默认）".into(), false));
+        assert!(setting(Some("[font]\nsize = 12\n")).0);
+        assert_eq!(
+            setting(Some("[terminal]\nshell_integration = \"zsh\"\n")),
+            (true, "zsh".into(), false)
+        );
+        assert_eq!(
+            setting(Some("[terminal]\nshell_integration = \"none\"\n")),
+            (false, "none（已关闭）".into(), false)
+        );
+        let (on, text, attention) = setting(Some("[terminal]\nshell_integration = \"bash\"\n"));
+        assert!(!on && attention && text.contains("\"bash\""), "{text}");
+        let (on, _, attention) = setting(Some("[terminal]\nshell_integration = false\n"));
+        assert!(on && attention);
+        let (on, text, attention) = setting(Some("token = \"sk-secret\n["));
+        assert!(on && attention && !text.contains("sk-secret"));
+    }
+
+    #[test]
+    fn zsh_integration_files_are_found_where_berthd_writes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        assert_eq!(
+            zsh_integration_dir(data),
+            berth_daemon::shell_integration::zsh_dir(data)
+        );
+        let login = LoginEnv {
+            shell: PathBuf::from("/bin/zsh"),
+            path: None,
+            claude: None,
+            codex: None,
+            error: None,
+        };
+        let paths = Paths::in_dir(data);
+        let input = DoctorInput {
+            paths: &paths,
+            home: None,
+            uid: current_uid(),
+            login: &login,
+            berthd: None,
+        };
+        let check = shell_integration_check(&input, None);
+        assert!(check.detail.contains("尚未写入"), "{}", check.detail);
+        berth_daemon::shell_integration::install_zsh(data).unwrap();
+        let check = shell_integration_check(&input, None);
+        assert_eq!(check.level, Level::Ok, "{}", check.detail);
+        assert!(check.detail.contains("已写入"), "{}", check.detail);
+        assert!(check.detail.contains("berthd 未连上"));
+        let bash = LoginEnv {
+            shell: PathBuf::from("/bin/bash"),
+            path: None,
+            claude: None,
+            codex: None,
+            error: None,
+        };
+        let check = shell_integration_check(
+            &DoctorInput {
+                login: &bash,
+                ..input
+            },
+            Some(&[]),
+        );
+        assert_eq!(check.level, Level::Info);
+        assert!(check.detail.contains("只有 zsh"), "{}", check.detail);
+        assert!(
+            check.detail.contains("0 个 live session"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn events_are_listed_oldest_first_in_local_time() {
+        let e = |at_ms, kind: &str, state: &str, detail: Option<&str>| EventEntry {
+            at_ms,
+            kind: kind.into(),
+            state: state.into(),
+            detail: detail.map(Into::into),
+        };
+        // As the daemon sends them: newest first.
+        let text = render_events(&[
+            e(1_790_000_002_345, "hook:Stop", "done", None),
+            e(
+                1_790_000_001_000,
+                "hook:PreToolUse",
+                "thinking",
+                Some("Write\u{1b}[2J"),
+            ),
+        ]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[0].starts_with("时间"));
+        assert!(lines[1].contains("hook:PreToolUse") && lines[1].contains("Write?[2J"));
+        assert!(lines[2].contains("hook:Stop") && lines[2].contains(".345"));
+        assert_eq!(render_events(&[]), "（没有事件）\n");
+        let t = local_time(1_790_000_002_345);
+        let shape: String = t
+            .chars()
+            .map(|c| if c.is_ascii_digit() { '9' } else { c })
+            .collect();
+        assert_eq!(shape, "9999-99-99 99:99:99.999", "{t}");
+        assert!(t.ends_with(".345"));
     }
 
     #[test]
@@ -1332,5 +1701,22 @@ mod tests {
         )
         .unwrap();
         assert!(resolve_session(&ss, "zzzz").is_err());
+        debug(
+            &d.paths,
+            DebugCmd::Events {
+                session: prefix.into(),
+                limit: 10,
+            },
+        )
+        .unwrap();
+        // A plain shell has no agent session to resume.
+        let err = debug(
+            &d.paths,
+            DebugCmd::Resume {
+                session: prefix.into(),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("不能恢复 agent"), "{err:#}");
     }
 }

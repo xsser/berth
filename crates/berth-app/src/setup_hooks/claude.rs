@@ -149,6 +149,49 @@ pub fn statusline_installed(text: &str) -> bool {
     })
 }
 
+/// Which of `EVENTS` have a `berth-hook claude` entry, the berth-hook
+/// paths used, and whether the status line goes through berth-hook — as
+/// Claude Code reads the file (serde_json: a repeated key's last value).
+pub fn installed(text: &str) -> Result<super::Installed, String> {
+    let v = check(text)?;
+    let mut out = super::Installed::default();
+    for event in EVENTS {
+        let berth: Vec<&str> = v["hooks"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+            .filter_map(|handler| handler["command"].as_str())
+            .filter(|command| is_berth_claude(command))
+            .collect();
+        if berth.is_empty() {
+            out.missing.push(event);
+        } else {
+            out.events.push(event);
+        }
+        for command in berth {
+            push_hook(&mut out.hooks, command);
+        }
+    }
+    if let Some(command) = v["statusLine"]["command"]
+        .as_str()
+        .filter(|c| is_berth_statusline(c))
+    {
+        out.statusline = true;
+        push_hook(&mut out.hooks, command);
+    }
+    Ok(out)
+}
+
+/// Add the program (first word) of `command` to `hooks` unless present.
+fn push_hook(hooks: &mut Vec<String>, command: &str) {
+    if let Some(first) = shell::split(command).and_then(|w| w.words.into_iter().next()) {
+        if !hooks.contains(&first.text) {
+            hooks.push(first.text);
+        }
+    }
+}
+
 fn handlers(entry: &Node) -> &[Node] {
     entry.get("hooks").and_then(Node::items).unwrap_or_default()
 }

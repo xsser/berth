@@ -24,6 +24,8 @@ use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+pub use shell::command_line;
+
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Agent {
     /// Claude Code: `~/.claude/settings.json`, 18 hook events.
@@ -95,6 +97,46 @@ impl Agent {
             Agent::Codex => "codex",
         }
     }
+}
+
+/// An installation as `berth doctor` reports it (read-only; names and
+/// paths only, never values).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Installed {
+    /// Claude: the events of [`CLAUDE_EVENTS`] with a `berth-hook claude`
+    /// entry. Codex: `["notify"]` when notify goes through berth-hook.
+    pub events: Vec<&'static str>,
+    /// Claude: the events of [`CLAUDE_EVENTS`] without one.
+    pub missing: Vec<&'static str>,
+    /// The berth-hook paths used, each once, in order of appearance.
+    pub hooks: Vec<String>,
+    /// Claude: the status line goes through berth-hook.
+    pub statusline: bool,
+    /// Codex: berth-hook runs the original notify program after forwarding.
+    pub chained: bool,
+}
+
+/// The hook events `berth setup-hooks claude` installs.
+pub const CLAUDE_EVENTS: [&str; 18] = claude::EVENTS;
+
+/// What of berth's is installed in the agent's file under `home`, judged as
+/// setup-hooks judges it. `Ok(None)`: the file does not exist.
+pub fn installed(agent: Agent, home: &Path) -> Result<Option<Installed>> {
+    let file = agent.file(home);
+    let Some(text) = read(&file)? else {
+        return Ok(None);
+    };
+    match agent {
+        Agent::Claude => claude::installed(&text),
+        Agent::Codex => codex::installed(&text),
+    }
+    .map(Some)
+    .map_err(|e| anyhow!("{}：{e}", file.display()))
+}
+
+/// The agent's file under `home`.
+pub fn config_file(agent: Agent, home: &Path) -> PathBuf {
+    agent.file(home)
 }
 
 /// Run the command; the report is returned for printing.
