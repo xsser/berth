@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use berth_core::{
-    decode_payload, encode_frame, ClientMsg, DaemonMsg, Event, FrameReader, Request,
+    decode_payload, encode_frame, ClientMsg, ClientRole, DaemonMsg, Event, FrameReader, Request,
     PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -62,7 +62,7 @@ async fn handle_conn(stream: UnixStream, mgr: Arc<Manager>, mut stop: watch::Rec
     let writer = tokio::spawn(write_loop(wr, outbox.clone()));
     let mut frames = FrameReader::new();
     let mut buf = vec![0u8; READ_BUF];
-    let mut conn: Option<ConnId> = None;
+    let mut conn: Option<(ConnId, ClientRole)> = None;
     'read: loop {
         let n = tokio::select! {
             r = rd.read(&mut buf) => match r {
@@ -93,10 +93,18 @@ async fn handle_conn(stream: UnixStream, mgr: Arc<Manager>, mut stop: watch::Rec
                 }
             };
             match conn {
-                Some(id) => handle_request(&mgr, id, &outbox, msg).await,
+                Some((_, role)) if !role_allows(role, &msg.req) => {
+                    tracing::debug!(?role, "request not allowed for this role; closing");
+                    outbox.push(error(
+                        Some(msg.id),
+                        format!("{role:?} connections may only send Hello and Hook"),
+                    ));
+                    break 'read;
+                }
+                Some((id, _)) => handle_request(&mgr, id, &outbox, msg).await,
                 None => match msg.req {
                     Request::Hello { role, protocol, .. } if protocol == PROTOCOL_VERSION => {
-                        conn = Some(mgr.register_conn(role, outbox.clone()));
+                        conn = Some((mgr.register_conn(role, outbox.clone()), role));
                         outbox.push(reply(msg.id, hello()));
                     }
                     Request::Hello { .. } => {
@@ -116,7 +124,7 @@ async fn handle_conn(stream: UnixStream, mgr: Arc<Manager>, mut stop: watch::Rec
             }
         }
     }
-    if let Some(id) = conn {
+    if let Some((id, _)) = conn {
         mgr.conn_closed(id);
     }
     outbox.close();
@@ -140,6 +148,14 @@ async fn write_loop(mut wr: OwnedWriteHalf, outbox: Arc<Outbox>) {
         }
     }
     let _ = wr.shutdown().await;
+}
+
+/// Hook connections (`berth-hook`) may only report events; control requests
+/// need a GUI / CLI connection. (Not a security boundary: the socket is
+/// owner-only and any local client can claim a role; it stops a confused or
+/// compromised hook sender from driving sessions.)
+fn role_allows(role: ClientRole, req: &Request) -> bool {
+    role != ClientRole::Hook || matches!(req, Request::Hello { .. } | Request::Hook(_))
 }
 
 fn hello() -> Event {

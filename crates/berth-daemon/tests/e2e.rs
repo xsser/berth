@@ -57,6 +57,10 @@ struct Client {
 
 impl Client {
     async fn connect(socket: &Path) -> Client {
+        Client::connect_as(socket, ClientRole::Gui).await
+    }
+
+    async fn connect_as(socket: &Path, role: ClientRole) -> Client {
         let deadline = Instant::now() + WAIT;
         let stream = loop {
             match UnixStream::connect(socket).await {
@@ -77,7 +81,7 @@ impl Client {
         };
         match c
             .request(Request::Hello {
-                role: ClientRole::Gui,
+                role,
                 protocol: PROTOCOL_VERSION,
                 client_version: "e2e".into(),
             })
@@ -740,5 +744,55 @@ async fn unterminated_synchronized_update_does_not_freeze_the_screen() {
     c.screen_until(sid, &mut screen, "after-2", |s| s.has("after-"))
         .await;
     assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
+
+/// Review: a Hook-role connection must not control the daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hook_role_cannot_control_the_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut gui = Client::connect(&paths.socket).await;
+    let (_ws, meta) = workspace_and_shell(&mut gui, root.path()).await;
+
+    for req in [
+        Request::Shutdown,
+        Request::Kill { session: meta.id },
+        Request::Delete { session: meta.id },
+    ] {
+        let mut hook = Client::connect_as(&paths.socket, ClientRole::Hook).await;
+        match hook.request(req.clone()).await {
+            Event::Error { message } => assert!(message.contains("Hook"), "{message}"),
+            other => panic!("{req:?} from a hook connection answered {other:?}"),
+        }
+        // ...and the connection is closed.
+        let closed = hook.read_one(Instant::now() + Duration::from_secs(5)).await;
+        assert!(closed.is_none(), "connection still open: {closed:?}");
+    }
+    // Hook events themselves are still accepted on a Hook connection.
+    let mut hook = Client::connect_as(&paths.socket, ClientRole::Hook).await;
+    hook.send(claude(
+        meta.id,
+        ClaudeHookEvent::PreToolUse {
+            tool_name: "Bash".into(),
+        },
+    ))
+    .await;
+    agent_state(
+        &mut gui,
+        meta.id,
+        AgentState::ToolRunning {
+            tool: "Bash".into(),
+        },
+    )
+    .await;
+    // The daemon kept running and the session is untouched.
+    assert!(matches!(
+        gui.request(Request::DaemonStatus).await,
+        Event::Status(s) if s.sessions_live == 1
+    ));
+    assert_eq!(gui.request(Request::Shutdown).await, Event::Ok);
     daemon.join().await;
 }
