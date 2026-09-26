@@ -28,8 +28,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use berth_core::{
-    CursorState, Dims, LineSnapshot, ScreenSnapshot, ScreenUpdate, SessionId, Style, StyleId,
-    StyleTable, TermModes,
+    CursorShape, CursorState, Dims, LineSnapshot, ScreenSnapshot, ScreenUpdate, SessionId, Style,
+    StyleId, StyleTable, TermModes,
 };
 
 use crate::selection::{Selection, SelectionSpans, Span};
@@ -76,6 +76,7 @@ pub struct SessionView {
     retry_after: Option<Instant>,
     composed: ScreenSnapshot,
     dirty: bool,
+    cursor_override: Option<CursorShape>,
     pub selection: Option<Selection>,
 }
 
@@ -99,6 +100,7 @@ impl SessionView {
             retry_after: None,
             composed: ScreenSnapshot::default(),
             dirty: true,
+            cursor_override: None,
             selection: None,
         }
     }
@@ -123,10 +125,12 @@ impl SessionView {
         self.history_len
     }
 
+    #[cfg(test)]
     pub fn display_offset(&self) -> u64 {
         self.display_offset
     }
 
+    #[cfg(test)]
     pub fn seq(&self) -> u64 {
         self.seq
     }
@@ -136,8 +140,20 @@ impl SessionView {
         self.history_len - self.display_offset
     }
 
+    #[cfg(test)]
     pub fn cached_lines(&self) -> usize {
         self.cache.len()
+    }
+
+    /// The program asked for a blinking cursor.
+    pub fn cursor_blinking(&self) -> bool {
+        self.cursor.blinking
+    }
+
+    /// Every visible row is known (no history fetch outstanding for it).
+    pub fn visible_complete(&self) -> bool {
+        let top = self.top_line();
+        self.has_screen && (top..top + u64::from(self.dims.rows)).all(|v| self.line(v).is_some())
     }
 
     /// Apply a `Screen` update. `baseline`: the answer to our `Attach`
@@ -362,11 +378,25 @@ impl SessionView {
 
     /// The visible rows, composed from the cache and the live screen.
     pub fn screen(&mut self) -> &ScreenSnapshot {
+        self.frame().0
+    }
+
+    /// The visible rows and the style table (what the renderer needs).
+    pub fn frame(&mut self) -> (&ScreenSnapshot, &StyleTable) {
         if self.dirty {
             self.compose();
             self.dirty = false;
         }
-        &self.composed
+        (&self.composed, &self.styles)
+    }
+
+    /// Draw the cursor with this shape whatever the program asked for
+    /// (`--cursor-style`).
+    pub fn set_cursor_override(&mut self, shape: Option<CursorShape>) {
+        if self.cursor_override != shape {
+            self.cursor_override = shape;
+            self.dirty = true;
+        }
     }
 
     fn compose(&mut self) {
@@ -378,6 +408,9 @@ impl SessionView {
             lines.push(self.line(top + r).cloned().unwrap_or_default());
         }
         let mut cursor = self.cursor;
+        if let Some(shape) = self.cursor_override {
+            cursor.shape = shape;
+        }
         let row = u64::from(cursor.row) + self.display_offset;
         cursor.visible = cursor.visible && row < rows as u64;
         cursor.row = row.min(u64::from(u16::MAX)) as u16;

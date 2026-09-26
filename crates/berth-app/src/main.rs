@@ -1,40 +1,36 @@
-//! `berth` — GUI client and CLI. See docs/DESIGN.md §8 and docs/tasks/app-spike.md.
+//! `berth` — GUI client and CLI. See docs/DESIGN.md §8 and
+//! docs/tasks/integrate.md.
 //!
-//! Without a subcommand the GUI starts (M0: fixture data, no daemon).
-//! Modules: `app` (winit ApplicationHandler, run modes), `renderer/{grid,
-//! atlas, text, metrics, sprites, shaders.wgsl}`, `sidebar` (egui), `input`
-//! (key encoding), `ime`, `terminal` (client-side view state), `fixture`,
-//! `theme`, `config`, `stats`. Planned: `client` (daemon connection),
-//! `keybinds`, `notify`, `setup_hooks`.
+//! Without a subcommand the GUI starts: it connects to `berthd` (launching
+//! it when nothing listens) and shows the daemon's sessions.
+//! Modules: `app` (winit ApplicationHandler, run modes), `client` (daemon
+//! connection), `controller` (protocol state), `session_view` (screen and
+//! history mirror), `renderer/{grid, atlas, text, metrics, sprites,
+//! shaders.wgsl}`, `sidebar` (egui), `input` (key encoding), `ime`, `mouse`,
+//! `paste`, `selection`, `notify`, `cli` (list / doctor / debug), `fixture`
+//! (`--bench` data), `theme`, `config`, `stats`.
 
 mod app;
-#[allow(dead_code)] // wired into the app in the following commits
 mod client;
 mod config;
-#[allow(dead_code)]
 mod controller;
 mod fixture;
 mod ime;
 mod input;
-#[allow(dead_code)]
 mod mouse;
-#[allow(dead_code)]
 mod notify;
-#[allow(dead_code)]
 mod paste;
 mod renderer;
-#[allow(dead_code)]
 mod selection;
-#[allow(dead_code)]
 mod session_view;
 mod sidebar;
 mod stats;
-mod terminal;
 #[cfg(test)]
 mod testutil;
 mod theme;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use berth_core::CursorShape;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -52,11 +48,37 @@ struct Cli {
 /// GUI options (used when no subcommand is given).
 #[derive(Args, Debug, Default)]
 struct GuiArgs {
-    /// Render 3 frames, save the window contents as a PNG and exit.
+    /// Save the window as a PNG once the session list and the focused
+    /// screen are shown (works while the screen is locked), then exit.
     #[arg(long, value_name = "PNG", conflicts_with = "bench")]
     screenshot: Option<PathBuf>,
-    /// Render continuously for SECS per phase with GPU-synchronised frame
-    /// timing, print statistics to stderr and exit.
+    /// Extra wait before the screenshot (previews, late output).
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 800,
+        requires = "screenshot"
+    )]
+    screenshot_delay_ms: u64,
+    /// Focus this session (id or unique prefix) at start.
+    #[arg(long, value_name = "ID")]
+    session: Option<String>,
+    /// Scroll the focused session N lines into its history once shown.
+    #[arg(long, value_name = "N", hide = true)]
+    scroll: Option<u32>,
+    /// Time every frame (GPU-synchronised) and print statistics to stderr
+    /// every 5 s and at exit.
+    #[arg(long, conflicts_with = "bench")]
+    stats: bool,
+    /// Quit after SECS seconds.
+    #[arg(long, value_name = "SECS", value_parser = parse_secs)]
+    exit_after: Option<f64>,
+    /// Initial window size in cells (default 120x40).
+    #[arg(long, value_name = "COLSxROWS", value_parser = parse_cells)]
+    cells: Option<(u16, u16)>,
+    /// Renderer benchmark on static fixture data (no daemon): render
+    /// continuously for SECS per phase with GPU-synchronised frame timing,
+    /// print statistics to stderr and exit.
     #[arg(long, value_name = "SECS", value_parser = parse_secs)]
     bench: Option<f64>,
     /// Terminal font family (overrides the config file; default "SF Mono").
@@ -113,13 +135,30 @@ fn parse_font_size(s: &str) -> Result<f32, String> {
     }
 }
 
+/// `COLSxROWS`, e.g. `120x40`.
+fn parse_cells(s: &str) -> std::result::Result<(u16, u16), String> {
+    let (c, r) = s
+        .split_once(['x', 'X'])
+        .ok_or_else(|| "expected COLSxROWS, e.g. 120x40".to_string())?;
+    let parse = |v: &str| -> std::result::Result<u16, String> {
+        let n: u16 = v.trim().parse().map_err(|e| format!("{v:?}: {e}"))?;
+        if (2..=1000).contains(&n) {
+            Ok(n)
+        } else {
+            Err(format!("{n} is outside 2..=1000"))
+        }
+    };
+    Ok((parse(c)?, parse(r)?))
+}
+
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// List sessions known to the daemon.
+    /// List workspaces and sessions known to the daemon.
     List,
-    /// Install / preview / undo Claude Code and Codex hook entries (explicit, never silent).
+    /// Install / preview / undo Claude Code and Codex hook entries (M3;
+    /// not implemented, writes nothing).
     SetupHooks,
-    /// Check daemon, socket, hooks and shell integration.
+    /// Read-only checks: daemon, socket permissions, hooks, login PATH.
     Doctor,
 }
 
@@ -132,25 +171,47 @@ fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        None => app::run(app::GuiOptions {
-            screenshot: cli.gui.screenshot,
-            bench_secs: cli.gui.bench,
-            font_family: cli.gui.font_family,
-            font_size: cli.gui.font_size,
-            no_vsync: cli.gui.no_vsync,
-            cursor_style: cli.gui.cursor_style.map(CursorShape::from),
-            demo_preedit: cli.gui.demo_preedit,
-        }),
+        None => app::run(gui_options(cli.gui)),
         Some(c) => {
-            eprintln!("berth {c:?}: not implemented yet (M0 spike)");
+            eprintln!("berth {c:?}: not implemented yet");
             Ok(())
         }
+    }
+}
+
+fn gui_options(gui: GuiArgs) -> app::GuiOptions {
+    app::GuiOptions {
+        screenshot_delay: if gui.screenshot.is_some() {
+            Duration::from_millis(gui.screenshot_delay_ms)
+        } else {
+            Duration::ZERO
+        },
+        screenshot: gui.screenshot,
+        session: gui.session,
+        scroll: gui.scroll,
+        stats: gui.stats,
+        exit_after: gui.exit_after.map(Duration::from_secs_f64),
+        bench_secs: gui.bench,
+        cells: gui.cells,
+        font_family: gui.font_family,
+        font_size: gui.font_size,
+        no_vsync: gui.no_vsync,
+        cursor_style: gui.cursor_style.map(CursorShape::from),
+        demo_preedit: gui.demo_preedit,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cells_parse() {
+        assert_eq!(parse_cells("120x40"), Ok((120, 40)));
+        assert_eq!(parse_cells("80X24"), Ok((80, 24)));
+        assert!(parse_cells("80").is_err());
+        assert!(parse_cells("1x24").is_err());
+    }
 
     #[test]
     fn cli_parses_gui_flags_and_subcommands() {
@@ -171,5 +232,25 @@ mod tests {
         );
         let cli = Cli::try_parse_from(["berth", "doctor"]).unwrap();
         assert!(matches!(cli.cmd, Some(Cmd::Doctor)));
+        let cli = Cli::try_parse_from([
+            "berth",
+            "--screenshot",
+            "/tmp/s.png",
+            "--screenshot-delay-ms",
+            "1500",
+            "--session",
+            "ab12",
+            "--cells",
+            "90x30",
+            "--stats",
+        ])
+        .unwrap();
+        let opts = gui_options(cli.gui);
+        assert_eq!(opts.screenshot_delay, Duration::from_millis(1500));
+        assert_eq!(opts.session.as_deref(), Some("ab12"));
+        assert_eq!(opts.cells, Some((90, 30)));
+        assert!(opts.stats);
+        assert!(Cli::try_parse_from(["berth", "--screenshot-delay-ms", "5"]).is_err());
+        assert!(Cli::try_parse_from(["berth", "--stats", "--bench", "5"]).is_err());
     }
 }

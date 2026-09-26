@@ -222,12 +222,9 @@ impl Controller {
         self.confirm.as_ref()
     }
 
+    #[cfg(test)]
     pub fn is_pasting(&self) -> bool {
         self.paste.is_some()
-    }
-
-    pub fn window_focused(&self) -> bool {
-        self.window_focused
     }
 
     /// Workspaces in display order.
@@ -956,6 +953,37 @@ impl Controller {
         }
     }
 
+    /// Bytes the terminal protocol generates (mouse reports, focus in/out):
+    /// sent like keys but without scrolling or touching the selection, and
+    /// silently dropped when the session cannot take input.
+    pub fn report(&mut self, out: &mut dyn Outbound, bytes: Vec<u8>, now: Instant) {
+        let Some(sid) = self.focused else {
+            return;
+        };
+        if bytes.is_empty()
+            || !self.connected
+            || !self.sessions.get(&sid).is_some_and(SessionMeta::is_live)
+        {
+            return;
+        }
+        match self.paste.as_mut() {
+            Some((psid, job)) if *psid == sid => {
+                job.push(&bytes);
+                self.pump_paste(out, now);
+            }
+            _ => {
+                self.send(
+                    out,
+                    Request::Input {
+                        session: sid,
+                        data: bytes,
+                    },
+                    None,
+                );
+            }
+        }
+    }
+
     /// ⌘V.
     pub fn paste(&mut self, out: &mut dyn Outbound, text: &str, now: Instant) {
         let Some(sid) = self.focused_live() else {
@@ -1034,6 +1062,11 @@ impl Controller {
                 self.create_workspace(out, home);
             }
         }
+    }
+
+    /// The "+" of a workspace header.
+    pub fn new_session_in(&mut self, out: &mut dyn Outbound, ws: WorkspaceId) {
+        self.create_session(out, ws);
     }
 
     /// ⌘⇧N after the folder was chosen: reuse a workspace with that root,

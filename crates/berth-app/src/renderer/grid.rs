@@ -17,8 +17,8 @@ use super::atlas::{AtlasEntry, AtlasFull, AtlasKind, GlyphAtlas};
 use super::metrics::{CellMetrics, FaceMetrics};
 use super::text::{GlyphKey, ShapedGlyph, TextSystem};
 use crate::config::FontConfig;
-use crate::fixture::Selection;
 use crate::ime::Preedit;
+use crate::selection::SelectionSpans;
 use crate::theme::{mix, rgba, CellColors, Rgb, Theme};
 
 #[repr(C)]
@@ -61,7 +61,8 @@ pub struct FrameInput<'a> {
     pub screen: &'a ScreenSnapshot,
     pub styles: &'a StyleTable,
     pub theme: &'a Theme,
-    pub selection: Option<Selection>,
+    /// Selected cells of the visible rows.
+    pub selection: Option<&'a SelectionSpans>,
     /// Cursor opacity from the blink animation (0 hidden … 1 solid).
     pub cursor_alpha: f32,
     pub focused: bool,

@@ -1,21 +1,17 @@
-//! Static data for the M0 spike (no daemon yet): a 120×40 screen exercising
-//! every rendering path, plus sidebar workspaces/sessions. The shapes are the
-//! real protocol types so the same code later consumes daemon events.
+//! Static 120×40 screen exercising every rendering path, drawn by
+//! `berth --bench` (renderer benchmark without a daemon).
 
 use berth_core::{
-    char_cells, AgentInfo, AgentKind, AgentState, CellFlags, Color, CursorShape, CursorState,
-    LineSnapshot, ScreenSnapshot, SessionId, SessionMeta, SessionStatus, StateSource, Style,
-    StyleId, StyleInterner, TermModes, Workspace, WorkspaceId,
+    char_cells, CellFlags, Color, CursorShape, CursorState, LineSnapshot, ScreenSnapshot, Style,
+    StyleId, StyleInterner, TermModes,
 };
-use std::path::PathBuf;
 
 pub const COLS: u16 = 120;
 pub const ROWS: u16 = 40;
 /// Row that shows the last key's encoding.
 pub const STATUS_ROW: u16 = ROWS - 2;
-/// Row with the prompt and the local echo.
+/// Row with the prompt.
 pub const PROMPT_ROW: u16 = ROWS - 1;
-pub const PROMPT: &str = "berth ❯ ";
 
 /// Inclusive cell range highlighted as a selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,8 +21,15 @@ pub struct Selection {
 }
 
 impl Selection {
-    pub fn contains(&self, row: u16, col: u16) -> bool {
-        (row, col) >= self.start && (row, col) <= self.end
+    /// The same cells in the renderer's form.
+    pub fn spans(&self) -> crate::selection::SelectionSpans {
+        use crate::selection::{Point, SelectionSpans, Span};
+        let span = Span {
+            start: Point::new(u64::from(self.start.0), self.start.1),
+            end: Point::new(u64::from(self.end.0), self.end.1),
+            block: false,
+        };
+        SelectionSpans::visible(&span, 0, ROWS, COLS)
     }
 }
 
@@ -549,179 +552,6 @@ impl Fixture {
     }
 }
 
-/// Sidebar fixture: 2 workspaces, 5 sessions, 3-line previews.
-pub struct SidebarFixture {
-    pub workspaces: Vec<Workspace>,
-    pub sessions: Vec<SessionMeta>,
-    /// Preview lines per session (same order as `sessions`).
-    pub previews: Vec<Vec<LineSnapshot>>,
-    pub focused: SessionId,
-}
-
-fn preview(lines: &[&str]) -> Vec<LineSnapshot> {
-    lines
-        .iter()
-        .map(|s| {
-            let mut l = LineSnapshot::blank();
-            l.push_str(s, StyleId::DEFAULT);
-            l
-        })
-        .collect()
-}
-
-impl SidebarFixture {
-    pub fn build(now_ms: i64) -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/Users/me"));
-        let ws1 = Workspace {
-            id: WorkspaceId::new(),
-            name: "berth".into(),
-            root: home.join("projects/berth"),
-            color: Some([0x81, 0xa2, 0xbe]),
-            order: 0,
-            created_at_ms: now_ms - 86_400_000,
-        };
-        let ws2 = Workspace {
-            id: WorkspaceId::new(),
-            name: "网关服务".into(),
-            root: home.join("work/api-gateway"),
-            color: Some([0xb5, 0xbd, 0x68]),
-            order: 1,
-            created_at_ms: now_ms - 3 * 86_400_000,
-        };
-        let mk = |ws: &Workspace,
-                  order: u32,
-                  kind: AgentKind,
-                  title: &str,
-                  cwd: PathBuf,
-                  state: AgentState,
-                  ago_s: i64,
-                  unread: bool| {
-            let is_shell = kind == AgentKind::Shell;
-            SessionMeta {
-                id: SessionId::new(),
-                workspace: ws.id,
-                title_auto: title.to_string(),
-                title_user: None,
-                cwd,
-                command: vec![if is_shell {
-                    "zsh".into()
-                } else {
-                    format!("{kind:?}").to_lowercase()
-                }],
-                env: Vec::new(),
-                status: SessionStatus::Live,
-                agent: AgentInfo {
-                    kind,
-                    state,
-                    since_ms: now_ms - ago_s * 1000,
-                    source: if is_shell {
-                        StateSource::ShellIntegration
-                    } else {
-                        StateSource::Hook
-                    },
-                    confidence: if is_shell { 0.8 } else { 1.0 },
-                    ..Default::default()
-                },
-                created_at_ms: now_ms - 7_200_000,
-                last_active_ms: now_ms - ago_s * 1000,
-                unread,
-                order,
-                cols: COLS,
-                rows: ROWS,
-                ..Default::default()
-            }
-        };
-        let sessions = vec![
-            mk(
-                &ws1,
-                0,
-                AgentKind::Claude,
-                "修复 berth-core 测试",
-                ws1.root.clone(),
-                AgentState::ToolRunning {
-                    tool: "Bash".into(),
-                },
-                12,
-                false,
-            ),
-            mk(
-                &ws1,
-                1,
-                AgentKind::Codex,
-                "重构 API 路由",
-                ws1.root.join("crates/berth-daemon"),
-                AgentState::WaitingPermission {
-                    tool: Some("apply_patch".into()),
-                },
-                95,
-                false,
-            ),
-            mk(
-                &ws1,
-                2,
-                AgentKind::Shell,
-                "",
-                ws1.root.join("web"),
-                AgentState::Idle,
-                3600,
-                false,
-            ),
-            mk(
-                &ws2,
-                0,
-                AgentKind::Claude,
-                "迁移数据库 schema",
-                ws2.root.clone(),
-                AgentState::Done,
-                300,
-                true,
-            ),
-            mk(
-                &ws2,
-                1,
-                AgentKind::Claude,
-                "生成周报",
-                ws2.root.join("docs"),
-                AgentState::Thinking,
-                8,
-                false,
-            ),
-        ];
-        let previews = vec![
-            preview(&[
-                "$ cargo test -p berth-core",
-                "running 12 tests",
-                "test protocol::… FAILED",
-            ]),
-            preview(&[
-                "codex 请求执行 apply_patch",
-                "M crates/berth-daemon/src/server.rs",
-                "允许？ [y/n]",
-            ]),
-            preview(&[
-                "~/projects/berth/web",
-                "$ pnpm dev",
-                "  ➜  Local: http://localhost:5173/",
-            ]),
-            preview(&[
-                "✓ 迁移完成：3 张表",
-                "  users, sessions, audit_log",
-                "Total cost: $0.42",
-            ]),
-            preview(&["✻ Thinking…", "读取 git log 最近 7 天", "汇总 23 个提交"]),
-        ];
-        let focused = sessions[0].id;
-        Self {
-            workspaces: vec![ws1, ws2],
-            sessions,
-            previews,
-            focused,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -797,14 +627,5 @@ mod tests {
         let b = bars(19);
         assert!(a.len() > 10);
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn sidebar_fixture_shape() {
-        let s = SidebarFixture::build(1_000_000_000);
-        assert_eq!(s.workspaces.len(), 2);
-        assert_eq!(s.sessions.len(), 5);
-        assert!(s.previews.iter().all(|p| p.len() == 3));
-        assert_eq!(s.sessions[2].title(), "web"); // falls back to cwd name
     }
 }
