@@ -23,7 +23,7 @@ use berth_core::{
 use berth_store::JournalWriter;
 use berth_vt::{
     Damage, OscEvent, ProcessOutcome, PtyHandle, PtyOutput, PtySpawn, TermEvent, Terminal,
-    TerminalConfig,
+    TerminalConfig, KILL_GRACE,
 };
 use crossbeam_channel::{select, Receiver, Sender};
 use tokio::sync::oneshot;
@@ -43,7 +43,13 @@ const FOREGROUND_POLL: Duration = Duration::from_secs(1);
 const ACTIVITY_MIN_INTERVAL: Duration = Duration::from_millis(500);
 /// Output right after user input is most likely the echo of that input.
 const ECHO_WINDOW: Duration = Duration::from_millis(250);
-const KILL_GRACE: Duration = Duration::from_secs(1);
+/// `try_wait` poll interval while a `Kill` is pending (SIGKILL follows after
+/// berth-vt's `KILL_GRACE`).
+const KILL_POLL: Duration = Duration::from_millis(50);
+/// A reaped child normally produces PTY EOF at once (macOS revokes the tty
+/// when the session leader exits). Where it does not (a background job keeps
+/// a Linux pty open), finish once the output has been quiet this long.
+const EOF_GRACE: Duration = Duration::from_millis(500);
 const EXIT_CODE_WAIT: Duration = Duration::from_millis(500);
 const IDLE_WAKE: Duration = Duration::from_secs(3600);
 /// Upper bound of one `FetchLines` reply.
@@ -140,7 +146,13 @@ pub(crate) struct Actor {
     silence_reported: bool,
     fg_name: Option<String>,
     next_fg_poll: Instant,
-    kill_deadline: Option<Instant>,
+    /// `Kill` sent SIGHUP at this instant; `try_wait` is polled every
+    /// `KILL_POLL` until the child is gone.
+    kill_since: Option<Instant>,
+    kill_forced: bool,
+    next_kill_poll: Instant,
+    /// `try_wait` reaped the child but PTY EOF has not been seen yet.
+    reaped_at: Option<Instant>,
     child_exit_code: Option<i32>,
     journal: Option<JournalWriter>,
     stopped: bool,
@@ -231,7 +243,10 @@ impl Actor {
             silence_reported: true,
             fg_name: None,
             next_fg_poll: now,
-            kill_deadline: None,
+            kill_since: None,
+            kill_forced: false,
+            next_kill_poll: now,
+            reaped_at: None,
             child_exit_code: None,
             journal: None,
             stopped: false,
@@ -272,7 +287,7 @@ impl Actor {
         self.term = Some(term);
         self.live = Some(Live { pty, rx });
         self.child_exit_code = None;
-        self.kill_deadline = None;
+        self.clear_exit_tracking();
         self.fg_name = None;
         self.next_fg_poll = Instant::now() + FOREGROUND_POLL;
         self.snap_dirty = true;
@@ -814,13 +829,82 @@ impl Actor {
 impl Actor {
     // -- lifecycle ------------------------------------------------------------
 
+    /// berth-vt's kill flow: SIGHUP now, then `poll_child` checks `try_wait`
+    /// every `KILL_POLL` and sends SIGKILL after `KILL_GRACE`.
     fn kill(&mut self) {
         if let Some(live) = &mut self.live {
             if let Err(e) = live.pty.kill() {
                 tracing::warn!(session = %self.id, error = %e, "SIGHUP failed");
             }
-            self.kill_deadline = Some(Instant::now() + KILL_GRACE);
+            let now = Instant::now();
+            // A repeated Kill keeps the original grace period.
+            self.kill_since.get_or_insert(now);
+            self.next_kill_poll = now + KILL_POLL;
         }
+    }
+
+    fn clear_exit_tracking(&mut self) {
+        self.kill_since = None;
+        self.kill_forced = false;
+        self.reaped_at = None;
+    }
+
+    /// Reap the child if it is gone (independent of PTY EOF) and escalate a
+    /// pending `Kill` to SIGKILL once `KILL_GRACE` has passed.
+    fn poll_child(&mut self, now: Instant) {
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if self.kill_since.is_some() {
+            self.next_kill_poll = now + KILL_POLL;
+        }
+        if self.reaped_at.is_some() {
+            return;
+        }
+        match live.pty.try_wait() {
+            Ok(Some(code)) => {
+                tracing::debug!(session = %self.id, code, "child reaped");
+                self.reaped_at = Some(now);
+                self.kill_since = None;
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!(session = %self.id, error = %e, "try_wait failed"),
+        }
+        if let Some(since) = self.kill_since {
+            if !self.kill_forced && now >= since + KILL_GRACE {
+                self.kill_forced = true;
+                tracing::info!(session = %self.id, "SIGHUP ignored; sending SIGKILL");
+                if let Err(e) = live.pty.force_kill() {
+                    tracing::warn!(session = %self.id, error = %e, "SIGKILL failed");
+                }
+            }
+        }
+    }
+
+    /// When a reaped child's PTY EOF is due: once output has been quiet for
+    /// `EOF_GRACE` after the reap.
+    fn eof_overdue_at(&self) -> Option<Instant> {
+        let reaped = self.reaped_at?;
+        let quiet_since = self.last_output.map_or(reaped, |t| t.max(reaped));
+        Some(quiet_since + EOF_GRACE)
+    }
+
+    /// The child is gone but its tty stays open: apply what the reader has
+    /// already delivered, then finish exactly like on EOF.
+    fn finish_without_eof(&mut self) {
+        loop {
+            let next = match &self.live {
+                Some(live) => live.rx.try_recv(),
+                None => return,
+            };
+            match next {
+                Ok(PtyOutput::Data(bytes)) => self.handle_output(&bytes),
+                Ok(PtyOutput::Eof) | Err(_) => break,
+            }
+        }
+        tracing::info!(session = %self.id, "child exited but its tty stays open; finishing");
+        self.on_exit();
     }
 
     fn revive(&mut self, spawn: &PtySpawn) -> Result<(), String> {
@@ -879,7 +963,7 @@ impl Actor {
         self.flush_screen();
         let code = wait_exit(&mut live.pty, EXIT_CODE_WAIT).or(self.child_exit_code);
         drop(live);
-        self.kill_deadline = None;
+        self.clear_exit_tracking();
         if let Some(mut j) = self.journal.take() {
             if let Err(e) = j.flush() {
                 tracing::warn!(session = %self.id, error = %e, "journal flush failed");
@@ -978,9 +1062,11 @@ impl Actor {
                 }
             }
         }
+        let mut poll_child = self.kill_since.is_some() && now >= self.next_kill_poll;
         if let Some(live) = &self.live {
             if now >= self.next_fg_poll {
                 self.next_fg_poll = now + FOREGROUND_POLL;
+                poll_child = true;
                 let name = live.pty.foreground_process().map(|p| p.name);
                 if name != self.fg_name {
                     self.fg_name = name.clone();
@@ -991,13 +1077,11 @@ impl Actor {
                 }
             }
         }
-        if self.kill_deadline.is_some_and(|d| d <= now) {
-            self.kill_deadline = None;
-            if let Some(live) = &mut self.live {
-                if let Err(e) = live.pty.force_kill() {
-                    tracing::warn!(session = %self.id, error = %e, "SIGKILL failed");
-                }
-            }
+        if poll_child {
+            self.poll_child(now);
+        }
+        if self.live.is_some() && self.eof_overdue_at().is_some_and(|t| t <= now) {
+            self.finish_without_eof();
         }
     }
 
@@ -1021,8 +1105,11 @@ impl Actor {
                 consider(self.last_output.map(|t| t + SILENCE));
             }
             consider(Some(self.next_fg_poll));
+            if self.kill_since.is_some() {
+                consider(Some(self.next_kill_poll));
+            }
+            consider(self.eof_overdue_at());
         }
-        consider(self.kill_deadline);
         next
     }
 }

@@ -228,6 +228,14 @@ fn mode(p: &Path) -> u32 {
 }
 
 async fn workspace_and_shell(c: &mut Client, root: &Path) -> (WorkspaceId, SessionMeta) {
+    workspace_and_command(c, root, &["/bin/sh"]).await
+}
+
+async fn workspace_and_command(
+    c: &mut Client,
+    root: &Path,
+    argv: &[&str],
+) -> (WorkspaceId, SessionMeta) {
     let ws = match c
         .request(Request::CreateWorkspace {
             name: "w".into(),
@@ -241,7 +249,7 @@ async fn workspace_and_shell(c: &mut Client, root: &Path) -> (WorkspaceId, Sessi
     let req = Request::CreateSession {
         workspace: ws.id,
         cwd: None,
-        command: Some(vec!["/bin/sh".into()]),
+        command: Some(argv.iter().map(|a| a.to_string()).collect()),
         title: None,
         dims: DIMS,
     };
@@ -252,6 +260,40 @@ async fn workspace_and_shell(c: &mut Client, root: &Path) -> (WorkspaceId, Sessi
             (ws.id, meta)
         }
         other => panic!("{other:?}"),
+    }
+}
+
+/// Attach and mirror the full screen of the reply.
+async fn attach(c: &mut Client, sid: SessionId) -> ScreenModel {
+    let id = c
+        .send(Request::Attach {
+            session: sid,
+            dims: DIMS,
+        })
+        .await;
+    let Event::Screen(first) = c
+        .wait_for("attach reply", |m| m.reply_to == Some(id))
+        .await
+        .event
+    else {
+        panic!("attach must be answered by a Screen");
+    };
+    let mut screen = ScreenModel::default();
+    screen.apply(&first);
+    screen
+}
+
+async fn exited(c: &mut Client, sid: SessionId) -> Option<i32> {
+    match c
+        .wait_for(
+            "Exited",
+            |m| matches!(m.event, Event::Exited { session, .. } if session == sid),
+        )
+        .await
+        .event
+    {
+        Event::Exited { code, .. } => code,
+        _ => unreachable!(),
     }
 }
 
@@ -611,5 +653,92 @@ async fn handshake_is_enforced() {
     );
     assert!(closed);
     daemon.stop.send_replace(true);
+    daemon.join().await;
+}
+
+/// berth-vt's kill flow: SIGHUP, poll `try_wait`, SIGKILL after `KILL_GRACE`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kill_escalates_to_sigkill_when_sighup_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    let script = "trap '' HUP; echo ready-$((40+2)); while :; do sleep 1; done";
+    let (_ws, meta) = workspace_and_command(&mut c, root.path(), &["/bin/sh", "-c", script]).await;
+    let sid = meta.id;
+    let mut screen = attach(&mut c, sid).await;
+    c.screen_until(sid, &mut screen, "ready-42", |s| s.has("ready-"))
+        .await;
+    let t0 = Instant::now();
+    assert_eq!(c.request(Request::Kill { session: sid }).await, Event::Ok);
+    let code = exited(&mut c, sid).await;
+    let took = t0.elapsed();
+    assert!(
+        took >= Duration::from_millis(900),
+        "SIGHUP is ignored, so only SIGKILL after the grace period ends it: {took:?}"
+    );
+    assert!(took < Duration::from_secs(5), "escalation took {took:?}");
+    assert_eq!(code, Some(128 + 9), "killed by SIGKILL");
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
+
+/// The shell exits while a background job (ignoring SIGHUP) still has the
+/// tty open. macOS revokes the tty when the session leader exits, so EOF
+/// comes anyway; on a Linux pty it would not and the `try_wait` poll ends
+/// the session. Either way it is Exited promptly with its output kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exit_is_detected_while_a_background_job_holds_the_tty() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    let script = "(trap '' HUP; exec sleep 5) & echo bg-$((40+2)); exit 3";
+    let t0 = Instant::now();
+    let (_ws, meta) = workspace_and_command(&mut c, root.path(), &["/bin/sh", "-c", script]).await;
+    let sid = meta.id;
+    let code = exited(&mut c, sid).await;
+    let took = t0.elapsed();
+    assert!(
+        took < Duration::from_millis(3500),
+        "exit noticed after {took:?}"
+    );
+    assert_eq!(code, Some(3));
+    let screen = attach(&mut c, sid).await;
+    assert!(screen.has("bg-"), "output kept: {:#?}", screen.rows);
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
+
+/// DEC 2026: output inside a synchronized update whose end marker never
+/// comes is released at the terminal's sync deadline instead of freezing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unterminated_synchronized_update_does_not_freeze_the_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    let (_ws, meta) = workspace_and_shell(&mut c, root.path()).await;
+    let sid = meta.id;
+    let mut screen = attach(&mut c, sid).await;
+    c.send(Request::Input {
+        session: sid,
+        data: b"printf '\\033[?2026h'; echo sync-$((40+2))\n".to_vec(),
+    })
+    .await;
+    c.screen_until(sid, &mut screen, "sync-42", |s| s.has("sync-"))
+        .await;
+    // The terminal keeps working after the timed-out update.
+    c.send(Request::Input {
+        session: sid,
+        data: b"echo after-$((1+1))\n".to_vec(),
+    })
+    .await;
+    c.screen_until(sid, &mut screen, "after-2", |s| s.has("after-"))
+        .await;
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
     daemon.join().await;
 }
