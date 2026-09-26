@@ -20,6 +20,7 @@ mod dock;
 mod fixture;
 mod ime;
 mod input;
+mod mismatch;
 mod mouse;
 mod notify;
 mod paste;
@@ -105,6 +106,10 @@ struct GuiArgs {
     /// (screenshot check only; id or unique prefix).
     #[arg(long, hide = true, value_name = "ID")]
     demo_hover: Option<String>,
+    /// Press 「重启 berthd」 as soon as the version-mismatch banner shows
+    /// (end-to-end check only).
+    #[arg(long, hide = true)]
+    demo_restart: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -216,6 +221,7 @@ fn gui_options(gui: GuiArgs) -> app::GuiOptions {
         cursor_style: gui.cursor_style.map(CursorShape::from),
         demo_preedit: gui.demo_preedit,
         demo_hover: gui.demo_hover,
+        demo_restart: gui.demo_restart,
     }
 }
 

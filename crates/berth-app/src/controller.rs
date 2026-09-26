@@ -50,8 +50,6 @@ pub const UNSUBSCRIBE_AFTER: Duration = Duration::from_secs(1);
 const INFO_TTL: Duration = Duration::from_secs(6);
 /// Events shown on a hovered card.
 pub const HOVER_EVENTS: u32 = 5;
-/// How an older berthd answers a request it cannot decode.
-const UNDECODABLE: &str = "undecodable message";
 const MAX_NOTICES: usize = 6;
 const FALLBACK_DIMS: Dims = Dims { cols: 80, rows: 24 };
 
@@ -223,8 +221,6 @@ pub struct Controller {
     counters: Counters,
     recent: HashMap<SessionId, RecentEvents>,
     resume: HashMap<SessionId, ResumeEntry>,
-    /// berthd did not understand `ListEvents` / `ResumeCommand`.
-    details_unsupported: bool,
 }
 
 impl Controller {
@@ -258,7 +254,6 @@ impl Controller {
             counters: Counters::default(),
             recent: HashMap::new(),
             resume: HashMap::new(),
-            details_unsupported: false,
         }
     }
 
@@ -308,11 +303,6 @@ impl Controller {
             .get(&sid)
             .filter(|e| self.sessions.get(&sid).map(resume_key).as_ref() == Some(&e.key))
             .and_then(|e| e.preview.as_ref())
-    }
-
-    /// Whether berthd answers `ListEvents` / `ResumeCommand`.
-    pub fn card_details(&self) -> bool {
-        !self.details_unsupported
     }
 
     /// Live sessions whose agent state needs attention (Dock badge).
@@ -493,7 +483,6 @@ impl Controller {
         self.mark_read_sent.clear();
         self.recent.clear();
         self.resume.clear();
-        self.details_unsupported = false;
         self.loaded_workspaces = false;
         self.loaded_sessions = false;
         self.send(out, Request::ListWorkspaces, Some(Awaiting::ListWorkspaces));
@@ -727,9 +716,6 @@ impl Controller {
                     return;
                 }
             }
-        }
-        if reply_to.is_none() && message.starts_with(UNDECODABLE) && self.drop_details() {
-            return;
         }
         let awaiting = reply_to.and_then(|id| self.pending.remove(&id));
         let text = match awaiting {
@@ -1024,7 +1010,7 @@ impl Controller {
     /// A card is hovered: fetch its newest events unless they are current
     /// or on their way.
     pub fn hover(&mut self, out: &mut dyn Outbound, sid: SessionId) {
-        if !self.connected || self.details_unsupported || !self.sessions.contains_key(&sid) {
+        if !self.connected || !self.sessions.contains_key(&sid) {
             return;
         }
         let r = self.recent.entry(sid).or_default();
@@ -1046,9 +1032,6 @@ impl Controller {
     /// Ask berthd for a dormant card's resume command unless it is known
     /// for the session as it is now, or on its way.
     fn want_resume(&mut self, out: &mut dyn Outbound, sid: SessionId) {
-        if self.details_unsupported {
-            return;
-        }
         let Some(key) = self.sessions.get(&sid).map(resume_key) else {
             return;
         };
@@ -1070,37 +1053,6 @@ impl Controller {
                 in_flight: id,
             },
         );
-    }
-
-    /// An undecodable-message error while card details were asked for:
-    /// berthd predates them. Stop asking on this connection (one notice).
-    /// Returns whether the error was about them.
-    fn drop_details(&mut self) -> bool {
-        let asked: Vec<u32> = self
-            .pending
-            .iter()
-            .filter(|(_, a)| matches!(a, Awaiting::Events(_) | Awaiting::Resume(_)))
-            .map(|(id, _)| *id)
-            .collect();
-        if asked.is_empty() && !self.details_unsupported {
-            return false;
-        }
-        for id in &asked {
-            self.pending.remove(id);
-        }
-        for r in self.recent.values_mut() {
-            r.in_flight = None;
-        }
-        for e in self.resume.values_mut() {
-            e.in_flight = None;
-        }
-        if self.details_unsupported {
-            tracing::debug!("undecodable-message error after card details were turned off");
-        } else {
-            self.details_unsupported = true;
-            self.info("berthd 版本较旧，不支持事件列表与恢复命令预览（重启 berthd 后可用）");
-        }
-        true
     }
 
     /// The grid size the window fits; sent as `Resize` after
@@ -1758,54 +1710,6 @@ mod tests {
             now,
         );
         assert!(c.resume_preview(did).unwrap().command.is_err());
-    }
-
-    #[test]
-    fn an_older_daemon_turns_card_details_off_with_one_notice() {
-        let mut c = Controller::new(vec![]);
-        let mut out = Fake::default();
-        let w = ws(0);
-        let live = session(&w, 0, true);
-        let d = claude_dormant(&w, 1, "abc");
-        let (lid, did) = (live.id, d.id);
-        listed(&mut c, &mut out, vec![w], vec![live, d]);
-        let now = Instant::now();
-        let undecodable = || {
-            push(Event::Error {
-                message: "undecodable message: Found an enum discriminant that was not valid"
-                    .into(),
-            })
-        };
-        c.hover(&mut out, lid);
-        c.set_visible(&mut out, &[did], now);
-        out.take();
-        c.handle(&mut out, undecodable(), now);
-        c.handle(&mut out, undecodable(), now);
-        assert!(!c.card_details());
-        let kinds: Vec<NoticeKind> = c.notices().iter().map(|n| n.kind).collect();
-        assert_eq!(kinds, [NoticeKind::Info], "{:?}", c.notices());
-        c.hover(&mut out, lid);
-        c.set_visible(&mut out, &[did], now);
-        let sent = out.take();
-        assert!(
-            requests(&sent, |r| matches!(
-                r,
-                Request::ListEvents { .. } | Request::ResumeCommand { .. }
-            ))
-            .is_empty(),
-            "{sent:?}"
-        );
-        // A new connection may reach a newer berthd.
-        c.on_connected(&mut out);
-        assert!(c.card_details());
-
-        // Without card details asked for, the same error is a real one.
-        let mut c = Controller::new(vec![]);
-        let w = ws(0);
-        listed(&mut c, &mut out, vec![w], vec![]);
-        c.handle(&mut out, undecodable(), now);
-        assert_eq!(c.notices()[0].kind, NoticeKind::Error);
-        assert!(c.card_details());
     }
 
     #[test]

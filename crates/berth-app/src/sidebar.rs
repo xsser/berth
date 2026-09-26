@@ -44,6 +44,7 @@ use egui::{
 use winit::window::Window;
 
 use crate::controller::{self, Confirm, Controller, NoticeKind, ResumePreview, PREVIEW_ROWS};
+use crate::mismatch::Banner;
 use crate::setup_hooks::command_line;
 use crate::theme::{mix, Rgb, Theme};
 use crate::timefmt::local_clock;
@@ -257,6 +258,8 @@ pub enum UiAction {
     Confirm(bool),
     DismissNotice(usize),
     ClosePalette,
+    /// The button of the version-mismatch banner (「重启 berthd」).
+    RestartDaemon,
     /// Session cards on screen this frame.
     Visible(Vec<SessionId>),
 }
@@ -270,6 +273,9 @@ pub struct Chrome<'a> {
     pub status: Option<&'a str>,
     /// Centered in the terminal area when there is no screen to show.
     pub placeholder: Option<&'a str>,
+    /// A berthd of another protocol version (shown instead of
+    /// `placeholder`).
+    pub mismatch: Option<&'a Banner>,
     /// Show this card's hover details without a pointer (`--demo-hover`).
     pub demo_hover: Option<SessionId>,
 }
@@ -521,6 +527,52 @@ fn put_inside(ui: &mut egui::Ui, r: Rect, widget: impl egui::Widget) -> egui::Re
             )),
     )
     .add(widget)
+}
+
+/// The version-mismatch banner, centered in the terminal area. Returns its
+/// button, when it has one.
+fn mismatch_panel(
+    ctx: &egui::Context,
+    pal: Palette,
+    grid: Rect,
+    banner: &Banner,
+    painted: &mut Option<&mut Painted>,
+    actions: &mut Vec<UiAction>,
+) -> Option<egui::Response> {
+    if let Some(p) = painted.as_deref_mut() {
+        p.push((
+            FontFamily::Proportional,
+            format!("{}{}", banner.title, banner.body),
+        ));
+    }
+    let width = (grid.width() - 40.0).clamp(200.0, 460.0);
+    egui::Area::new(Id::new("mismatch"))
+        .order(Order::Middle)
+        .pivot(Align2::CENTER_CENTER)
+        .fixed_pos(grid.center())
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(Color32::from_rgb(0x26, 0x2c, 0x36))
+                .corner_radius(8.0)
+                .inner_margin(Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_width(width);
+                    let title = egui::RichText::new(&banner.title).size(15.0).strong();
+                    ui.label(title.color(pal.fg));
+                    ui.add_space(6.0);
+                    let body = egui::RichText::new(&banner.body).size(13.0);
+                    ui.add(egui::Label::new(body.color(pal.dim)).wrap());
+                    let label = banner.button?;
+                    ui.add_space(10.0);
+                    let button = ui.button(label);
+                    if button.clicked() {
+                        actions.push(UiAction::RestartDaemon);
+                    }
+                    Some(button)
+                })
+                .inner
+        })
+        .inner
 }
 
 impl Sidebar {
@@ -1015,8 +1067,7 @@ impl Sidebar {
         let pal = self.palette;
         let live = m.is_live();
         let resume = controller::resumable(m);
-        let resume_line = resume && ctl.card_details();
-        let buttons_h = match (live, resume_line) {
+        let buttons_h = match (live, resume) {
             (true, _) => 0.0,
             (false, false) => 24.0,
             (false, true) => 24.0 + 16.0,
@@ -1241,7 +1292,7 @@ impl Sidebar {
                 };
                 button(&label, ReviveMode::ResumeAgent, &tip);
             }
-            if resume_line {
+            if resume {
                 let (text, color) = match ctl.resume_preview(m.id) {
                     Some(ResumePreview {
                         command: Ok(argv), ..
@@ -1348,9 +1399,6 @@ impl Sidebar {
                     ui.label(egui::RichText::new(line).font(mono(11.0)).color(pal.fg));
                 }
             }
-            _ if !ctl.card_details() => {
-                ui.label(small("（berthd 较旧：没有事件列表）".into(), pal.dim));
-            }
             _ => {
                 ui.label(small("读取事件…".into(), pal.dim));
             }
@@ -1433,7 +1481,9 @@ impl Sidebar {
     ) {
         let pal = self.palette;
         let grid = chrome.grid_rect;
-        if let Some(text) = chrome.placeholder {
+        if let Some(banner) = chrome.mismatch {
+            mismatch_panel(ctx, pal, grid, banner, painted, actions);
+        } else if let Some(text) = chrome.placeholder {
             let painter =
                 ctx.layer_painter(egui::LayerId::new(Order::Middle, Id::new("placeholder")));
             painter.text(
@@ -1674,6 +1724,56 @@ mod tests {
         });
         // No renderer here: the font atlas upload is dropped on purpose.
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn the_mismatch_banner_button_asks_for_the_restart() {
+        use crate::client::Incompatible;
+        use crate::mismatch::Mismatch;
+        let ctx = egui::Context::default();
+        let pal = Palette::from_theme(&Theme::ghostty_default());
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 600.0));
+        let grid = Rect::from_min_max(Pos2::new(240.0, 0.0), screen.max);
+        let frame = |events: Vec<egui::Event>, banner: &Banner| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let (mut button, mut actions) = (None, Vec::new());
+            let mut out = ctx.run_ui(input, |ui| {
+                let shown = mismatch_panel(ui.ctx(), pal, grid, banner, &mut None, &mut actions);
+                button = shown.map(|r| r.rect);
+            });
+            // No renderer here: the font atlas upload is dropped on purpose.
+            out.textures_delta.clear();
+            (button, actions)
+        };
+        let mut m = Mismatch::None;
+        m.connect_failed(Some(Incompatible {
+            daemon: berth_core::PROTOCOL_VERSION - 1,
+        }));
+        let banner = m.banner().unwrap();
+        // A new area is measured on its first frame and placed on the next.
+        frame(Vec::new(), &banner);
+        let (button, actions) = frame(Vec::new(), &banner);
+        let at = button.expect("a restart button").center();
+        assert!(grid.contains(at), "{at:?}");
+        assert!(actions.is_empty());
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![egui::Event::PointerMoved(at)], &banner);
+        frame(vec![press(true)], &banner);
+        let (_, actions) = frame(vec![press(false)], &banner);
+        assert_eq!(actions, vec![UiAction::RestartDaemon]);
+
+        assert!(m.restart());
+        let (button, _) = frame(Vec::new(), &m.banner().unwrap());
+        assert_eq!(button, None, "nothing to press while it stops");
     }
 
     #[test]
