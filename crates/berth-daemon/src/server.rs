@@ -95,10 +95,12 @@ async fn handle_conn(stream: UnixStream, mgr: Arc<Manager>, mut stop: watch::Rec
             match conn {
                 Some((_, role)) if !role_allows(role, &msg.req) => {
                     tracing::debug!(?role, "request not allowed for this role; closing");
-                    outbox.push(error(
-                        Some(msg.id),
-                        format!("{role:?} connections may only send Hello and Hook"),
-                    ));
+                    let message = if matches!(msg.req, Request::Hook(_)) {
+                        format!("{role:?} connections may not send Hook events")
+                    } else {
+                        format!("{role:?} connections may only send Hello and Hook")
+                    };
+                    outbox.push(error(Some(msg.id), message));
                     break 'read;
                 }
                 Some((id, _)) => handle_request(&mgr, id, &outbox, msg).await,
@@ -150,12 +152,17 @@ async fn write_loop(mut wr: OwnedWriteHalf, outbox: Arc<Outbox>) {
     let _ = wr.shutdown().await;
 }
 
-/// Hook connections (`berth-hook`) may only report events; control requests
-/// need a GUI / CLI connection. (Not a security boundary: the socket is
-/// owner-only and any local client can claim a role; it stops a confused or
-/// compromised hook sender from driving sessions.)
+/// Hook connections (`berth-hook`) may only report agent events, and only
+/// they may: control requests need a GUI / CLI connection, and a GUI / CLI
+/// client cannot inject agent events for other sessions. (Not a security
+/// boundary: the socket is owner-only and any local client can claim a role;
+/// it keeps each client kind to its own job.)
 fn role_allows(role: ClientRole, req: &Request) -> bool {
-    role != ClientRole::Hook || matches!(req, Request::Hello { .. } | Request::Hook(_))
+    match req {
+        Request::Hello { .. } => true,
+        Request::Hook(_) => role == ClientRole::Hook,
+        _ => role != ClientRole::Hook,
+    }
 }
 
 fn hello() -> Event {

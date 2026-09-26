@@ -7,10 +7,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use berth_core::{
-    decode_payload, encode_frame, now_ms, AgentSignal, AgentState, ClaudeHook, ClaudeHookEvent,
-    ClientMsg, ClientRole, DaemonMsg, Dims, Event, FrameReader, HookEnvelope, LineSnapshot, Paths,
-    Request, ReviveMode, ScreenUpdate, SessionId, SessionMeta, SessionStatus, SubscribeMode,
-    WorkspaceId, PROTOCOL_VERSION,
+    decode_payload, encode_frame, now_ms, AgentKind, AgentSignal, AgentState, ClaudeHook,
+    ClaudeHookEvent, ClientMsg, ClientRole, DaemonMsg, Dims, Event, FrameReader, HookEnvelope,
+    LineSnapshot, Paths, Request, ReviveMode, ScreenUpdate, SessionId, SessionMeta, SessionStatus,
+    SubscribeMode, WorkspaceId, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -399,9 +399,10 @@ async fn attach_hooks_kill_restart_revive() {
         fresh.rows
     );
 
-    // D.2: hook events drive the agent state.
+    // D.2: hook events (on a Hook connection) drive the agent state.
+    let mut hook = Client::connect_as(&paths.socket, ClientRole::Hook).await;
     assert_eq!(
-        c.request(claude(
+        hook.request(claude(
             sid,
             ClaudeHookEvent::PreToolUse {
                 tool_name: "Bash".into()
@@ -422,7 +423,7 @@ async fn attach_hooks_kill_restart_revive() {
         notification_type: Some("permission_prompt".into()),
         message: "Claude needs your permission to use Bash".into(),
     };
-    assert_eq!(c.request(claude(sid, permission)).await, Event::Ok);
+    assert_eq!(hook.request(claude(sid, permission)).await, Event::Ok);
     agent_state(
         &mut c,
         sid,
@@ -432,7 +433,7 @@ async fn attach_hooks_kill_restart_revive() {
     )
     .await;
     assert_eq!(
-        c.request(claude(
+        hook.request(claude(
             sid,
             ClaudeHookEvent::Stop {
                 stop_hook_active: false
@@ -809,6 +810,41 @@ async fn hook_role_cannot_control_the_daemon() {
     daemon.join().await;
 }
 
+/// Review #13: the other direction — GUI / CLI connections cannot inject
+/// agent events (they could otherwise forge any session's state).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_hook_connections_may_send_hook_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut gui = Client::connect(&paths.socket).await;
+    let (_ws, meta) = workspace_and_shell(&mut gui, root.path()).await;
+    let forged = || {
+        claude(
+            meta.id,
+            ClaudeHookEvent::PreToolUse {
+                tool_name: "Bash".into(),
+            },
+        )
+    };
+    for role in [ClientRole::Gui, ClientRole::Cli] {
+        let mut c = Client::connect_as(&paths.socket, role).await;
+        match c.request(forged()).await {
+            Event::Error { message } => assert!(message.contains("Hook"), "{message}"),
+            other => panic!("Hook from a {role:?} connection answered {other:?}"),
+        }
+        let closed = c.read_one(Instant::now() + Duration::from_secs(5)).await;
+        assert!(closed.is_none(), "connection still open: {closed:?}");
+    }
+    // Nothing reached the state machine.
+    let agent = session_meta(&mut gui, meta.id).await.agent;
+    assert_eq!(agent.state, AgentState::Idle);
+    assert_eq!(agent.kind, AgentKind::Shell);
+    assert_eq!(gui.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
+
 /// Review high #2: client-supplied FetchLines ranges cannot crash a session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fetch_lines_with_absurd_range_is_harmless() {
@@ -886,7 +922,8 @@ async fn resume_agent_execs_the_resume_argv_without_a_shell() {
     let (_ws, meta) = workspace_and_shell(&mut c, root.path()).await;
     let sid = meta.id;
     let id = "0f8c2e1a-1111-2222-3333-444455556666";
-    c.send(claude_as(sid, id, ClaudeHookEvent::UserPromptSubmit))
+    let mut hook = Client::connect_as(&paths.socket, ClientRole::Hook).await;
+    hook.send(claude_as(sid, id, ClaudeHookEvent::UserPromptSubmit))
         .await;
     c.wait_for("external id", |m| {
         matches!(&m.event, Event::AgentChanged { session, agent }
@@ -950,7 +987,8 @@ async fn hostile_agent_session_id_is_never_resumed() {
     let sid = meta.id;
     let pwned = root.path().join("pwned");
     let hostile = format!("\u{15}touch {} #", pwned.display());
-    c.send(claude_as(sid, &hostile, ClaudeHookEvent::UserPromptSubmit))
+    let mut hook = Client::connect_as(&paths.socket, ClientRole::Hook).await;
+    hook.send(claude_as(sid, &hostile, ClaudeHookEvent::UserPromptSubmit))
         .await;
     agent_state(&mut c, sid, AgentState::Thinking).await;
     let stored = session_meta(&mut c, sid).await.agent.external_id;
