@@ -5,11 +5,13 @@
 //!   berth-hook codex [--chain <notify cmd...>] <json>  # Codex notify (JSON = last argv)
 //!   berth-hook statusline -- <statusline cmd...>       # tee stdin JSON, run original
 //!
-//! Behaviour: read stdin (bounded), map to `HookEnvelope`, connect to
-//! `BERTH_SOCKET` (or the default socket) within 50 ms, send one frame pair,
-//! exit 0. Any failure is silent (set `BERTH_HOOK_DEBUG=1` for stderr).
-//! `codex --chain` then `exec`s the original notify command with the same
-//! argv; `statusline` runs the original command with the same stdin and
+//! Behaviour: read stdin (bounded: 1 MiB, 1 s), map to `HookEnvelope`,
+//! connect to `BERTH_SOCKET` (or the default socket) within 50 ms, send one
+//! frame pair, exit 0. Any failure is silent (set `BERTH_HOOK_DEBUG=1` for
+//! stderr). `codex --chain` then `exec`s the original notify command with the
+//! same argv (127 if that fails); `statusline` runs the original command with
+//! the same stdin — also when the JSON was not forwarded (too large, or stdin
+//! still open after the deadline: then the rest is passed through) — and
 //! passes its stdout and exit code through. No tokio, no clap: startup cost
 //! matters.
 
@@ -18,9 +20,9 @@ mod send;
 
 use std::io::{self, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 /// Hook payloads larger than this are not forwarded.
 const MAX_STDIN: usize = 1024 * 1024;
@@ -67,33 +69,89 @@ fn main() {
     std::process::exit(code);
 }
 
+/// Chunks of stdin from a helper thread; an empty chunk marks EOF. The
+/// thread keeps reading after the deadline (for pass-through) and dies with
+/// the process.
+type StdinChunks = Receiver<io::Result<Vec<u8>>>;
+
+fn stdin_reader() -> StdinChunks {
+    let (tx, rx) = mpsc::sync_channel(8);
+    std::thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        loop {
+            let mut buf = vec![0u8; 64 * 1024];
+            match stdin.read(&mut buf) {
+                Ok(n) => {
+                    buf.truncate(n);
+                    if tx.send(Ok(buf)).is_err() || n == 0 {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// What arrived on stdin within `STDIN_DEADLINE` (at most a chunk beyond
+/// `MAX_STDIN`).
+struct Head {
+    bytes: Vec<u8>,
+    /// The stream ended (EOF or read error) within the deadline.
+    ended: bool,
+}
+
+impl Head {
+    /// The whole payload, if it ended in time and fits.
+    fn complete(&self) -> Option<&[u8]> {
+        (self.ended && self.bytes.len() <= MAX_STDIN).then_some(&self.bytes[..])
+    }
+
+    fn why_incomplete(&self) -> &'static str {
+        if self.bytes.len() > MAX_STDIN {
+            "stdin exceeds 1 MiB"
+        } else {
+            "stdin deadline exceeded"
+        }
+    }
+}
+
+fn read_head(chunks: &StdinChunks) -> Head {
+    let deadline = Instant::now() + STDIN_DEADLINE;
+    let mut bytes = Vec::new();
+    while bytes.len() <= MAX_STDIN {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match chunks.recv_timeout(left) {
+            Ok(Ok(chunk)) if chunk.is_empty() => return Head { bytes, ended: true },
+            Ok(Ok(chunk)) => bytes.extend_from_slice(&chunk),
+            Ok(Err(e)) => {
+                log(format!("stdin: {e}"));
+                return Head { bytes, ended: true };
+            }
+            Err(RecvTimeoutError::Disconnected) => return Head { bytes, ended: true },
+            Err(RecvTimeoutError::Timeout) => break,
+        }
+    }
+    Head {
+        bytes,
+        ended: false,
+    }
+}
+
 /// Read stdin (≤ 1 MiB) on a helper thread so a stdin that never closes
 /// cannot block the agent.
 fn read_stdin_with_deadline() -> Option<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let res = io::stdin()
-            .lock()
-            .take(MAX_STDIN as u64 + 1)
-            .read_to_end(&mut buf);
-        let _ = tx.send(res.map(|_| buf));
-    });
-    match rx.recv_timeout(STDIN_DEADLINE) {
-        Ok(Ok(buf)) if buf.len() <= MAX_STDIN => Some(buf),
-        Ok(Ok(_)) => {
-            log("stdin exceeds 1 MiB; ignored");
-            None
-        }
-        Ok(Err(e)) => {
-            log(format!("stdin: {e}"));
-            None
-        }
-        Err(_) => {
-            log("stdin deadline exceeded");
-            None
-        }
+    let head = read_head(&stdin_reader());
+    if head.complete().is_none() {
+        log(format!("{}; ignored", head.why_incomplete()));
+        return None;
     }
+    Some(head.bytes)
 }
 
 fn codex(args: &[String]) -> i32 {
@@ -117,19 +175,14 @@ fn codex(args: &[String]) -> i32 {
 
 fn statusline(args: &[String]) -> i32 {
     let command = map::parse_statusline_args(args);
-    let mut stdin = io::stdin().lock();
-    let mut head = Vec::new();
-    if let Err(e) = (&mut stdin)
-        .take(MAX_STDIN as u64 + 1)
-        .read_to_end(&mut head)
-    {
-        log(format!("stdin: {e}"));
-    }
-    let complete = head.len() <= MAX_STDIN;
-    if complete {
-        deliver(map::statusline(&head, &map::Context::from_env()));
-    } else {
-        log("statusline JSON exceeds 1 MiB; not forwarded");
+    let chunks = stdin_reader();
+    let head = read_head(&chunks);
+    match head.complete() {
+        Some(json) => deliver(map::statusline(json, &map::Context::from_env())),
+        None => log(format!(
+            "{}; statusline not forwarded",
+            head.why_incomplete()
+        )),
     }
     let Some((program, rest)) = command.split_first() else {
         return 0;
@@ -149,9 +202,8 @@ fn statusline(args: &[String]) -> i32 {
     };
     if let Some(mut pipe) = child.stdin.take() {
         // A child that exits without reading gives EPIPE: not our problem.
-        let _ = pipe.write_all(&head);
-        if !complete {
-            let _ = io::copy(&mut stdin, &mut pipe);
+        if pipe.write_all(&head.bytes).is_ok() && !head.ended {
+            pass_through(&chunks, &mut pipe, &mut child);
         }
     }
     match child.wait() {
@@ -161,6 +213,26 @@ fn statusline(args: &[String]) -> i32 {
         Err(e) => {
             log(format!("wait: {e}"));
             1
+        }
+    }
+}
+
+/// Copy the rest of stdin to the child until either side is done; a child
+/// that exits without reading ends it even if stdin never closes.
+fn pass_through(chunks: &StdinChunks, pipe: &mut impl Write, child: &mut Child) {
+    loop {
+        match chunks.recv_timeout(Duration::from_millis(50)) {
+            Ok(Ok(chunk)) if !chunk.is_empty() => {
+                if pipe.write_all(&chunk).is_err() {
+                    return;
+                }
+            }
+            Ok(_) | Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    return;
+                }
+            }
         }
     }
 }

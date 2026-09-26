@@ -238,3 +238,62 @@ fn codex_chain_exec_failure_exits_127() {
     let (out, _) = run(&["codex", json], &dir.path().join("x.sock"), None, b"");
     assert_eq!(out.status.code(), Some(0));
 }
+
+/// Review medium #4: a statusline stdin that stays open is not forwarded
+/// after the 1 s deadline, but the original command still gets what was
+/// read and the rest is passed through.
+#[test]
+fn statusline_stdin_that_stays_open_still_runs_the_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut child = Command::new(BIN)
+        .args(["statusline", "--", "/bin/cat"])
+        .env("BERTH_SOCKET", &socket)
+        .env_remove("BERTH_SESSION_ID")
+        .env_remove("BERTH_HOOK_DEBUG")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 256];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if tx.send(buf[..n].to_vec()).is_err() || n == 0 {
+                break;
+            }
+        }
+    });
+    let read_until = |want: &[u8]| {
+        let mut got = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !got.ends_with(want) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(chunk) if !chunk.is_empty() => got.extend_from_slice(&chunk),
+                other => panic!("original command output so far {got:?}; then {other:?}"),
+            }
+        }
+        got
+    };
+
+    let partial = br#"{"session_id":"s1","model":{"id":"m"}"#;
+    stdin.write_all(partial).unwrap();
+    // stdin stays open: the original runs after the deadline with the head.
+    assert_eq!(read_until(partial), partial.to_vec());
+    stdin.write_all(b"}\n").unwrap();
+    assert_eq!(read_until(b"}\n"), b"}\n".to_vec());
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(0));
+    // Nothing was sent to the daemon.
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("statusline forwarded after the deadline: {other:?}"),
+    }
+}
