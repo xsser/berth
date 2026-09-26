@@ -4,6 +4,11 @@
 //! heuristics, kill escalation) — no fixed-rate ticker, so idle sessions
 //! don't wake up needlessly.
 //!
+//! PTY input (and the terminal's replies) goes through a writer thread per
+//! PTY behind a byte budget (`MAX_PENDING_INPUT`): a child that does not read
+//! its input blocks that thread, never the actor, which keeps rendering,
+//! answering and killing.
+//!
 //! Virtual line space (`FetchLines`, `history_len`):
 //! `[restored prefix 0..R) ++ [live scrollback) ++ [screen rows)`. The prefix
 //! is what earlier lives left behind (loaded lazily from the snapshot for
@@ -14,7 +19,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -29,6 +34,7 @@ use berth_vt::{
     TerminalConfig, KILL_GRACE,
 };
 use crossbeam_channel::{select, Receiver, Sender};
+use parking_lot::RwLock;
 use tokio::sync::oneshot;
 
 use crate::agent_state::{Signal, SILENCE_IDLE_SECS};
@@ -127,14 +133,16 @@ pub(crate) struct ActorHandle {
     pub input: Arc<InputBudget>,
 }
 
-/// Cap on PTY input queued for a session (`SessionCmd::Input` not yet
-/// written). The actor writes synchronously, so input for a child that does
-/// not read it would otherwise pile up without bound. One message is always
-/// admitted into an empty queue, so a single paste larger than the cap still
-/// goes through (memory per session: cap + one frame).
+/// Cap on PTY input queued for a session: accepted by `Manager::input` but
+/// not yet written by the PTY's writer thread. Beyond it input is refused
+/// (backpressure) instead of piling up behind a child that does not read.
+/// One message is always admitted into an empty queue, so a single paste
+/// larger than the cap still goes through (memory per session: cap + one
+/// frame). Terminal replies share the budget and are dropped when it is full.
 pub const MAX_PENDING_INPUT: usize = 1024 * 1024;
 
-/// Input bytes handed to the actor but not yet written to the PTY.
+/// Input bytes accepted for a session but not yet written to (or discarded
+/// by) its PTY writer.
 #[derive(Default)]
 pub(crate) struct InputBudget {
     pending: AtomicUsize,
@@ -167,7 +175,7 @@ impl InputBudget {
         !self.dropping.swap(true, Ordering::AcqRel)
     }
 
-    /// `n` reserved bytes were written (or discarded) by the actor.
+    /// `n` reserved bytes were written (or discarded) by the writer.
     pub fn release(&self, n: usize) {
         if self.pending.fetch_sub(n, Ordering::AcqRel) == n {
             self.dropping.store(false, Ordering::Release);
@@ -181,8 +189,20 @@ impl InputBudget {
 }
 
 struct Live {
-    pty: PtyHandle,
+    /// Shared with the writer thread, which holds a read lock (and a strong
+    /// reference) only while a write is in flight. The actor's `&mut`
+    /// operations (`try_wait`, `kill`, `force_kill`) use `try_write` and
+    /// never wait for a write; `resize` / `foreground_process` take a read
+    /// lock, which a write in flight does not block.
+    pty: Arc<RwLock<PtyHandle>>,
+    /// The child's pid, which is also its process group (portable-pty
+    /// `setsid`s the child).
+    pid: u32,
     rx: Receiver<PtyOutput>,
+    /// Queue of the writer thread (bounded by the session's `InputBudget`).
+    writer: Sender<Vec<u8>>,
+    /// Set when the PTY is let go: the writer discards what is still queued.
+    closed: Arc<AtomicBool>,
 }
 
 pub(crate) struct Actor {
@@ -344,6 +364,16 @@ impl Actor {
     /// Spawn the child and a fresh terminal below the existing history.
     fn start_pty(&mut self, spawn: &PtySpawn) -> Result<(), String> {
         let (pty, rx) = PtyHandle::spawn(spawn).map_err(|e| e.to_string())?;
+        let pid = pty.child_pid();
+        let pty = Arc::new(RwLock::new(pty));
+        let closed = Arc::new(AtomicBool::new(false));
+        let writer = spawn_writer(
+            self.id,
+            Arc::downgrade(&pty),
+            closed.clone(),
+            self.input_budget.clone(),
+        )
+        .map_err(|e| format!("cannot start the pty writer thread: {e}"))?;
         let interner = match self.term.take() {
             Some(old) => self.fold_into_prefix(old),
             None => std::mem::replace(&mut self.restored_styles, StyleInterner::new()),
@@ -361,7 +391,13 @@ impl Actor {
         *term.interner() = interner;
         term.set_clipboard_store_allowed(self.cfg.osc52_store);
         self.term = Some(term);
-        self.live = Some(Live { pty, rx });
+        self.live = Some(Live {
+            pty,
+            pid,
+            rx,
+            writer,
+            closed,
+        });
         self.child_exit_code = None;
         self.clear_exit_tracking();
         self.fg_name = None;
@@ -424,10 +460,7 @@ impl Actor {
 
     fn handle_cmd(&mut self, cmd: SessionCmd) {
         match cmd {
-            SessionCmd::Input(data) => {
-                self.input(&data);
-                self.input_budget.release(data.len());
-            }
+            SessionCmd::Input(data) => self.input(data),
             SessionCmd::Attach {
                 conn,
                 outbox,
@@ -484,7 +517,15 @@ impl Actor {
             }
             SessionCmd::Kill => self.kill(),
             SessionCmd::Revive { spawn, reply } => {
-                let _ = reply.send(self.revive(&spawn));
+                let result = self.revive(&spawn);
+                let started = result.is_ok();
+                if reply.send(result).is_err() && started {
+                    // The manager stopped waiting and rolled the session
+                    // back: do not leave a child running that it does not
+                    // know about.
+                    tracing::warn!(session = %self.id, "revive reply not delivered; hanging up the new child");
+                    self.kill();
+                }
             }
             SessionCmd::SetPersist(policy) => self.set_persist(policy),
             SessionCmd::Shutdown { reply } => {
@@ -514,12 +555,16 @@ fn sane_dims(d: Dims) -> Dims {
 impl Actor {
     // -- input / output -----------------------------------------------------
 
-    fn input(&mut self, data: &[u8]) {
+    /// Hand input (already accounted by `Manager::input`) to the writer;
+    /// never blocks.
+    fn input(&mut self, data: Vec<u8>) {
         let Some(live) = &self.live else {
+            self.input_budget.release(data.len());
             return;
         };
-        if let Err(e) = live.pty.write(data) {
-            tracing::warn!(session = %self.id, error = %e, "pty write failed");
+        if let Err(e) = live.writer.try_send(data) {
+            tracing::warn!(session = %self.id, "pty writer gone; input dropped");
+            self.input_budget.release(e.into_inner().len());
         }
         let now = Instant::now();
         self.last_input = Some(now);
@@ -580,13 +625,7 @@ impl Actor {
             match ev {
                 TermEvent::Title(title) => self.mgr.set_title(self.id, title.unwrap_or_default()),
                 TermEvent::Bell => self.mgr.broadcast(Event::Bell { session: self.id }),
-                TermEvent::PtyWrite(bytes) => {
-                    if let Some(live) = &self.live {
-                        if let Err(e) = live.pty.write(&bytes) {
-                            tracing::warn!(session = %self.id, error = %e, "pty reply write failed");
-                        }
-                    }
-                }
+                TermEvent::PtyWrite(bytes) => self.reply(bytes),
                 // Only surfaced with `[terminal] osc52_store = true`. The
                 // protocol has no clipboard event yet: log the size, never
                 // the text.
@@ -598,6 +637,23 @@ impl Actor {
                 TermEvent::CursorBlinkingChanged => self.mark_screen_dirty(Instant::now()),
                 TermEvent::ChildExit(code) => self.child_exit_code = Some(code),
             }
+        }
+    }
+
+    /// A terminal reply (DA, DSR, ...) joins the input queue, within the
+    /// same budget: a child that does not read its input does not get
+    /// replies either.
+    fn reply(&self, bytes: Vec<u8>) {
+        let Some(live) = &self.live else {
+            return;
+        };
+        let n = bytes.len();
+        if !self.input_budget.reserve(n) {
+            tracing::debug!(session = %self.id, bytes = n, "input queue full; terminal reply dropped");
+            return;
+        }
+        if live.writer.try_send(bytes).is_err() {
+            self.input_budget.release(n);
         }
     }
 
@@ -900,7 +956,7 @@ impl Actor {
         }
         self.dims = dims;
         if let Some(live) = &self.live {
-            if let Err(e) = live.pty.resize(dims.cols, dims.rows) {
+            if let Err(e) = live.pty.read().resize(dims.cols, dims.rows) {
                 tracing::warn!(session = %self.id, error = %e, "pty resize failed");
             }
         }
@@ -927,15 +983,25 @@ impl Actor {
     /// berth-vt's kill flow: SIGHUP now, then `poll_child` checks `try_wait`
     /// every `KILL_POLL` and sends SIGKILL after `KILL_GRACE`.
     fn kill(&mut self) {
-        if let Some(live) = &mut self.live {
-            if let Err(e) = live.pty.kill() {
-                tracing::warn!(session = %self.id, error = %e, "SIGHUP failed");
+        let Some(live) = &self.live else {
+            return;
+        };
+        let result = match live.pty.try_write() {
+            Some(mut pty) => pty.kill().map_err(|e| e.to_string()),
+            // A write is in flight (the child is not reading): signal the
+            // groups directly. Not after a reap: the pid may be reused.
+            None if self.reaped_at.is_none() => {
+                signal_groups(&live.pty, live.pid, libc::SIGHUP).map_err(|e| e.to_string())
             }
-            let now = Instant::now();
-            // A repeated Kill keeps the original grace period.
-            self.kill_since.get_or_insert(now);
-            self.next_kill_poll = now + KILL_POLL;
+            None => Ok(()),
+        };
+        if let Err(e) = result {
+            tracing::warn!(session = %self.id, error = %e, "SIGHUP failed");
         }
+        let now = Instant::now();
+        // A repeated Kill keeps the original grace period.
+        self.kill_since.get_or_insert(now);
+        self.next_kill_poll = now + KILL_POLL;
     }
 
     fn clear_exit_tracking(&mut self) {
@@ -947,7 +1013,7 @@ impl Actor {
     /// Reap the child if it is gone (independent of PTY EOF) and escalate a
     /// pending `Kill` to SIGKILL once `KILL_GRACE` has passed.
     fn poll_child(&mut self, now: Instant) {
-        let Some(live) = self.live.as_mut() else {
+        let Some(live) = self.live.as_ref() else {
             return;
         };
         if self.kill_since.is_some() {
@@ -956,21 +1022,32 @@ impl Actor {
         if self.reaped_at.is_some() {
             return;
         }
-        match live.pty.try_wait() {
-            Ok(Some(code)) => {
-                tracing::debug!(session = %self.id, code, "child reaped");
-                self.reaped_at = Some(now);
-                self.kill_since = None;
-                return;
+        // A write in flight holds the handle: no reap this round (so the pid
+        // stays the child's), but the escalation below still happens.
+        let mut pty = live.pty.try_write();
+        if let Some(pty) = pty.as_mut() {
+            match pty.try_wait() {
+                Ok(Some(code)) => {
+                    tracing::debug!(session = %self.id, code, "child reaped");
+                    self.reaped_at = Some(now);
+                    self.kill_since = None;
+                    return;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::debug!(session = %self.id, error = %e, "try_wait failed"),
             }
-            Ok(None) => {}
-            Err(e) => tracing::debug!(session = %self.id, error = %e, "try_wait failed"),
         }
         if let Some(since) = self.kill_since {
             if !self.kill_forced && now >= since + KILL_GRACE {
                 self.kill_forced = true;
                 tracing::info!(session = %self.id, "SIGHUP ignored; sending SIGKILL");
-                if let Err(e) = live.pty.force_kill() {
+                let result = match pty.as_mut() {
+                    Some(pty) => pty.force_kill().map_err(|e| e.to_string()),
+                    None => {
+                        signal_groups(&live.pty, live.pid, libc::SIGKILL).map_err(|e| e.to_string())
+                    }
+                };
+                if let Err(e) = result {
                     tracing::warn!(session = %self.id, error = %e, "SIGKILL failed");
                 }
             }
@@ -1035,12 +1112,8 @@ impl Actor {
         if snapshot && self.snap_dirty {
             self.write_snapshot(true);
         }
-        if let Some(mut live) = self.live.take() {
-            // Dropping the handle reaps the child in the background
-            // (SIGKILL after berth-vt's grace period if SIGHUP is ignored).
-            if let Err(e) = live.pty.kill() {
-                tracing::debug!(session = %self.id, error = %e, "SIGHUP on stop failed");
-            }
+        if let Some(live) = self.live.take() {
+            self.hang_up(live);
         }
         if let Some(mut j) = self.journal.take() {
             if let Err(e) = j.flush() {
@@ -1050,13 +1123,39 @@ impl Actor {
         self.stopped = true;
     }
 
+    /// Let go of the PTY without waiting: SIGHUP now; dropping the handle
+    /// reaps the child in the background (SIGKILL after `KILL_GRACE` if
+    /// SIGHUP is ignored). A write in flight keeps the handle alive until
+    /// that write fails, so then a watchdog sends the SIGKILL instead.
+    fn hang_up(&self, live: Live) {
+        // From here on the writer discards instead of starting a write.
+        live.closed.store(true, Ordering::Release);
+        let in_flight = match live.pty.try_write() {
+            Some(mut pty) => {
+                if let Err(e) = pty.kill() {
+                    tracing::debug!(session = %self.id, error = %e, "SIGHUP on stop failed");
+                }
+                false
+            }
+            None => true,
+        };
+        if in_flight && self.reaped_at.is_none() {
+            if let Err(e) = signal_groups(&live.pty, live.pid, libc::SIGHUP) {
+                tracing::debug!(session = %self.id, error = %e, "SIGHUP on stop failed");
+            }
+            spawn_kill_watchdog(self.id, Arc::downgrade(&live.pty), live.pid);
+        }
+    }
+
     /// PTY EOF: final screen, exit code, Dormant + Exited, final snapshot.
     fn on_exit(&mut self) {
-        let Some(mut live) = self.live.take() else {
+        let Some(live) = self.live.take() else {
             return;
         };
         self.flush_screen();
-        let code = wait_exit(&mut live.pty, EXIT_CODE_WAIT).or(self.child_exit_code);
+        // Queued input has nowhere to go any more.
+        live.closed.store(true, Ordering::Release);
+        let code = wait_exit(&live.pty, EXIT_CODE_WAIT).or(self.child_exit_code);
         drop(live);
         self.clear_exit_tracking();
         if let Some(mut j) = self.journal.take() {
@@ -1162,7 +1261,7 @@ impl Actor {
             if now >= self.next_fg_poll {
                 self.next_fg_poll = now + FOREGROUND_POLL;
                 poll_child = true;
-                let name = live.pty.foreground_process().map(|p| p.name);
+                let name = live.pty.read().foreground_process().map(|p| p.name);
                 if name != self.fg_name {
                     self.fg_name = name.clone();
                     if let Some(name) = name {
@@ -1223,7 +1322,9 @@ impl Actor {
         if saved.is_err() {
             tracing::error!(session = %self.id, "final snapshot after the panic failed");
         }
-        self.live = None;
+        if let Some(live) = self.live.take() {
+            self.hang_up(live);
+        }
         if let Some(mut j) = self.journal.take() {
             if let Err(e) = j.flush() {
                 tracing::warn!(session = %self.id, error = %e, "journal flush failed");
@@ -1250,19 +1351,136 @@ fn enumerate_rows(lines: Vec<LineSnapshot>) -> Vec<(u16, LineSnapshot)> {
         .collect()
 }
 
-/// Poll for the child's exit code for up to `max`.
-fn wait_exit(pty: &mut PtyHandle, max: Duration) -> Option<i32> {
+/// Poll for the child's exit code for up to `max`. A write still in flight
+/// (it fails once the tty is gone) only delays the polls.
+fn wait_exit(pty: &RwLock<PtyHandle>, max: Duration) -> Option<i32> {
     let deadline = Instant::now() + max;
     loop {
-        match pty.try_wait() {
-            Ok(Some(code)) => return Some(code),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Ok(None) => return None,
-            Err(e) => {
-                tracing::debug!(error = %e, "try_wait failed");
-                return None;
+        if let Some(mut pty) = pty.try_write() {
+            match pty.try_wait() {
+                Ok(Some(code)) => return Some(code),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "try_wait failed");
+                    return None;
+                }
             }
         }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The PTY's writer thread: writes queued input in order, off the actor
+/// thread, and releases each job's bytes from the session's budget once
+/// written or discarded. After a failed write (the tty is gone), once the
+/// PTY is let go (`closed`) or the handle is dropped, the rest is discarded.
+/// Ends when the actor drops the queue's sender.
+fn spawn_writer(
+    id: SessionId,
+    pty: Weak<RwLock<PtyHandle>>,
+    closed: Arc<AtomicBool>,
+    budget: Arc<InputBudget>,
+) -> std::io::Result<Sender<Vec<u8>>> {
+    let (tx, jobs) = crossbeam_channel::unbounded::<Vec<u8>>();
+    std::thread::Builder::new()
+        .name(format!("pty-writer-{}", id.short()))
+        .spawn(move || {
+            let mut broken = false;
+            for bytes in jobs {
+                if !broken {
+                    broken = match pty.upgrade() {
+                        None => true,
+                        Some(pty) => {
+                            let pty = pty.read();
+                            // Checked under the lock: `hang_up` sets `closed`
+                            // before its `try_write`, so no write can start
+                            // after the hang-up found the handle idle.
+                            if closed.load(Ordering::Acquire) {
+                                true
+                            } else if let Err(e) = pty.write(&bytes) {
+                                tracing::debug!(session = %id, error = %e, "pty write failed; discarding queued input");
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                }
+                budget.release(bytes.len());
+            }
+        })?;
+    Ok(tx)
+}
+
+/// `PtyHandle::kill` / `force_kill` for when a write in flight holds the
+/// handle: signal the child's process group and the tty's foreground group.
+/// Callers make sure the child has not been reaped — only `try_wait` under
+/// the write lock reaps it — so `pid` still names it.
+#[allow(unsafe_code)]
+fn signal_groups(pty: &RwLock<PtyHandle>, pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    let own = libc::pid_t::try_from(pid)
+        .map_err(|_| std::io::Error::other(format!("pid {pid} does not fit pid_t")))?;
+    // `foreground_process` names a live member of the foreground group.
+    let foreground = pty
+        .read()
+        .foreground_process()
+        .and_then(|p| libc::pid_t::try_from(p.pid).ok())
+        // SAFETY: getpgid takes a plain integer.
+        .map(|p| unsafe { libc::getpgid(p) })
+        .filter(|&group| group != own);
+    let result = kill_group(own, signal);
+    if let Some(group) = foreground {
+        if let Err(e) = kill_group(group, signal) {
+            tracing::debug!(group, signal, error = %e, "signalling the foreground group failed");
+        }
+    }
+    result
+}
+
+/// `killpg(2)`; `ESRCH` (group already gone) is success. Never our own group
+/// (0), init (1) or an error value.
+#[allow(unsafe_code)]
+fn kill_group(group: libc::pid_t, signal: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: getpgrp takes no arguments and cannot fail.
+    if group <= 1 || group == unsafe { libc::getpgrp() } {
+        return Err(std::io::Error::other(format!(
+            "refusing to signal process group {group}"
+        )));
+    }
+    // SAFETY: killpg takes plain integers.
+    if unsafe { libc::killpg(group, signal) } == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+/// A hung-up child whose handle a stuck write still holds: SIGKILL its
+/// groups after `KILL_GRACE` unless the handle is gone by then. The child's
+/// death takes the tty with it, which fails the write and lets the handle
+/// drop (and reap the child). While the handle lives nobody reaps the child,
+/// so its pid is still its own.
+fn spawn_kill_watchdog(id: SessionId, pty: Weak<RwLock<PtyHandle>>, pid: u32) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("pty-kill-{}", id.short()))
+        .spawn(move || {
+            std::thread::sleep(KILL_GRACE);
+            if let Some(pty) = pty.upgrade() {
+                tracing::info!(session = %id, "SIGHUP ignored; sending SIGKILL");
+                if let Err(e) = signal_groups(&pty, pid, libc::SIGKILL) {
+                    tracing::warn!(session = %id, error = %e, "SIGKILL failed");
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(session = %id, error = %e, "cannot start the kill watchdog thread");
     }
 }
 

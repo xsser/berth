@@ -1,7 +1,7 @@
 //! End-to-end: in-process `berth_daemon::run` on a temp dir, a real PTY
 //! (`/bin/sh`), and a protocol client speaking the framed socket protocol.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -1018,52 +1018,214 @@ async fn hostile_agent_session_id_is_never_resumed() {
     daemon.join().await;
 }
 
-/// Review medium #7: input for a child that does not read it is capped at
-/// 1 MiB queued; the excess is dropped with a single error, and the session
-/// still finishes normally.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn input_for_a_child_that_does_not_read_is_capped() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = tempfile::tempdir().unwrap();
-    let paths = Paths::in_dir(dir.path());
-    let daemon = start_daemon(&paths);
-    let mut c = Client::connect(&paths.socket).await;
-    // Raw mode: a full tty input queue blocks the writer (canonical mode
-    // would discard instead).
-    let (_ws, meta) = workspace_and_command(
-        &mut c,
-        root.path(),
-        &["/bin/sh", "-c", "stty raw -echo; echo raw-ready; sleep 2"],
-    )
-    .await;
-    let sid = meta.id;
-    let mut screen = attach(&mut c, sid).await;
-    c.screen_until(sid, &mut screen, "raw-ready", |s| {
-        s.rows.values().any(|t| t.contains("raw-ready"))
-    })
-    .await;
-    let chunk = vec![b'x'; 64 * 1024];
-    for _ in 0..40 {
+/// A session running `sh -c 'trap "" HUP; …; exec sleep 30'` (SIGHUP
+/// ignored, input never read) whose writer is stuck in a write; returns its
+/// id and the child's pid (`exec` keeps it; an ignored signal stays ignored
+/// across `exec`).
+async fn stuck_sighup_ignoring_session(
+    c: &mut Client,
+    ws: WorkspaceId,
+    dir: &Path,
+    name: &str,
+) -> (SessionId, u32) {
+    let pidfile = dir.join(name);
+    let script = format!(
+        "trap '' HUP; echo $$ > '{}'; exec /bin/sleep 30",
+        pidfile.display()
+    );
+    let req = Request::CreateSession {
+        workspace: ws,
+        cwd: None,
+        command: Some(vec!["/bin/sh".into(), "-c".into(), script]),
+        title: None,
+        dims: DIMS,
+    };
+    let sid = match c.request(req).await {
+        Event::SessionUpdated(meta) => meta.id,
+        other => panic!("{other:?}"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid = loop {
+        let pid = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        if let Some(pid) = pid {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "no pid file");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let chunk = [vec![b'x'; 63], vec![b'\n']].concat().repeat(1024);
+    for _ in 0..20 {
         c.send(Request::Input {
             session: sid,
             data: chunk.clone(),
         })
         .await;
     }
-    let dropped = c
-        .wait_for("input dropped", |m| {
-            matches!(&m.event, Event::Error { message } if message.contains("not reading its input"))
+    // In-order barrier; a refused Input means the queue is full, so the
+    // writer is stuck in a write.
+    let lines = c
+        .request(Request::FetchLines {
+            session: sid,
+            start: 0,
+            count: 1,
         })
         .await;
-    assert!(dropped.reply_to.is_some());
-    // `sleep` ends, the blocked write fails, the queue drains, exit.
-    exited(&mut c, sid).await;
-    let errors: Vec<_> = c
+    assert!(matches!(lines, Event::Lines { .. }), "{lines:?}");
+    let refused = c
         .backlog
         .iter()
-        .filter(|m| matches!(m.event, Event::Error { .. }))
-        .collect();
-    assert!(errors.is_empty(), "warned more than once: {errors:?}");
+        .filter(
+            |m| matches!(&m.event, Event::Error { message } if message.starts_with("backpressure")),
+        )
+        .count();
+    assert!(refused > 0, "the writer never got stuck");
+    c.backlog
+        .retain(|m| !matches!(m.event, Event::Error { .. }));
+    (sid, pid)
+}
+
+fn alive(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// Review #15: with the writer stuck in a write the actor cannot use the
+/// handle's own kill; a child that also ignores SIGHUP must still die (and
+/// be reaped). `Kill` escalates to SIGKILL after `KILL_GRACE`; `Delete`
+/// lets go of the PTY at once and leaves a watchdog that does the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stuck_writer_does_not_keep_a_sighup_ignoring_child_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    let ws = match c
+        .request(Request::CreateWorkspace {
+            name: "w".into(),
+            root: root.path().to_path_buf(),
+        })
+        .await
+    {
+        Event::WorkspaceUpdated(ws) => ws.id,
+        other => panic!("{other:?}"),
+    };
+    let grace = berth_vt::KILL_GRACE;
+
+    let (sid, _) = stuck_sighup_ignoring_session(&mut c, ws, root.path(), "kill.pid").await;
+    let t = Instant::now();
+    assert_eq!(c.request(Request::Kill { session: sid }).await, Event::Ok);
+    assert_eq!(exited(&mut c, sid).await, Some(128 + 9), "SIGKILL");
+    let took = t.elapsed();
+    assert!(
+        took >= grace && took <= grace + Duration::from_secs(1),
+        "Kill took {took:?}"
+    );
+
+    let (sid, pid) = stuck_sighup_ignoring_session(&mut c, ws, root.path(), "delete.pid").await;
+    let t = Instant::now();
+    assert_eq!(c.request(Request::Delete { session: sid }).await, Event::Ok);
+    assert!(t.elapsed() < grace, "Delete waited for the child");
+    while alive(pid) {
+        assert!(
+            t.elapsed() <= grace + Duration::from_secs(1),
+            "child {pid} still alive {:?} after Delete",
+            t.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        t.elapsed() >= grace,
+        "it ignores SIGHUP: only SIGKILL ends it"
+    );
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
+
+/// Review #15 (refines medium #7): PTY writes run on a writer thread per
+/// session behind a 1 MiB queue, so a child that never reads its input
+/// (`sleep 30`) cannot block its session. 4 MiB poured in: every Input the
+/// queue cannot take gets its own backpressure error, the actor keeps
+/// answering (`FetchLines`), and `Kill` ends the session within
+/// `KILL_GRACE` + 1 s although the writer is stuck in a write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_child_that_does_not_read_cannot_block_its_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    let (_ws, meta) = workspace_and_command(&mut c, root.path(), &["/bin/sleep", "30"]).await;
+    let sid = meta.id;
+    // Short lines: a canonical-mode tty queues complete lines until its
+    // input buffer is full, then blocks the writer. (A line longer than the
+    // buffer would be discarded instead, and nothing would ever block.)
+    let line: Vec<u8> = [vec![b'x'; 63], vec![b'\n']].concat();
+    let chunk: Vec<u8> = line.repeat(1024);
+    assert_eq!(chunk.len(), 64 * 1024);
+    let mut inputs = HashSet::new();
+    for _ in 0..64 {
+        let id = c
+            .send(Request::Input {
+                session: sid,
+                data: chunk.clone(),
+            })
+            .await;
+        inputs.insert(id);
+    }
+    // Requests are handled in order: once this is answered, so is every
+    // Input before it.
+    let asked = Instant::now();
+    let lines = c
+        .request(Request::FetchLines {
+            session: sid,
+            start: 0,
+            count: 10,
+        })
+        .await;
+    assert!(
+        matches!(lines, Event::Lines { session, .. } if session == sid),
+        "{lines:?}"
+    );
+    assert!(
+        asked.elapsed() < Duration::from_secs(2),
+        "FetchLines took {:?}",
+        asked.elapsed()
+    );
+    let mut refused = HashSet::new();
+    for m in &c.backlog {
+        if let Event::Error { message } = &m.event {
+            let for_input = m.reply_to.filter(|id| inputs.contains(id));
+            assert!(
+                for_input.is_some() && message.starts_with("backpressure"),
+                "unexpected error {:?}: {message}",
+                m.reply_to
+            );
+            assert!(refused.insert(for_input), "two errors for one Input");
+        }
+    }
+    // 16 chunks fill the 1 MiB queue (allow one more for a chunk the tty
+    // took whole); each of the others was refused on its own.
+    assert!(
+        refused.len() >= 64 - 17,
+        "only {} of 64 Inputs refused",
+        refused.len()
+    );
+
+    let killed = Instant::now();
+    assert_eq!(c.request(Request::Kill { session: sid }).await, Event::Ok);
+    exited(&mut c, sid).await;
+    let took = killed.elapsed();
+    assert!(
+        took <= berth_vt::KILL_GRACE + Duration::from_secs(1),
+        "Kill took {took:?}"
+    );
     assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
     daemon.join().await;
 }

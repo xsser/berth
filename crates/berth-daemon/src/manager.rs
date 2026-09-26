@@ -35,6 +35,14 @@ pub type Result<T> = std::result::Result<T, String>;
 /// How long `shutdown` waits, in total, for the sessions to write their
 /// snapshots.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+/// Longest wait for a session actor's reply. Actors never block by design
+/// (PTY writes run on a writer thread), so this only turns a bug into an
+/// error for that one request instead of a request that never completes.
+const ACTOR_REPLY_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(30)
+};
 const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "elvish", "xonsh",
 ];
@@ -87,6 +95,39 @@ fn unknown(sid: SessionId) -> String {
 
 fn stopped() -> String {
     "session actor stopped".to_string()
+}
+
+fn no_reply(sid: SessionId) -> String {
+    format!(
+        "session {sid} did not respond within {} s",
+        ACTOR_REPLY_TIMEOUT.as_secs()
+    )
+}
+
+/// An actor's reply, waited for at most `ACTOR_REPLY_TIMEOUT`.
+async fn actor_reply<T>(sid: SessionId, rx: oneshot::Receiver<T>) -> Result<T> {
+    match tokio::time::timeout(ACTOR_REPLY_TIMEOUT, rx).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(stopped()),
+        Err(_) => {
+            tracing::warn!(session = %sid, "session actor did not reply in time");
+            Err(no_reply(sid))
+        }
+    }
+}
+
+/// Wait up to `max` for an actor thread to end. Polls: a blocking join on
+/// the runtime's blocking pool would keep the daemon from ever exiting.
+async fn join_within(join: std::thread::JoinHandle<()>, max: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + max;
+    while !join.is_finished() {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = join.join();
+    true
 }
 
 impl Manager {
@@ -546,14 +587,15 @@ impl Manager {
                 if let Some(e) = self.reg.lock().sessions.get_mut(&meta.id) {
                     e.actor = Some(handle);
                 }
-                init.await.unwrap_or_else(|_| Err(stopped()))
+                actor_reply(meta.id, init).await.and_then(|started| started)
             }
             Err(e) => Err(format!("cannot start session thread: {e}")),
         };
         if let Err(e) = started {
+            // Dropping the handle stops an actor that is merely late.
             let entry = self.reg.lock().sessions.remove(&meta.id);
             if let Some(join) = entry.and_then(|e| e.actor).and_then(|a| a.join) {
-                let _ = tokio::task::spawn_blocking(move || join.join()).await;
+                join_within(join, Duration::from_secs(1)).await;
             }
             return Err(format!(
                 "cannot start {:?} in {}: {e}",
@@ -605,9 +647,10 @@ impl Manager {
         Ok(())
     }
 
-    /// Queue input for the PTY. Beyond `MAX_PENDING_INPUT` queued bytes
-    /// (the child is not reading) input is dropped; the first drop of an
-    /// episode is logged and answered with an error, later ones silently.
+    /// Queue input for the PTY's writer. Beyond `MAX_PENDING_INPUT` queued
+    /// bytes (the child is not reading) input is refused: each refused
+    /// `Input` gets its own backpressure error and nothing of it is queued.
+    /// The first refusal of an episode is logged.
     pub fn input(&self, sid: SessionId, data: Vec<u8>) -> Result<()> {
         let (tx, budget) = {
             let reg = self.reg.lock();
@@ -621,13 +664,12 @@ impl Manager {
         let n = data.len();
         if !budget.reserve(n) {
             if budget.first_drop() {
-                tracing::warn!(session = %sid, bytes = n, "session is not reading its input; dropping input");
-                return Err(format!(
-                    "input dropped: session {sid} is not reading its input ({} KiB queued)",
-                    MAX_PENDING_INPUT / 1024
-                ));
+                tracing::warn!(session = %sid, bytes = n, "session is not reading its input; refusing input");
             }
-            return Ok(());
+            return Err(format!(
+                "backpressure: session {sid} is not reading its input ({} KiB queued); input refused",
+                MAX_PENDING_INPUT / 1024
+            ));
         }
         tx.send(SessionCmd::Input(data)).map_err(|_| {
             budget.release(n);
@@ -649,7 +691,7 @@ impl Manager {
             reply,
         })
         .map_err(|_| stopped())?;
-        rx.await.map_err(|_| stopped())
+        actor_reply(sid, rx).await
     }
 
     pub fn subscribe(
@@ -747,11 +789,12 @@ impl Manager {
         };
         let (reply, rx) = oneshot::channel();
         let started = match tx.send(SessionCmd::Revive { spawn, reply }) {
-            Ok(()) => rx.await.unwrap_or_else(|_| Err(stopped())),
+            Ok(()) => actor_reply(sid, rx).await.and_then(|started| started),
             Err(_) => Err(stopped()),
         };
         if let Err(err) = started {
-            // Nothing started: put the previous state back.
+            // Nothing started (or the actor is too late: it hangs up a child
+            // whose reply nobody took): put the previous state back.
             let _ = self.update(sid, |e| {
                 e.meta.status = meta.status.clone();
                 e.meta.cwd = meta.cwd.clone();
@@ -786,13 +829,24 @@ impl Manager {
                 .actor
                 .take()
         };
-        if let Some(ActorHandle { tx, join, .. }) = actor {
+        if let Some(mut actor) = actor {
             let (reply, rx) = oneshot::channel();
-            if tx.send(SessionCmd::Remove { reply }).is_ok() {
-                let _ = rx.await;
+            if actor.tx.send(SessionCmd::Remove { reply }).is_ok()
+                && tokio::time::timeout(ACTOR_REPLY_TIMEOUT, rx).await.is_err()
+            {
+                // A stuck actor still owns the PTY and the files: keep it
+                // and the session. `Remove` stays queued; a retry finds the
+                // actor gone and completes the delete.
+                tracing::warn!(session = %sid, "session actor did not stop in time; not deleted");
+                if let Some(e) = self.reg.lock().sessions.get_mut(&sid) {
+                    e.actor = Some(actor);
+                }
+                return Err(no_reply(sid));
             }
-            if let Some(join) = join {
-                let _ = tokio::task::spawn_blocking(move || join.join()).await;
+            if let Some(join) = actor.join.take() {
+                if !join_within(join, ACTOR_REPLY_TIMEOUT).await {
+                    tracing::warn!(session = %sid, "session thread still running; detached");
+                }
             }
         }
         self.reg.lock().sessions.remove(&sid);
@@ -1353,6 +1407,52 @@ mod tests {
                 "{mode:?}"
             );
         }
+        mgr.shutdown().await;
+    }
+
+    /// Review #15: waiting on an actor is capped (`ACTOR_REPLY_TIMEOUT`): a
+    /// stuck actor turns requests into errors, not requests that never
+    /// complete. A delete that timed out keeps the session (its actor still
+    /// owns the PTY and the files); once the actor is back, a retry deletes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stuck_actor_turns_requests_into_errors_not_hangs() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        paths.ensure_dirs().unwrap();
+        let store = Store::open(&paths).unwrap();
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        let mgr = Manager::start(paths, Config::default(), store, stop_tx).unwrap();
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let dims = Dims { cols: 80, rows: 24 };
+        let sid = mgr
+            .create_session(ws.id, None, Some(vec!["/bin/sh".into()]), None, dims)
+            .await
+            .unwrap()
+            .id;
+        let stall = ACTOR_REPLY_TIMEOUT * 2 + Duration::from_millis(500);
+        let stalled = std::time::Instant::now();
+        mgr.existing_tx(sid)
+            .unwrap()
+            .unwrap()
+            .send(SessionCmd::Stall(stall))
+            .unwrap();
+
+        let err = mgr.fetch_lines(sid, 0, 10).await.unwrap_err();
+        assert!(err.contains("did not respond"), "{err}");
+        assert!(stalled.elapsed() < ACTOR_REPLY_TIMEOUT + Duration::from_millis(500));
+        let err = mgr.delete_session(sid).await.unwrap_err();
+        assert!(err.contains("did not respond"), "{err}");
+        assert!(
+            mgr.meta(sid).is_some(),
+            "a delete that timed out keeps the session"
+        );
+
+        tokio::time::sleep(stall.saturating_sub(stalled.elapsed()) + Duration::from_millis(200))
+            .await;
+        mgr.delete_session(sid).await.unwrap();
+        assert!(mgr.meta(sid).is_none());
         mgr.shutdown().await;
     }
 
