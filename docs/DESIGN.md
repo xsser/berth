@@ -171,6 +171,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 [persist]        snapshot_interval_s = 5   journal = false   max_restored_lines = 50000
 [sidebar]        width = 280   preview_rows = 3   preview_hz = 4
 [notify]         on = ["waiting_permission", "waiting_input", "done", "error"]
+                 identity = "com.apple.Terminal"   # 未打包成 .app 前借用的通知身份；打包后改为自身 bundle id
 [agents.claude]  resume_command = "claude --resume {id}"
 [[keybind]]      key = "cmd+k"   action = "command_palette"
 ```
