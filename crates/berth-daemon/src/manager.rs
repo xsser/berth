@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use berth_core::{
-    now_ms, AgentInfo, AgentSignal, AgentState, ClaudeHookEvent, ClientRole, DaemonMsg,
+    now_ms, AgentInfo, AgentKind, AgentSignal, AgentState, ClaudeHookEvent, ClientRole, DaemonMsg,
     DaemonStatus, Dims, Event, HookEnvelope, Paths, PersistPolicy, ReviveMode, SessionId,
     SessionMeta, SessionStatus, StateSource, SubscribeMode, Workspace, WorkspaceId,
 };
@@ -730,7 +730,13 @@ impl Manager {
             e.meta.status = SessionStatus::Live;
             e.meta.cwd = cwd;
             e.meta.last_active_ms = now;
+            // Review #17: whatever the agent was doing is over. `Shell` does
+            // not bring it back (kind `Shell`, as when an agent leaves);
+            // `ResumeAgent` does. Ids and transcript stay for a later resume.
             let mut agent = e.meta.agent.clone();
+            if matches!(mode, ReviveMode::Shell) {
+                agent.kind = AgentKind::Shell;
+            }
             agent.state = AgentState::Idle;
             agent.since_ms = now;
             agent.source = StateSource::Heuristic;
@@ -1037,7 +1043,6 @@ fn usable_cwd(cwd: &Path, workspace_root: Option<&Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use berth_core::AgentKind;
 
     #[test]
     fn revive_reuses_plain_shells_only() {
@@ -1257,6 +1262,97 @@ mod tests {
             (events[0].kind.as_str(), events[0].detail.as_deref()),
             ("hook:late", Some("PreToolUse"))
         );
+        mgr.shutdown().await;
+    }
+
+    /// Review #17: a revive resets the agent to Idle / Heuristic / now.
+    /// `Shell` ends the agent (kind `Shell`), `ResumeAgent` keeps its kind;
+    /// both keep the ids and transcript a resume needs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revive_resets_the_agent_but_keeps_its_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        paths.ensure_dirs().unwrap();
+        let store = Store::open(&paths).unwrap();
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        // External id "30": the resumed "agent" is `sleep 30`, which stays
+        // up (and silent) for the whole test.
+        let config =
+            Config::parse("[agents.claude]\nresume_command = \"/bin/sleep {id}\"\n").unwrap();
+        let mgr = Manager::start(paths, config, store, stop_tx).unwrap();
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let dims = Dims { cols: 80, rows: 24 };
+        let sid = mgr
+            .create_session(ws.id, None, Some(vec!["/bin/sh".into()]), None, dims)
+            .await
+            .unwrap()
+            .id;
+        let claude = |event| HookEnvelope {
+            berth_session: Some(sid),
+            pid: 1,
+            sent_at_ms: 0,
+            signal: AgentSignal::Claude(berth_core::ClaudeHook {
+                session_id: "30".into(),
+                cwd: None,
+                transcript_path: Some("/t.jsonl".into()),
+                permission_mode: None,
+                event,
+            }),
+        };
+        let cases = [
+            (ReviveMode::Shell, AgentKind::Shell, "revive:shell"),
+            (ReviveMode::ResumeAgent, AgentKind::Claude, "revive:resume"),
+        ];
+        for (mode, kind, record) in cases {
+            // Claude owns the session and is running a tool (hook-sourced)
+            // when the PTY goes away.
+            mgr.handle_hook(claude(ClaudeHookEvent::SessionStart { source: None }));
+            mgr.handle_hook(claude(ClaudeHookEvent::PreToolUse {
+                tool_name: "Bash".into(),
+            }));
+            let busy = mgr.meta(sid).unwrap().agent;
+            assert_eq!(
+                (busy.kind.clone(), busy.source),
+                (AgentKind::Claude, StateSource::Hook)
+            );
+            mgr.kill(sid).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while mgr.meta(sid).unwrap().is_live() {
+                assert!(std::time::Instant::now() < deadline, "session did not exit");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(matches!(
+                mgr.meta(sid).unwrap().agent.state,
+                AgentState::Exited { .. }
+            ));
+
+            let t0 = now_ms();
+            let agent = mgr.revive(sid, mode).await.unwrap().agent;
+            assert_eq!(
+                (agent.kind.clone(), agent.state.clone(), agent.source),
+                (kind.clone(), AgentState::Idle, StateSource::Heuristic),
+                "{mode:?}"
+            );
+            assert!(agent.since_ms >= t0, "{mode:?}");
+            assert_eq!(agent.external_id.as_deref(), Some("30"));
+            assert_eq!(agent.transcript_path, Some(PathBuf::from("/t.jsonl")));
+            let events = mgr.store.list_events(sid, 50).unwrap();
+            let revive = events.iter().find(|e| e.kind.starts_with("revive:"));
+            assert_eq!(
+                revive.map(|e| (e.kind.as_str(), e.state.as_str())),
+                Some((record, AgentState::Idle.name()))
+            );
+            // Settled: the revived child's output does not move it.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let settled = mgr.meta(sid).unwrap().agent;
+            assert_eq!(
+                (settled.kind, settled.state),
+                (kind, AgentState::Idle),
+                "{mode:?}"
+            );
+        }
         mgr.shutdown().await;
     }
 
