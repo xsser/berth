@@ -325,6 +325,7 @@ dependencies = [
  "berth-core",
  "postcard",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
