@@ -83,12 +83,9 @@ impl OscPrescanner {
         let mut i = 0;
         while i < bytes.len() {
             if self.state == State::Ground {
+                // Fast path: in ground state only the next ESC matters.
                 match bytes[i..].iter().position(|&b| b == ESC) {
-                    Some(offset) => {
-                        i += offset + 1;
-                        self.state = State::Escape;
-                        continue;
-                    }
+                    Some(offset) => i += offset,
                     None => break,
                 }
             }
@@ -96,7 +93,10 @@ impl OscPrescanner {
             let byte = bytes[i];
             i += 1;
             self.state = match self.state {
-                State::Ground => unreachable!("handled above"),
+                State::Ground => match byte {
+                    ESC => State::Escape,
+                    _ => State::Ground,
+                },
                 State::Escape => match byte {
                     b']' => {
                         self.payload.clear();

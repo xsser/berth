@@ -171,8 +171,17 @@ impl Terminal {
         // Mirror alacritty's event loop: an expired synchronized update is
         // ended before more bytes are parsed.
         self.end_sync_if_expired(Instant::now());
+        let was_syncing = self.sync_deadline().is_some();
+        let buffered_before = self.parser.sync_bytes_count();
         self.parser.advance(&mut self.term, bytes);
-        self.collect_damage();
+        // Inside a synchronized update vte only buffers bytes and leaves the
+        // `Term` untouched; collecting would just re-damage the cursor row.
+        let fully_buffered = was_syncing
+            && self.sync_deadline().is_some()
+            && self.parser.sync_bytes_count() == buffered_before + bytes.len();
+        if !fully_buffered {
+            self.collect_damage();
+        }
         ProcessOutcome {
             osc,
             events: self.drain_events(),
@@ -840,9 +849,14 @@ mod tests {
         t.process(b"\x1b[?2026hframe");
         assert!(t.sync_deadline().is_some());
         assert_eq!(t.screen().lines[0].text(), "");
+        let _ = t.take_damage();
+        // Fully buffered chunks change nothing on screen: no damage.
+        t.process(b" in");
+        assert_eq!(t.take_damage(), Damage::None);
         t.process(b" done\x1b[?2026l");
         assert!(t.sync_deadline().is_none());
-        assert_eq!(t.screen().lines[0].text(), "frame done");
+        assert_eq!(t.screen().lines[0].text(), "frame in done");
+        assert_eq!(t.take_damage(), Damage::Lines(vec![0]));
     }
 
     #[test]
