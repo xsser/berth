@@ -35,6 +35,8 @@ pub struct Config {
     pub sidebar_width: f32,
     /// Agent states (`AgentState::name`) that raise a desktop notification.
     pub notify_on: Vec<String>,
+    /// Bundle id desktop notifications appear under (`[notify].identity`).
+    pub notify_identity: String,
 }
 
 impl Default for Config {
@@ -46,6 +48,7 @@ impl Default for Config {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            notify_identity: crate::notify::DEFAULT_IDENTITY.to_string(),
         }
     }
 }
@@ -63,6 +66,17 @@ struct FileConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileNotify {
     on: Option<Vec<String>>,
+    identity: Option<String>,
+}
+
+/// A bundle id as Apple defines it: letters, digits, `-` and `.`, with at
+/// least one `.` (reverse DNS), e.g. `com.apple.Terminal`.
+fn is_bundle_id(s: &str) -> bool {
+    s.contains('.')
+        && !s.starts_with('.')
+        && !s.ends_with('.')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
 }
 
 /// States `[notify].on` may list.
@@ -109,6 +123,13 @@ impl Config {
             }
             cfg.notify_on = on;
         }
+        if let Some(identity) = file.notify.identity {
+            anyhow::ensure!(
+                is_bundle_id(&identity),
+                "notify.identity {identity:?} is not a bundle id (e.g. \"com.apple.Terminal\")"
+            );
+            cfg.notify_identity = identity;
+        }
         Ok(cfg)
     }
 
@@ -153,6 +174,29 @@ mod tests {
         assert_eq!(cfg.font.family, "Menlo");
         assert_eq!(cfg.font.size, 14.5);
         assert_eq!(cfg.sidebar_width, 300.0);
+    }
+
+    #[test]
+    fn notify_identity_is_configurable_and_checked() {
+        assert_eq!(Config::default().notify_identity, "com.apple.Terminal");
+        let cfg = Config::from_toml_str("[notify]\nidentity = \"dev.berth.app\"\n").unwrap();
+        assert_eq!(cfg.notify_identity, "dev.berth.app");
+        assert_eq!(
+            cfg.notify_on,
+            Config::default().notify_on,
+            "on keeps its default"
+        );
+        for bad in [
+            "",
+            "Terminal",
+            "com.apple.Terminal app",
+            ".com.x",
+            "com.x.",
+            "com/x.y",
+        ] {
+            let doc = format!("[notify]\nidentity = {bad:?}\n");
+            assert!(Config::from_toml_str(&doc).is_err(), "{bad:?} accepted");
+        }
     }
 
     #[test]

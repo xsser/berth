@@ -337,7 +337,7 @@ impl App {
         };
         // No desktop notifications from one-shot runs.
         let notifier = match mode {
-            Mode::Interactive => match Notifier::start() {
+            Mode::Interactive => match Notifier::start(config.notify_identity.clone()) {
                 Ok(n) => Some(n),
                 Err(e) => {
                     ctl.error(format!("通知线程无法启动：{e:#}"));

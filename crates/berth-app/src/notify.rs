@@ -9,7 +9,8 @@
 //!
 //! [`Notifier`] delivers on its own thread (`mac-notification-sys` may block
 //! briefly); failures are logged. The app identity notifications appear under
-//! is set once, before the first one (see [`IDENTITY`]).
+//! (`[notify].identity`, default [`DEFAULT_IDENTITY`]) is set once, before
+//! the first one.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -103,11 +104,12 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    pub fn start() -> anyhow::Result<Notifier> {
+    /// `identity`: the bundle id notifications appear under.
+    pub fn start(identity: String) -> anyhow::Result<Notifier> {
         let (tx, rx) = crossbeam_channel::bounded::<(String, String)>(64);
         std::thread::Builder::new()
             .name("berth-notify".into())
-            .spawn(move || run(rx, set_identity, deliver))?;
+            .spawn(move || run(rx, &identity, set_identity, deliver))?;
         Ok(Notifier { tx })
     }
 
@@ -118,25 +120,28 @@ impl Notifier {
     }
 }
 
-/// The notifier thread: the identity is set once, before the first
+/// The notifier thread: `identity` is set once, before the first
 /// notification (not at start, so a run that never notifies leaves the
 /// process untouched), then each notification is delivered in order.
 fn run(
     rx: crossbeam_channel::Receiver<(String, String)>,
-    identify: impl FnOnce(),
+    identity: &str,
+    identify: impl FnOnce(&str),
     mut deliver: impl FnMut(&str, &str),
 ) {
     let mut identify = Some(identify);
     for (title, body) in rx {
         if let Some(identify) = identify.take() {
-            identify();
+            identify(identity);
         }
         deliver(&title, &body);
     }
 }
 
-/// The app identity of berth's notifications until berth ships as an app
-/// bundle. Unbundled binaries have none; left unset, mac-notification-sys
+/// Default of `[notify].identity`: the app identity of berth's notifications
+/// while berth runs as bare executables. Once it ships as an .app bundle,
+/// the default becomes that bundle's own id. Unbundled binaries have none;
+/// left unset, mac-notification-sys
 /// looks one up on the first notification with the AppleScript `get id of
 /// application "use_default"`, which on current macOS opens a "Where is
 /// use_default?" dialog and blocks the notifier thread for good. What that
@@ -144,16 +149,15 @@ fn run(
 /// "Legacy client com.apple.finder connecting to modern client" and denies
 /// every notification. Terminal is accepted (the library's own default;
 /// macOS asks the user once whether Terminal may notify).
-#[cfg(target_os = "macos")]
-const IDENTITY: &str = "com.apple.Terminal";
+pub const DEFAULT_IDENTITY: &str = "com.apple.Terminal";
 
 #[cfg(target_os = "macos")]
-fn set_identity() {
+fn set_identity(identity: &str) {
     // Called once: the library allows one attempt, and after it (success or
     // not) never runs its own lookup.
-    match mac_notification_sys::set_application(IDENTITY) {
-        Ok(()) => tracing::info!(identity = IDENTITY, "desktop notification identity set"),
-        Err(e) => tracing::warn!("desktop notification identity not set: {e}"),
+    match mac_notification_sys::set_application(identity) {
+        Ok(()) => tracing::info!(identity, "desktop notification identity set"),
+        Err(e) => tracing::warn!(identity, "desktop notification identity not set: {e}"),
     }
 }
 
@@ -174,7 +178,7 @@ fn deliver(title: &str, body: &str) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn set_identity() {}
+fn set_identity(_identity: &str) {}
 
 #[cfg(not(target_os = "macos"))]
 fn deliver(title: &str, body: &str) {
@@ -268,15 +272,19 @@ mod tests {
         drop(tx);
         run(
             rx,
-            || calls.borrow_mut().push("identify".to_string()),
+            "com.example.berth",
+            |id| calls.borrow_mut().push(format!("identify {id}")),
             |t, b| calls.borrow_mut().push(format!("{t}:{b}")),
         );
-        assert_eq!(calls.into_inner(), ["identify", "a:1", "b:2"]);
+        assert_eq!(
+            calls.into_inner(),
+            ["identify com.example.berth", "a:1", "b:2"]
+        );
         // Nothing to deliver: the identity is left alone.
         let (tx, rx) = crossbeam_channel::unbounded::<(String, String)>();
         drop(tx);
         let mut identified = false;
-        run(rx, || identified = true, |_, _| {});
+        run(rx, DEFAULT_IDENTITY, |_| identified = true, |_, _| {});
         assert!(!identified);
     }
 
