@@ -160,6 +160,10 @@ impl PtyHandle {
             if let Err(err) = child.kill() {
                 tracing::warn!(error = %err, "killing a child without pid failed");
             }
+            // Reap it too, so no zombie is left behind.
+            if let Err(err) = child.wait() {
+                tracing::warn!(error = %err, "reaping a child without pid failed");
+            }
             return Err(VtError::Pty("spawned child has no usable pid".into()));
         };
 
@@ -228,16 +232,25 @@ impl PtyHandle {
         self.signal(libc::SIGKILL)
     }
 
-    /// Foreground process group leader of the PTY (`tcgetpgrp` on the master
-    /// fd, then `proc_pidinfo` / `/proc`), used for agent-kind heuristics.
+    /// Foreground process of the PTY, used for agent-kind heuristics:
+    /// `tcgetpgrp` on the master fd names the foreground process group and
+    /// `proc_pidinfo` / `/proc` describe its leader. If the leader already
+    /// exited while other members still run (`a | b` after `a` finished),
+    /// the lowest-pid member that can still be inspected is reported.
     ///
-    /// `None` when there is no foreground group, its leader has exited, or it
-    /// has not exec'd yet: portable-pty's `pre_exec` closes std's exec-status
-    /// pipe, so [`PtyHandle::spawn`] can return while the child still runs
-    /// the daemon's own image; that transient state is not reported.
+    /// `None` when there is no foreground group, none of its members can be
+    /// inspected, or the process has not exec'd yet: portable-pty's
+    /// `pre_exec` closes std's exec-status pipe, so [`PtyHandle::spawn`] can
+    /// return while the child still runs the daemon's own image; that
+    /// transient state is not reported.
     pub fn foreground_process(&self) -> Option<ProcessInfo> {
-        let pgrp = self.foreground_pgrp()?;
-        let (info, exe) = procinfo::inspect(u32::try_from(pgrp).ok()?)?;
+        let pgrp = u32::try_from(self.foreground_pgrp()?).ok()?;
+        let (info, exe) = procinfo::inspect(pgrp).or_else(|| {
+            procinfo::group_members(pgrp)
+                .into_iter()
+                .filter(|&pid| pid != pgrp)
+                .find_map(procinfo::inspect)
+        })?;
         if exe.as_deref().is_some_and(is_own_executable) {
             return None;
         }
@@ -259,15 +272,17 @@ impl PtyHandle {
 }
 
 impl Drop for PtyHandle {
-    /// A still-running child is hung up and reaped on a background thread
-    /// (SIGKILL after [`KILL_GRACE`]) so the daemon never accumulates zombies.
+    /// A child that still runs, or whose state cannot be read, is hung up and
+    /// reaped on a background thread (SIGKILL after [`KILL_GRACE`]) so the
+    /// daemon never leaves orphans or zombies behind.
     fn drop(&mut self) {
         match self.try_wait() {
             Ok(Some(_)) => return,
             Ok(None) => {}
+            // Unknown state: clean up as if it still ran (groups that are
+            // already gone are not an error).
             Err(err) => {
-                tracing::warn!(pid = self.pid, error = %err, "try_wait failed while dropping PtyHandle");
-                return;
+                tracing::warn!(pid = self.pid, error = %err, "try_wait failed while dropping PtyHandle; hanging up anyway");
             }
         }
         let foreground = self.foreground_pgrp();
@@ -311,26 +326,34 @@ fn read_loop(mut reader: Box<dyn Read + Send>, tx: Sender<PtyOutput>) {
     }
 }
 
+/// Give a hung-up child [`KILL_GRACE`] to exit, then SIGKILL its groups and
+/// wait for it. A child whose state cannot be polled is treated as still
+/// running: same grace period, same escalation; a failing final `wait` is
+/// only logged.
 fn reap(mut child: Box<dyn Child + Send + Sync>, pid: u32, foreground: Option<libc::pid_t>) {
     let deadline = Instant::now() + KILL_GRACE;
+    let mut poll_failed = false;
     loop {
         match poll_child(child.as_mut()) {
             Ok(Some(_)) => return,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            Ok(None) => {
-                if let Err(err) = signal_session(pid, foreground, libc::SIGKILL) {
-                    tracing::warn!(pid, error = %err, "SIGKILL while reaping failed");
-                }
-                if let Err(err) = child.wait() {
-                    tracing::warn!(pid, error = %err, "waiting for killed child failed");
-                }
-                return;
-            }
+            Ok(None) => {}
             Err(err) => {
-                tracing::warn!(pid, error = %err, "polling child while reaping failed");
-                return;
+                if !poll_failed {
+                    tracing::warn!(pid, error = %err, "polling child while reaping failed; escalating after the grace period");
+                }
+                poll_failed = true;
             }
         }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Err(err) = signal_session(pid, foreground, libc::SIGKILL) {
+        tracing::warn!(pid, error = %err, "SIGKILL while reaping failed");
+    }
+    if let Err(err) = child.wait() {
+        tracing::warn!(pid, error = %err, "waiting for killed child failed");
     }
 }
 
@@ -472,6 +495,19 @@ fn is_own_executable(exe: &Path) -> bool {
     exe.file_name() == own.file_name() && exe.canonicalize().is_ok_and(|exe| exe == *own)
 }
 
+/// `(state, pgrp)` from the contents of `/proc/<pid>/stat`
+/// (`pid (comm) state ppid pgrp ...`). `comm` may itself contain spaces and
+/// parentheses, so fields are counted after the last `)`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_stat(stat: &str) -> Option<(char, u32)> {
+    let (_, fields) = stat.rsplit_once(')')?;
+    let mut fields = fields.split_ascii_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let _ppid = fields.next()?;
+    let pgrp = fields.next()?.parse().ok()?;
+    Some((state, pgrp))
+}
+
 #[cfg(target_os = "macos")]
 mod procinfo {
     use std::ffi::{OsStr, OsString};
@@ -501,6 +537,37 @@ mod procinfo {
             },
             exe,
         ))
+    }
+
+    /// `PROC_PGRP_ONLY` from `<sys/proc_info.h>` (libc does not export it).
+    const PROC_PGRP_ONLY: u32 = 2;
+
+    /// Upper bound on the pids listed per process group; a job's group
+    /// rarely has more than a handful of members.
+    const MAX_GROUP_MEMBERS: usize = 256;
+
+    /// Pids in process group `pgid`, ascending. The kernel also lists
+    /// zombies that were not reaped yet.
+    pub(super) fn group_members(pgid: u32) -> Vec<u32> {
+        let mut pids: [c_int; MAX_GROUP_MEMBERS] = [0; MAX_GROUP_MEMBERS];
+        let Ok(capacity) = c_int::try_from(std::mem::size_of_val(&pids)) else {
+            return Vec::new();
+        };
+        // SAFETY: `pids` is a writable stack array of exactly `capacity`
+        // bytes; proc_listpids copies out at most that many bytes of pids and
+        // returns the number of bytes written (<= 0 on failure).
+        let written = unsafe {
+            libc::proc_listpids(PROC_PGRP_ONLY, pgid, pids.as_mut_ptr().cast(), capacity)
+        };
+        let count = usize::try_from(written).unwrap_or(0) / std::mem::size_of::<c_int>();
+        let mut members: Vec<u32> = pids[..count.min(MAX_GROUP_MEMBERS)]
+            .iter()
+            .filter_map(|&pid| u32::try_from(pid).ok())
+            .filter(|&pid| pid > 0)
+            .collect();
+        members.sort_unstable();
+        members.dedup();
+        members
     }
 
     fn executable_path(pid: c_int) -> Option<PathBuf> {
@@ -585,6 +652,26 @@ mod procinfo {
         let cwd = std::fs::read_link(dir.join("cwd")).ok();
         Some((ProcessInfo { pid, name, cwd }, exe))
     }
+
+    /// Live pids in process group `pgid`, ascending, from `/proc/*/stat`.
+    pub(super) fn group_members(pgid: u32) -> Vec<u32> {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let mut members: Vec<u32> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .as_deref()
+                    .and_then(super::parse_proc_stat)
+                    .is_some_and(|(state, pgrp)| pgrp == pgid && !matches!(state, 'Z' | 'X'))
+            })
+            .collect();
+        members.sort_unstable();
+        members
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -593,6 +680,10 @@ mod procinfo {
 
     pub(super) fn inspect(_pid: u32) -> Option<(ProcessInfo, Option<std::path::PathBuf>)> {
         None
+    }
+
+    pub(super) fn group_members(_pgid: u32) -> Vec<u32> {
+        Vec::new()
     }
 }
 
@@ -679,5 +770,217 @@ mod tests {
     fn pty_handle_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PtyHandle>();
+    }
+
+    /// Poll `condition` every 20 ms until it holds or `timeout` passes.
+    fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if condition() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Hang up the session and make sure it is gone before the test ends.
+    fn shut_down(pty: &mut PtyHandle) {
+        pty.kill().expect("SIGHUP");
+        if !wait_for(Duration::from_secs(3), || {
+            matches!(pty.try_wait(), Ok(Some(_)))
+        }) {
+            pty.force_kill().expect("SIGKILL");
+            assert!(
+                wait_for(Duration::from_secs(3), || matches!(
+                    pty.try_wait(),
+                    Ok(Some(_))
+                )),
+                "child survived SIGKILL"
+            );
+        }
+    }
+
+    #[test]
+    fn foreground_process_reports_a_member_after_the_leader_exits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // An interactive shell saves its history on exit: keep it out of the
+        // user's home directory.
+        let history = dir.path().join("sh_history");
+        let history = history.to_string_lossy();
+        let mut spec = spec(&["/bin/sh", "-i"], &[("HISTFILE", history.as_ref())]);
+        spec.cwd = dir.path().to_path_buf();
+        let (mut pty, _output) = PtyHandle::spawn(&spec).expect("spawn");
+        pty.write(b"sleep 0.5 | sleep 5\n").expect("write");
+        let runs_sleep = |pty: &PtyHandle| {
+            pty.foreground_process()
+                .is_some_and(|info| info.name.starts_with("sleep"))
+        };
+        assert!(
+            wait_for(Duration::from_secs(5), || runs_sleep(&pty)),
+            "the pipeline never became the foreground job"
+        );
+        // The job's process group is named after its first process. Once
+        // `sleep 0.5` has exited and been reaped, only `sleep 5` keeps the
+        // group, and with it the terminal, alive.
+        let pgrp = pty
+            .foreground_pgrp()
+            .and_then(|pgrp| u32::try_from(pgrp).ok())
+            .expect("foreground group");
+        assert!(
+            wait_for(Duration::from_secs(3), || procinfo::inspect(pgrp).is_none()),
+            "the group leader never went away"
+        );
+        let info = pty.foreground_process();
+        shut_down(&mut pty);
+        let info = info.expect("a surviving member of the foreground group is reported");
+        assert!(info.name.starts_with("sleep"), "{info:?}");
+        assert_ne!(info.pid, pgrp);
+    }
+
+    /// Stands in for a child whose state can no longer be read (for example
+    /// because something else reaped it): every poll and wait fails.
+    #[derive(Debug)]
+    struct UnreadableChild {
+        pid: u32,
+    }
+
+    impl portable_pty::ChildKiller for UnreadableChild {
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(UnreadableChild { pid: self.pid })
+        }
+    }
+
+    impl Child for UnreadableChild {
+        fn try_wait(&mut self) -> io::Result<Option<portable_pty::ExitStatus>> {
+            Err(io::Error::from_raw_os_error(libc::ECHILD))
+        }
+
+        fn wait(&mut self) -> io::Result<portable_pty::ExitStatus> {
+            Err(io::Error::from_raw_os_error(libc::ECHILD))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(self.pid)
+        }
+    }
+
+    /// Exit status of `child` within `timeout`. On timeout its whole process
+    /// group is killed so nothing outlives a failing test.
+    fn status_within(
+        child: &mut std::process::Child,
+        timeout: Duration,
+    ) -> Option<std::process::ExitStatus> {
+        let mut status = None;
+        wait_for(timeout, || {
+            status = child.try_wait().expect("try_wait");
+            status.is_some()
+        });
+        if status.is_none() {
+            let pgid = libc::pid_t::try_from(child.id()).expect("pid fits pid_t");
+            kill_group(pgid, libc::SIGKILL).expect("cleanup SIGKILL");
+            child.wait().expect("cleanup wait");
+        }
+        status
+    }
+
+    #[test]
+    fn dropping_with_unreadable_child_state_still_hangs_up_and_kills() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ready = dir.path().join("ready");
+        let hung_up = dir.path().join("hung-up");
+        // A process group of its own that records SIGHUP but keeps running,
+        // so only the SIGKILL escalation ends it.
+        let script = format!(
+            r#"trap ': > "{hup}"' HUP; : > "{ready}"; while :; do /bin/sleep 0.1; done"#,
+            hup = hung_up.display(),
+            ready = ready.display(),
+        );
+        let mut victim = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .process_group(0)
+            .spawn()
+            .expect("spawn victim");
+        assert!(
+            wait_for(Duration::from_secs(5), || ready.exists()),
+            "victim never installed its trap"
+        );
+
+        let pid = victim.id();
+        let pair = native_pty_system()
+            .openpty(pty_size(80, 24))
+            .expect("openpty");
+        let writer = pair.master.take_writer().expect("pty writer");
+        drop(pair.slave);
+        let handle = PtyHandle {
+            master: Mutex::new(pair.master),
+            writer: Mutex::new(writer),
+            child: Some(Box::new(UnreadableChild { pid })),
+            pid,
+            exit_code: None,
+        };
+        let dropped = Instant::now();
+        drop(handle);
+
+        let status = status_within(&mut victim, KILL_GRACE + Duration::from_secs(5));
+        let elapsed = dropped.elapsed();
+        assert!(hung_up.exists(), "SIGHUP was not sent");
+        assert_eq!(
+            status.and_then(|status| status.signal()),
+            Some(libc::SIGKILL),
+            "no SIGKILL escalation: {status:?}"
+        );
+        assert!(
+            elapsed >= KILL_GRACE,
+            "SIGKILL came before the grace period: {elapsed:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn group_members_lists_the_processes_of_a_group() {
+        use std::os::unix::process::CommandExt;
+
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn leader");
+        let pgid = leader.id();
+        let mut member = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(i32::try_from(pgid).expect("pgid fits i32"))
+            .spawn()
+            .expect("spawn member");
+        let members = procinfo::group_members(pgid);
+        let unknown = procinfo::group_members(i32::MAX as u32);
+        for child in [&mut leader, &mut member] {
+            child.kill().expect("kill");
+            child.wait().expect("wait");
+        }
+        let mut expected = vec![pgid, member.id()];
+        expected.sort_unstable();
+        assert_eq!(members, expected);
+        assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
+    #[test]
+    fn proc_stat_fields_are_counted_after_the_last_paren() {
+        assert_eq!(
+            parse_proc_stat("4242 (sleep) S 4200 4242 4200 34816 4242 4194304\n"),
+            Some(('S', 4242))
+        );
+        // `comm` may itself contain spaces and parentheses.
+        assert_eq!(parse_proc_stat("7 (a) (b c) Z 1 99 1 0"), Some(('Z', 99)));
+        assert_eq!(parse_proc_stat("7 (truncated"), None);
+        assert_eq!(parse_proc_stat("7 (x) R 1"), None);
     }
 }
