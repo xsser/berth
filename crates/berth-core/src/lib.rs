@@ -22,8 +22,11 @@ pub use session::*;
 pub use snapshot::*;
 pub use style::*;
 
-/// Wire protocol version. Bump on any incompatible change to `protocol`.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Wire protocol version, checked by `Hello`. Bump on any change to the
+/// protocol messages or the types they carry.
+/// - 1: M1 / M2.
+/// - 2: M3: `ListEvents` / `ResumeCommand` and their answers.
+pub const PROTOCOL_VERSION: u32 = 2;
 /// On-disk snapshot format version (`SessionSnapshotFile`).
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 

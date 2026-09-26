@@ -452,6 +452,52 @@ mod tests {
         }
     }
 
+    /// A client stops a daemon of another protocol version by speaking that
+    /// version (`Hello`, `Shutdown`, answered by `Hello`, `Incompatible`,
+    /// `Ok` or `Error`), so these frames must keep their bytes in every
+    /// protocol version.
+    #[test]
+    fn frames_spoken_across_protocol_versions_keep_their_bytes() {
+        let hello = ClientMsg {
+            id: 0,
+            req: Request::Hello {
+                role: ClientRole::Cli,
+                protocol: 1,
+                client_version: "v".into(),
+            },
+        };
+        assert_eq!(postcard::to_stdvec(&hello).unwrap(), [0, 0, 2, 1, 1, b'v']);
+        let shutdown = ClientMsg {
+            id: 1,
+            req: Request::Shutdown,
+        };
+        assert_eq!(postcard::to_stdvec(&shutdown).unwrap(), [1, 23]);
+        let answers: [(Event, &[u8]); 4] = [
+            (
+                Event::Hello {
+                    daemon_version: "v".into(),
+                    protocol: 1,
+                },
+                &[0, 1, b'v', 1],
+            ),
+            (Event::Incompatible { daemon_protocol: 1 }, &[1, 1]),
+            (Event::Ok, &[2]),
+            (
+                Event::Error {
+                    message: "e".into(),
+                },
+                &[3, 1, b'e'],
+            ),
+        ];
+        for (event, bytes) in answers {
+            let msg = DaemonMsg {
+                reply_to: Some(1),
+                event,
+            };
+            assert_eq!(postcard::to_stdvec(&msg).unwrap(), [&[1, 1], bytes].concat());
+        }
+    }
+
     /// The M3 variants are appended: every pre-M3 variant keeps its postcard
     /// discriminant, so M2 peers still decode each other's old messages.
     #[test]
