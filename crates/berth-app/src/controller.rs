@@ -577,6 +577,8 @@ impl Controller {
                 }
             }
             Event::Ok => {}
+            // Only requested by the CLI so far.
+            Event::Events { .. } | Event::ResumeCommand { .. } => {}
             Event::Hello { .. } | Event::Incompatible { .. } => {
                 tracing::debug!("unexpected handshake message after Hello");
             }

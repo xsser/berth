@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use berth_core::{
     now_ms, AgentInfo, AgentKind, AgentSignal, AgentState, ClaudeHookEvent, ClientRole, DaemonMsg,
-    DaemonStatus, Dims, Event, HookEnvelope, Paths, PersistPolicy, ReviveMode, SessionId,
-    SessionMeta, SessionStatus, StateSource, SubscribeMode, Workspace, WorkspaceId,
+    DaemonStatus, Dims, Event, EventEntry, HookEnvelope, Paths, PersistPolicy, ReviveMode,
+    SessionId, SessionMeta, SessionStatus, StateSource, SubscribeMode, Workspace, WorkspaceId,
 };
 use berth_store::{EventRecord, Store};
 use berth_vt::PtySpawn;
@@ -43,6 +43,8 @@ const ACTOR_REPLY_TIMEOUT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(30)
 };
+/// Most rows one `ListEvents` returns.
+const MAX_EVENT_LIST: u32 = 200;
 const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "elvish", "xonsh",
 ];
@@ -749,13 +751,7 @@ impl Manager {
             return Err("session is live".into());
         }
         let command = revive_argv(&self.config, &meta, mode)?;
-        let root = self
-            .reg
-            .lock()
-            .workspaces
-            .get(&meta.workspace)
-            .map(|w| w.root.clone());
-        let cwd = usable_cwd(&meta.cwd, root.as_deref());
+        let cwd = self.revive_cwd(&meta, mode);
         let spawn = self.pty_spawn(&meta, command, cwd.clone());
         let tx = self.actor_tx(sid)?;
         // Live *before* the PTY starts (registry only, committed below): the
@@ -926,16 +922,22 @@ impl Manager {
         };
         match envelope.signal {
             AgentSignal::Claude(hook) => {
-                // Resume needs Claude's own cwd (it keys transcripts by cwd).
+                // The agent's own cwd: where it started (resume needs it,
+                // see `revive_start_dir`) and where its `cd`s lead.
                 let cwd = match (&hook.event, &hook.cwd) {
                     (ClaudeHookEvent::SessionStart { .. }, Some(cwd)) => Some(cwd.clone()),
+                    (ClaudeHookEvent::Other { hook_event_name }, Some(cwd))
+                        if hook_event_name == "CwdChanged" =>
+                    {
+                        Some(cwd.clone())
+                    }
                     _ => None,
                 };
-                self.transition(sid, Signal::Hook(hook), |m| {
-                    if let Some(cwd) = cwd {
-                        m.cwd = cwd;
-                    }
-                });
+                self.transition(sid, Signal::Hook(hook), |_| {});
+                // Persist + `SessionUpdated` + `Cwd` like an OSC 7 report.
+                if let Some(cwd) = cwd.filter(|c| c.is_absolute()) {
+                    self.set_cwd(sid, cwd);
+                }
             }
             AgentSignal::Codex(notify) => {
                 self.transition(sid, Signal::Codex(notify), |_| {});
@@ -959,6 +961,48 @@ impl Manager {
                 });
             }
         }
+    }
+
+    /// Where a revive of `meta` starts (see `revive_start_dir`).
+    fn revive_cwd(&self, meta: &SessionMeta, mode: ReviveMode) -> PathBuf {
+        let root = self
+            .reg
+            .lock()
+            .workspaces
+            .get(&meta.workspace)
+            .map(|w| w.root.clone());
+        usable_cwd(&revive_start_dir(meta, mode), root.as_deref())
+    }
+
+    /// The session's most recent agent events, newest first.
+    pub fn list_events(&self, sid: SessionId, limit: u32) -> Result<Vec<EventEntry>> {
+        if self.meta(sid).is_none() {
+            return Err(unknown(sid));
+        }
+        let rows = self
+            .store
+            .list_events(sid, limit.min(MAX_EVENT_LIST))
+            .map_err(|e| format!("cannot read events: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| EventEntry {
+                at_ms: r.at_ms,
+                kind: r.kind,
+                state: r.state,
+                detail: r.detail,
+            })
+            .collect())
+    }
+
+    /// What `revive(sid, ResumeAgent)` would execute and where, computed by
+    /// the same code; nothing is started.
+    pub fn resume_command(&self, sid: SessionId) -> Result<Event> {
+        let meta = self.meta(sid).ok_or_else(|| unknown(sid))?;
+        Ok(Event::ResumeCommand {
+            session: sid,
+            cwd: self.revive_cwd(&meta, ReviveMode::ResumeAgent),
+            command: revive_argv(&self.config, &meta, ReviveMode::ResumeAgent),
+        })
     }
 
     pub fn status(&self) -> DaemonStatus {
@@ -1082,6 +1126,49 @@ fn revive_argv(config: &Config, meta: &SessionMeta, mode: ReviveMode) -> Result<
             config.resume_argv(&meta.agent.kind, id)
         }
     }
+}
+
+/// The directory a revive should start in, before the existence fallbacks
+/// of `usable_cwd`. Claude keys a session's transcript by the directory it
+/// was started in, while `cwd` follows the agent's `cd`s (`CwdChanged`), so
+/// a Claude resume starts in the ancestor of `cwd` that owns the transcript
+/// (`claude --resume <id>` elsewhere does not find the session). Without a
+/// match it is `cwd`, as for every other revive.
+fn revive_start_dir(meta: &SessionMeta, mode: ReviveMode) -> PathBuf {
+    let claude_transcript = match (mode, &meta.agent.kind, &meta.agent.transcript_path) {
+        (ReviveMode::ResumeAgent, AgentKind::Claude, Some(t)) => Some(t),
+        _ => None,
+    };
+    claude_transcript
+        .and_then(|t| claude_project_dir(&meta.cwd, t))
+        .unwrap_or_else(|| meta.cwd.clone())
+}
+
+/// The ancestor of `cwd` (itself included) whose Claude project key equals
+/// the name of the transcript's directory
+/// (`~/.claude/projects/<key>/<id>.jsonl`).
+fn claude_project_dir(cwd: &Path, transcript: &Path) -> Option<PathBuf> {
+    let key = transcript.parent()?.file_name()?.to_str()?;
+    cwd.ancestors()
+        .find(|dir| {
+            claude_project_key(dir) == key
+                || std::fs::canonicalize(dir).is_ok_and(|real| claude_project_key(&real) == key)
+        })
+        .map(Path::to_path_buf)
+}
+
+/// Claude Code's directory key: every UTF-16 unit that is not an ASCII
+/// letter or digit becomes `-` (`/Users/me/my.app` → `-Users-me-my-app`).
+fn claude_project_key(dir: &Path) -> String {
+    let mut key = String::new();
+    for c in dir.to_string_lossy().chars() {
+        if c.is_ascii_alphanumeric() {
+            key.push(c);
+        } else {
+            key.extend(std::iter::repeat_n('-', c.len_utf16()));
+        }
+    }
+    key
 }
 
 fn usable_cwd(cwd: &Path, workspace_root: Option<&Path>) -> PathBuf {
@@ -1462,5 +1549,61 @@ mod tests {
         assert_eq!(usable_cwd(dir.path(), None), dir.path());
         let gone = dir.path().join("gone");
         assert_eq!(usable_cwd(&gone, Some(dir.path())), dir.path());
+    }
+
+    #[test]
+    fn claude_project_key_matches_claude_code() {
+        let key = |p: &str| claude_project_key(Path::new(p));
+        assert_eq!(key("/Users/me/my.app"), "-Users-me-my-app");
+        assert_eq!(key("/Users/me/.claude"), "-Users-me--claude");
+        assert_eq!(key("/private/tmp/a_b c"), "-private-tmp-a-b-c");
+        // One `-` per UTF-16 unit, as JavaScript's replace sees the string.
+        assert_eq!(key("/tmp/中文"), "-tmp---");
+        assert_eq!(key("/tmp/\u{1F600}"), "-tmp---");
+    }
+
+    /// M3: after `CwdChanged` moved `cwd` below the project, a Claude resume
+    /// still starts where the transcript lives; everything else keeps `cwd`.
+    #[test]
+    fn claude_resume_starts_in_the_transcripts_project_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj.x");
+        let sub = project.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Claude sees the real path (`/var` → `/private/var` on macOS).
+        let real = std::fs::canonicalize(&project).unwrap();
+        let transcript = PathBuf::from("/h/.claude/projects")
+            .join(claude_project_key(&real))
+            .join("id.jsonl");
+        let mut meta = SessionMeta {
+            id: SessionId::new(),
+            workspace: WorkspaceId::new(),
+            title_auto: String::new(),
+            title_user: None,
+            cwd: sub.clone(),
+            command: vec!["/bin/zsh".into()],
+            env: Vec::new(),
+            status: SessionStatus::Restored,
+            agent: AgentInfo::default(),
+            created_at_ms: 0,
+            last_active_ms: 0,
+            unread: false,
+            persist: PersistPolicy {
+                snapshot: true,
+                journal: false,
+            },
+            order: 0,
+            cols: 80,
+            rows: 24,
+        };
+        meta.agent.kind = AgentKind::Claude;
+        meta.agent.transcript_path = Some(transcript.clone());
+        assert_eq!(revive_start_dir(&meta, ReviveMode::ResumeAgent), project);
+        assert_eq!(revive_start_dir(&meta, ReviveMode::Shell), sub);
+        meta.agent.transcript_path = Some(PathBuf::from("/h/.claude/projects/-elsewhere/id.jsonl"));
+        assert_eq!(revive_start_dir(&meta, ReviveMode::ResumeAgent), sub);
+        meta.agent.transcript_path = Some(transcript);
+        meta.agent.kind = AgentKind::Codex;
+        assert_eq!(revive_start_dir(&meta, ReviveMode::ResumeAgent), sub);
     }
 }

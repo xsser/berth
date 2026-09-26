@@ -114,6 +114,8 @@ fn event_kind(e: &Event) -> &'static str {
         Event::AgentChanged { .. } => "AgentChanged",
         Event::Exited { .. } => "Exited",
         Event::Status(_) => "Status",
+        Event::Events { .. } => "Events",
+        Event::ResumeCommand { .. } => "ResumeCommand",
     }
 }
 

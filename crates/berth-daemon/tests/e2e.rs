@@ -1229,3 +1229,152 @@ async fn a_child_that_does_not_read_cannot_block_its_session() {
     assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
     daemon.join().await;
 }
+
+/// Claude's key for a project directory (`~/.claude/projects/<key>/`).
+fn claude_project_key(dir: &Path) -> String {
+    dir.to_string_lossy()
+        .chars()
+        .flat_map(|c| {
+            let n = if c.is_ascii_alphanumeric() {
+                0
+            } else {
+                c.len_utf16()
+            };
+            std::iter::repeat_n('-', n).chain((n == 0).then_some(c))
+        })
+        .collect()
+}
+
+/// A Claude hook event as `berth-hook claude` sends it, with cwd and
+/// transcript path.
+fn claude_at(
+    sid: SessionId,
+    session_id: &str,
+    cwd: &Path,
+    transcript: &Path,
+    event: ClaudeHookEvent,
+) -> Request {
+    Request::Hook(HookEnvelope {
+        berth_session: Some(sid),
+        pid: std::process::id(),
+        sent_at_ms: now_ms(),
+        signal: AgentSignal::Claude(ClaudeHook {
+            session_id: session_id.into(),
+            cwd: Some(cwd.to_path_buf()),
+            transcript_path: Some(transcript.to_path_buf()),
+            permission_mode: Some("default".into()),
+            event,
+        }),
+    })
+}
+
+async fn cwd_event(c: &mut Client, sid: SessionId, want: &Path) {
+    c.wait_for(
+        &format!("Cwd {}", want.display()),
+        |m| matches!(&m.event, Event::Cwd { session, path } if *session == sid && path == want),
+    )
+    .await;
+}
+
+/// M3: `SessionStart` and `CwdChanged` move the session's cwd and tell the
+/// clients (`Cwd`); `ListEvents` returns the recorded events newest first;
+/// `ResumeCommand` shows what a resume would run, in the transcript's
+/// project directory rather than the `cd` target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claude_cwd_events_list_and_resume_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let config = berth_daemon::Config::parse(
+        "[agents.claude]\nresume_command = \"/bin/echo resumed-by {id}\"\n",
+    )
+    .unwrap();
+    let daemon = start_daemon_with(&paths, config);
+    let mut c = Client::connect(&paths.socket).await;
+    let (_ws, meta) = workspace_and_shell(&mut c, root.path()).await;
+    let sid = meta.id;
+    let project = std::fs::canonicalize(root.path()).unwrap().join("proj");
+    let sub = project.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let transcript = dir
+        .path()
+        .join("projects")
+        .join(claude_project_key(&project))
+        .join("t.jsonl");
+    let id = "0f8c2e1a-1111-2222-3333-444455556666";
+    let mut hook = Client::connect_as(&paths.socket, ClientRole::Hook).await;
+
+    let start = ClaudeHookEvent::SessionStart {
+        source: Some("startup".into()),
+    };
+    hook.send(claude_at(sid, id, &project, &transcript, start))
+        .await;
+    cwd_event(&mut c, sid, &project).await;
+    let changed = ClaudeHookEvent::Other {
+        hook_event_name: "CwdChanged".into(),
+    };
+    hook.send(claude_at(sid, id, &sub, &transcript, changed))
+        .await;
+    cwd_event(&mut c, sid, &sub).await;
+    assert_eq!(session_meta(&mut c, sid).await.cwd, sub);
+
+    let events = match c
+        .request(Request::ListEvents {
+            session: sid,
+            limit: 10,
+        })
+        .await
+    {
+        Event::Events { session, events } => {
+            assert_eq!(session, sid);
+            events
+        }
+        other => panic!("ListEvents answered {other:?}"),
+    };
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["hook:CwdChanged", "hook:SessionStart"],
+        "{events:?}"
+    );
+    match c
+        .request(Request::ListEvents {
+            session: sid,
+            limit: 1,
+        })
+        .await
+    {
+        Event::Events { events, .. } => assert_eq!(events.len(), 1),
+        other => panic!("ListEvents answered {other:?}"),
+    }
+
+    assert_eq!(c.request(Request::Kill { session: sid }).await, Event::Ok);
+    exited(&mut c, sid).await;
+    match c.request(Request::ResumeCommand { session: sid }).await {
+        Event::ResumeCommand {
+            session,
+            cwd,
+            command,
+        } => {
+            assert_eq!(session, sid);
+            assert_eq!(cwd, project, "resume starts where the transcript lives");
+            let want: Vec<String> = ["/bin/echo", "resumed-by", id].map(String::from).into();
+            assert_eq!(command, Ok(want));
+        }
+        other => panic!("ResumeCommand answered {other:?}"),
+    }
+    // Nothing ran: the session is still dormant.
+    assert!(!session_meta(&mut c, sid).await.is_live());
+    let unknown = SessionId::new();
+    for req in [
+        Request::ResumeCommand { session: unknown },
+        Request::ListEvents {
+            session: unknown,
+            limit: 1,
+        },
+    ] {
+        assert!(matches!(c.request(req).await, Event::Error { .. }));
+    }
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
