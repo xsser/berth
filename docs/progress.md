@@ -20,3 +20,6 @@
 - `feat/daemon` 合并到 main（b293c61）：19 项审查发现全部修复并经独立复核（Revive 白名单 id + argv exec、FetchLines 饱和运算 + actor catch_unwind、双向角色鉴权、statusline 1s 期限、codex --chain 127、并发 shutdown 5s、writer 线程 + 1 MiB 背压、状态机 agent_left/Exited 终态/hook:late、outbox reply_to、purge 顺序、hook 50 ms 硬预算）。合并后 workspace 全绿：app 69、core 13、daemon 50+13、hook 8+7、store 11、vt 59+11；clippy、fmt 干净。M1 完成。
 - 设计澄清：`AgentState::Exited` 只表示 PTY 子进程退出（⇔ `SessionStatus::Dormant`），Claude `SessionEnd` 走 agent 离开转移（DESIGN §9，e147a89）。
 - 下一步 M2：`feat/integrate`（worktree `~/projects/berth-wt-integrate`），按 `docs/tasks/integrate.md`（含 §6 审查约束与登录 shell PATH 要求）。
+- `feat/integrate` 合并到 main（0a9831b）：M2 完成。GUI 跑在 berthd 上（client 读写线程 + generation 重连、controller、真实数据侧栏与 Preview 订阅、通知、`berth list`/`berth doctor` 只读、隐藏 `berth debug` 脚本化验收）。独立审查 1 medium（触顶后历史缓存陈旧）已修（缓存代号 + 旧代回包丢弃 + 红检测试），1 low（粘贴任务全局单例）记入缺口。workspace 311 测试全绿（app 139、core 13、daemon 63、hook 15、store 11、vt 70）。验收证据 `/tmp/berth-m2/shots/`（锁屏下 offscreen）；需用户解锁验证：present/vsync、真实 IME、鼠标拖拽、目录选择器、claude 中文 prompt（信任框未替用户确认）。
+- 已知缺口（app）：触顶洪水中回滚视图无法锚定、合并更新里同时增长又越界的驱逐识别不了（根治需 daemon 单调绝对行号，v1.1）；`berthd` 由 GUI 用登录 shell PATH 拉起，argv resume 依赖该 PATH。
+- 下一步 M3：`feat/m3`（worktree `~/projects/berth-wt-m3`），任务书 `docs/tasks/m3-agent-aware.md` §5（官方 hook 事件核对结果、验收不写真实配置、`claude --settings` 语义）。
