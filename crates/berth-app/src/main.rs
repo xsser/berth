@@ -9,6 +9,7 @@ mod config;
 mod fixture;
 mod ime;
 mod input;
+mod renderer;
 mod terminal;
 mod theme;
 
