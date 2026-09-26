@@ -184,13 +184,16 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 | `PreToolUse { tool_name }` / `PostToolUse` | Claude hook | → ToolRunning(name) / → Thinking |
 | `Notification { permission_prompt }` / `{ idle_prompt }` | Claude hook | → WaitingPermission / → WaitingInput |
 | `Stop` / `SubagentStop` | Claude hook | → Done（用户再输入后 → Idle）/ 不变，记子代理计数 |
-| `PreCompact` / `SessionEnd` | Claude hook | → Compacting / → Exited |
+| `PermissionRequest` / `PermissionDenied` | Claude hook | → WaitingPermission(tool)（即时信号；`permission_prompt` 通知约 6s 后才来）/ → Thinking |
+| `PostToolUseFailure` / `StopFailure` | Claude hook | → Thinking / → Error |
+| `PreCompact` | Claude hook | → Compacting |
+| `SessionEnd { reason }` | Claude hook | agent 离开：kind=Shell，→ Idle，保留 `session_id` / `transcript_path` 供「续接」展示（不是 Exited：shell 仍活着） |
 | `agent-turn-complete` | Codex notify | → Done |
-| OSC 133 A / C / D(exit) | shell 集成 | → Idle / Running(cmd) / Idle(+exit code) |
-| 前台进程名 = claude / codex / node(claude) | `tcgetpgrp` + `proc_pidinfo` | 设 kind；无 hook 时输出活动 → Thinking，静默 ≥3s 且光标在行首 → Idle（confidence 0.5） |
-| 子进程退出 | PTY EOF | → Exited，status=Dormant |
+| OSC 133 A / C / D(exit) | shell 集成 | → Idle / Running(cmd) / Idle(+exit code)；若当前 kind 是 agent，则同为 agent 离开（kind=Shell） |
+| 前台进程名 = claude / codex / node(claude) | `tcgetpgrp` + `proc_pidinfo` | 设 kind；无 hook 时输出活动 → Thinking，静默 ≥3s 且光标在行首 → Idle（confidence 0.5）；前台从 agent 变为非 agent → agent 离开 |
+| 子进程退出 | PTY EOF | → Exited，status=Dormant（终态：任何信号都不改变，只有 Revive 重置） |
 
-优先级：hook 事件 30s 内有效期内覆盖启发式；启发式不能覆盖 WaitingPermission（避免把「等授权」误判成 Idle）。每次转移写入 SQLite `events` 表（时间线 / 复盘）。
+优先级按状态门控而非时间门控（`StateSource` 契约，见 berth-core `agent.rs`）：启发式不覆盖 hook 态，也不离开粘性状态（WaitingPermission / WaitingInput / Done / Error / Exited）；shell 集成提示符与前台进程离开是「agent 已不在前台」的证据，可结束 hook 态但走 agent 离开转移；迟到的 hook 不能把 Exited 复活。每次转移写入 SQLite `events` 表（时间线 / 复盘）。
 
 ## 10. 与 Claude Code / Codex 集成
 
