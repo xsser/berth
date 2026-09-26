@@ -8,7 +8,8 @@
 //! notifications follow the same focus and repeat rules.
 //!
 //! [`Notifier`] delivers on its own thread (`mac-notification-sys` may block
-//! briefly); failures are logged.
+//! briefly); failures are logged. The app identity notifications appear under
+//! is set once, before the first one (see [`IDENTITY`]).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -106,11 +107,7 @@ impl Notifier {
         let (tx, rx) = crossbeam_channel::bounded::<(String, String)>(64);
         std::thread::Builder::new()
             .name("berth-notify".into())
-            .spawn(move || {
-                for (title, body) in rx {
-                    deliver(&title, &body);
-                }
-            })?;
+            .spawn(move || run(rx, set_identity, deliver))?;
         Ok(Notifier { tx })
     }
 
@@ -121,15 +118,60 @@ impl Notifier {
     }
 }
 
+/// The notifier thread: the identity is set once, before the first
+/// notification (not at start, so a run that never notifies leaves the
+/// process untouched), then each notification is delivered in order.
+fn run(
+    rx: crossbeam_channel::Receiver<(String, String)>,
+    identify: impl FnOnce(),
+    mut deliver: impl FnMut(&str, &str),
+) {
+    let mut identify = Some(identify);
+    for (title, body) in rx {
+        if let Some(identify) = identify.take() {
+            identify();
+        }
+        deliver(&title, &body);
+    }
+}
+
+/// The app identity of berth's notifications until berth ships as an app
+/// bundle. Unbundled binaries have none; left unset, mac-notification-sys
+/// looks one up on the first notification with the AppleScript `get id of
+/// application "use_default"`, which on current macOS opens a "Where is
+/// use_default?" dialog and blocks the notifier thread for good. Finder is
+/// what that lookup falls back to, so it is named directly.
+#[cfg(target_os = "macos")]
+const IDENTITY: &str = "com.apple.Finder";
+
+#[cfg(target_os = "macos")]
+fn set_identity() {
+    // Called once: the library allows one attempt, and after it (success or
+    // not) never runs its own lookup.
+    match mac_notification_sys::set_application(IDENTITY) {
+        Ok(()) => tracing::info!(identity = IDENTITY, "desktop notification identity set"),
+        Err(e) => tracing::warn!("desktop notification identity not set: {e}"),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn deliver(title: &str, body: &str) {
-    // Unbundled binaries notify under the library's default identity until
-    // berth ships as an app bundle.
+    let started = Instant::now();
     match mac_notification_sys::send_notification(title, None, body, None) {
-        Ok(_) => tracing::info!(title, body, "desktop notification handed to macOS"),
+        // The library waits up to 2 s for macOS to confirm delivery and
+        // returns Ok either way; the time tells the two apart.
+        Ok(_) => tracing::info!(
+            title,
+            body,
+            ms = started.elapsed().as_millis() as u64,
+            "desktop notification handed to macOS"
+        ),
         Err(e) => tracing::warn!(title, "desktop notification failed: {e}"),
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+fn set_identity() {}
 
 #[cfg(not(target_os = "macos"))]
 fn deliver(title: &str, body: &str) {
@@ -211,6 +253,28 @@ mod tests {
         assert!(!p.program_notify(s, false, t0 + Duration::from_secs(10)));
         p.forget(s);
         assert!(p.program_notify(s, false, t0 + Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn the_identity_is_set_once_before_the_first_notification() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(("a".to_string(), "1".to_string())).unwrap();
+        tx.send(("b".to_string(), "2".to_string())).unwrap();
+        drop(tx);
+        run(
+            rx,
+            || calls.borrow_mut().push("identify".to_string()),
+            |t, b| calls.borrow_mut().push(format!("{t}:{b}")),
+        );
+        assert_eq!(calls.into_inner(), ["identify", "a:1", "b:2"]);
+        // Nothing to deliver: the identity is left alone.
+        let (tx, rx) = crossbeam_channel::unbounded::<(String, String)>();
+        drop(tx);
+        let mut identified = false;
+        run(rx, || identified = true, |_, _| {});
+        assert!(!identified);
     }
 
     #[test]
