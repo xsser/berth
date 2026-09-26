@@ -212,7 +212,13 @@ fn row_pre_compact_and_session_end() {
         )
         .unwrap();
     assert_eq!(a.detail.as_deref(), Some("prompt_input_exit"));
-    assert_eq!(m.info().state, AgentState::Exited { code: None });
+    // DESIGN §9: agent left, not Exited (the shell lives on).
+    let info = m.info();
+    assert_eq!(
+        (info.kind.clone(), info.state.clone(), info.source),
+        (AgentKind::Shell, AgentState::Idle, StateSource::Hook)
+    );
+    assert_eq!(info.external_id.as_deref(), Some("claude-uuid"));
 }
 
 #[test]
@@ -543,15 +549,15 @@ fn foreground_agent_to_non_agent_is_agent_left() {
         None
     );
 
-    // Not after `Exited` (SessionEnd).
+    // Not after `Exited` (PTY exit).
     let mut m = machine();
     m.apply(&Signal::ForegroundProcess("claude".into()), T0);
-    m.apply(&hook(ClaudeHookEvent::SessionEnd { reason: None }), T0 + 1);
+    m.apply(&Signal::Exited(Some(0)), T0 + 1);
     assert_eq!(
         m.apply(&Signal::ForegroundProcess("zsh".into()), T0 + 2),
         None
     );
-    assert_eq!(m.info().state, AgentState::Exited { code: None });
+    assert_eq!(m.info().state, AgentState::Exited { code: Some(0) });
 
     // Only a switch *from an agent name* counts: `node` hosting Claude.
     let mut m = machine();
@@ -681,50 +687,48 @@ fn exited_is_terminal() {
     assert!(m.apply(&pre("Bash"), T0 + 11).unwrap().state_changed);
 }
 
-/// Deviation from "only a revive leaves `Exited`": after the agent's
-/// `SessionEnd` the PTY (a shell) may start the agent again, and that run's
-/// `SessionStart` must be tracked. Anything else stays late.
+/// DESIGN §9 (e147a89): `SessionEnd` is "agent left", not `Exited` — the
+/// shell lives on, drives the state through OSC 133 again, and the next
+/// agent run simply starts over. Only the PTY's exit is `Exited`.
 #[test]
-fn session_end_yields_only_to_a_new_agent_run_while_the_pty_lives() {
+fn session_end_is_agent_left_not_exited() {
     let mut m = machine();
-    m.apply(&hook(ClaudeHookEvent::SessionEnd { reason: None }), T0);
-    assert_eq!(m.info().state, AgentState::Exited { code: None });
-    assert_eq!(m.apply(&pre("Bash"), T0 + 1).unwrap().kind, "hook:late");
+    m.apply(&pre("Bash"), T0);
+    let a = m
+        .apply(&hook(ClaudeHookEvent::SessionEnd { reason: None }), T0 + 1)
+        .unwrap();
     assert_eq!(
-        m.apply(
-            &Signal::Osc(OscEvent::Prompt(PromptMark::PromptStart)),
-            T0 + 2
-        ),
-        None
+        (a.kind.as_str(), a.state_changed),
+        ("hook:SessionEnd", true)
     );
+    let info = m.info().clone();
+    assert_eq!(
+        (info.kind, info.state),
+        (AgentKind::Shell, AgentState::Idle)
+    );
+    assert_eq!(info.external_id.as_deref(), Some("claude-uuid"));
+    assert_eq!(info.transcript_path, Some(PathBuf::from("/t.jsonl")));
+    // The shell's marks move it again.
+    let a = m
+        .apply(
+            &Signal::Osc(OscEvent::Prompt(PromptMark::OutputStart)),
+            T0 + 2,
+        )
+        .unwrap();
+    assert_eq!((a.kind.as_str(), a.detail), ("osc:133C", None));
+    assert_eq!(m.info().state, AgentState::Thinking);
+    // A new run in the same shell.
     let a = m
         .apply(
             &hook_from("new-run", ClaudeHookEvent::SessionStart { source: None }),
             T0 + 3,
         )
         .unwrap();
+    assert!(a.state_changed);
     assert_eq!(
-        (a.kind.as_str(), a.state_changed),
-        ("hook:SessionStart", true)
+        (m.info().kind.clone(), m.info().external_id.as_deref()),
+        (AgentKind::Claude, Some("new-run"))
     );
-    assert_eq!(
-        (m.info().state.clone(), m.info().external_id.as_deref()),
-        (AgentState::Idle, Some("new-run"))
-    );
-    // SessionEnd, then the PTY ends too: the code refines Exited, and from
-    // then on nothing (not even SessionStart) leaves it.
-    m.apply(&hook(ClaudeHookEvent::SessionEnd { reason: None }), T0 + 4);
-    let a = m.apply(&Signal::Exited(Some(0)), T0 + 5).unwrap();
-    assert_eq!(a.kind, "pty:exit");
-    assert_eq!(m.info().state, AgentState::Exited { code: Some(0) });
-    let a = m
-        .apply(
-            &hook(ClaudeHookEvent::SessionStart { source: None }),
-            T0 + 6,
-        )
-        .unwrap();
-    assert_eq!(a.kind, "hook:late");
-    assert_eq!(m.info().state, AgentState::Exited { code: Some(0) });
 }
 
 #[test]

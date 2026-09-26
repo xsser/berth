@@ -11,13 +11,12 @@
 //!   activity only moves `Idle → Thinking`, silence only moves busy states
 //!   `→ Idle`;
 //! - a foreground agent name sets the kind unless a hook spoke within 30 s;
-//! - OSC 133 marks while an agent owns the session (the shell is back at
-//!   its prompt), and a foreground switch from an agent name to another
-//!   name, are "agent left": kind back to `Shell`, ids and transcript kept;
-//! - `Exited` is terminal: no signal leaves it (late hooks are recorded as
-//!   `hook:late`), only a revive (`reset`) does — except that while the PTY
-//!   still runs, a `SessionStart` after the agent's `SessionEnd` begins a new
-//!   agent run in the same shell;
+//! - the agent's `SessionEnd`, OSC 133 marks while an agent owns the session
+//!   (the shell is back at its prompt) and a foreground switch from an agent
+//!   name to another name are "agent left": kind back to `Shell`, ids and
+//!   transcript kept — the shell lives on, so this is never `Exited`;
+//! - `Exited` is the PTY's exit and terminal: no signal leaves it (late
+//!   hooks are recorded as `hook:late`), only a revive (`reset`) does;
 //! - the nine core Claude hook events, `Notification` types with a clear
 //!   meaning and `PermissionRequest` / `PermissionDenied` /
 //!   `PostToolUseFailure` / `StopFailure` move the state; the other hook
@@ -91,9 +90,6 @@ pub struct AgentMachine {
     subagent_stops: u32,
     /// Previous `ForegroundProcess` name, to recognise an agent leaving.
     last_fg: Option<String>,
-    /// The PTY child exited (`Signal::Exited`), as opposed to an `Exited`
-    /// entered through the agent's `SessionEnd`.
-    pty_exited: bool,
 }
 
 impl AgentMachine {
@@ -103,7 +99,6 @@ impl AgentMachine {
             last_hook_ms: None,
             subagent_stops: 0,
             last_fg: None,
-            pty_exited: false,
         }
     }
 
@@ -117,7 +112,6 @@ impl AgentMachine {
         self.last_hook_ms = None;
         self.subagent_stops = 0;
         self.last_fg = None;
-        self.pty_exited = false;
     }
 
     pub fn subagent_stops(&self) -> u32 {
@@ -209,7 +203,7 @@ impl AgentMachine {
             return self.apply_pty_exit(*code, now_ms);
         }
         if matches!(self.info.state, AgentState::Exited { .. }) {
-            return self.apply_while_exited(signal, now_ms);
+            return self.apply_while_exited(signal);
         }
         match signal {
             Signal::Hook(hook) => Some(self.apply_claude(hook, now_ms)),
@@ -275,9 +269,8 @@ impl AgentMachine {
         }
     }
 
-    /// PTY EOF. Also refines an `Exited` from `SessionEnd` with the code.
+    /// PTY EOF.
     fn apply_pty_exit(&mut self, code: Option<i32>, now_ms: i64) -> Option<Applied> {
-        self.pty_exited = true;
         let state = AgentState::Exited { code };
         if self.info.state == state {
             return None;
@@ -291,24 +284,16 @@ impl AgentMachine {
         })
     }
 
-    /// `Exited` is terminal (review #19): late hooks are reported as
-    /// `hook:late` and change nothing (not even ids or kind); OSC and
-    /// heuristics are ignored. Only while the PTY still runs can a
-    /// `SessionStart` (the agent started again in the same shell after its
-    /// `SessionEnd`) begin a new run.
-    fn apply_while_exited(&mut self, signal: &Signal, now_ms: i64) -> Option<Applied> {
+    /// `Exited` is terminal (review #19, DESIGN §9): late hooks are reported
+    /// as `hook:late` and change nothing (not even ids or kind); OSC and
+    /// heuristics are ignored.
+    fn apply_while_exited(&self, signal: &Signal) -> Option<Applied> {
         let late = |name: String| Applied {
             kind: "hook:late".into(),
             detail: Some(name),
             state_changed: false,
         };
         match signal {
-            Signal::Hook(hook)
-                if !self.pty_exited
-                    && matches!(hook.event, ClaudeHookEvent::SessionStart { .. }) =>
-            {
-                Some(self.apply_claude(hook, now_ms))
-            }
             Signal::Hook(hook) => Some(late(claude_event_name(&hook.event).to_owned())),
             Signal::Codex(n) => Some(late(format!("codex:{}", n.event_type))),
             _ => None,
@@ -409,11 +394,17 @@ impl AgentMachine {
             ClaudeHookEvent::PreCompact { trigger } => {
                 ("PreCompact", trigger.clone(), Some(AgentState::Compacting))
             }
-            ClaudeHookEvent::SessionEnd { reason } => (
-                "SessionEnd",
-                reason.clone(),
-                Some(AgentState::Exited { code: None }),
-            ),
+            // DESIGN §9: the agent left and the shell lives on (`Exited` is
+            // the PTY's). Ids and transcript stay for a later resume.
+            ClaudeHookEvent::SessionEnd { reason } => {
+                let state_changed =
+                    self.agent_left(AgentState::Idle, StateSource::Hook, HOOK_CONFIDENCE, now_ms);
+                return Applied {
+                    kind: "hook:SessionEnd".into(),
+                    detail: reason.clone(),
+                    state_changed,
+                };
+            }
             ClaudeHookEvent::Other { hook_event_name } => {
                 let name = hook_event_name.as_str();
                 match name {
