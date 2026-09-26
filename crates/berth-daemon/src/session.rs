@@ -10,7 +10,9 @@
 //! restored sessions, or folded from the old terminal on revive); style ids
 //! stay valid across lives because the new terminal inherits the interner.
 
+use std::any::Any;
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -101,6 +103,9 @@ pub(crate) enum SessionCmd {
     Remove {
         reply: oneshot::Sender<()>,
     },
+    /// Test-only: panic on the actor thread.
+    #[cfg(test)]
+    Crash,
 }
 
 #[derive(Clone, Debug)]
@@ -204,8 +209,13 @@ fn start_thread(
     let join = std::thread::Builder::new()
         .name(format!("session-{}", actor.id.short()))
         .spawn(move || {
-            if init(&mut actor) {
-                actor.run(rx);
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                if init(&mut actor) {
+                    actor.run(&rx);
+                }
+            }));
+            if let Err(panic) = outcome {
+                actor.crashed(panic_message(panic.as_ref()));
             }
         })?;
     Ok(ActorHandle {
@@ -320,7 +330,7 @@ impl Actor {
         }
     }
 
-    fn run(mut self, rx: Receiver<SessionCmd>) {
+    fn run(&mut self, rx: &Receiver<SessionCmd>) {
         let never = crossbeam_channel::never();
         while !self.stopped {
             self.on_timers(Instant::now());
@@ -419,6 +429,8 @@ impl Actor {
                 self.stop(false);
                 let _ = reply.send(());
             }
+            #[cfg(test)]
+            SessionCmd::Crash => panic!("injected session actor panic"),
         }
     }
 }
@@ -755,30 +767,37 @@ impl Actor {
         out
     }
 
+    /// Lines `[start, start + count)` of the virtual line space (restored
+    /// prefix ++ live scrollback ++ screen). `start` / `count` come straight
+    /// from the client: they are clamped to the space before any arithmetic,
+    /// so absurd values yield an empty reply, never an overflow.
     fn fetch_lines(&mut self, start: u64, count: u32) -> Event {
         let count = u64::from(count.min(MAX_FETCH_LINES));
         let prefix_len = self.prefix.len() as u64;
+        let hist_len = self.term.as_ref().map_or(0, |t| t.history_len() as u64);
+        let screen_rows = self.term.as_ref().map_or(0, |t| u64::from(t.dims().rows));
+        let screen_start = prefix_len + hist_len;
+        let total = screen_start + screen_rows;
+        let start = start.min(total);
+        let end = start.saturating_add(count).min(total);
         let mut lines: Vec<LineSnapshot> = Vec::new();
-        let end_prefix = (start + count).min(prefix_len);
-        if start < end_prefix {
-            lines.extend_from_slice(&self.prefix[start as usize..end_prefix as usize]);
+        if start < prefix_len {
+            lines.extend_from_slice(&self.prefix[start as usize..end.min(prefix_len) as usize]);
         }
         if let Some(term) = self.term.as_mut() {
-            let hist_len = term.history_len() as u64;
-            let mut pos = start.max(prefix_len);
-            let end = start + count;
-            if pos < end && pos < prefix_len + hist_len {
-                let take = (end.min(prefix_len + hist_len) - pos) as usize;
-                lines.extend(term.history((pos - prefix_len) as usize, take));
-                pos += take as u64;
+            let (from, to) = (start.max(prefix_len), end.min(screen_start));
+            if from < to {
+                lines.extend(term.history((from - prefix_len) as usize, (to - from) as usize));
             }
-            let screen_start = prefix_len + hist_len;
-            if pos < end && pos >= screen_start {
+            let from = start.max(screen_start);
+            if from < end {
                 let screen = term.screen().lines;
-                let from = (pos - screen_start) as usize;
-                let to = ((end - screen_start) as usize).min(screen.len());
-                if from < to {
-                    lines.extend_from_slice(&screen[from..to]);
+                let (a, b) = (
+                    (from - screen_start) as usize,
+                    (end - screen_start) as usize,
+                );
+                if a < b.min(screen.len()) {
+                    lines.extend_from_slice(&screen[a..b.min(screen.len())]);
                 }
             }
         }
@@ -1120,6 +1139,39 @@ impl Actor {
         }
         next
     }
+}
+
+impl Actor {
+    /// The actor thread panicked. Salvage what can be salvaged — a final
+    /// snapshot (itself guarded: the state may be inconsistent), the journal
+    /// — hang up the child (dropping the handle does that), and let the
+    /// manager forget this actor: the next request starts a history-only
+    /// actor from the snapshot, so Attach / FetchLines / Revive / Delete keep
+    /// working.
+    fn crashed(&mut self, what: String) {
+        tracing::error!(session = %self.id, panic = %what, "session actor panicked");
+        let was_live = self.live.is_some();
+        let saved = catch_unwind(AssertUnwindSafe(|| self.write_snapshot(true)));
+        if saved.is_err() {
+            tracing::error!(session = %self.id, "final snapshot after the panic failed");
+        }
+        self.live = None;
+        if let Some(mut j) = self.journal.take() {
+            if let Err(e) = j.flush() {
+                tracing::warn!(session = %self.id, error = %e, "journal flush failed");
+            }
+        }
+        self.subs.clear();
+        self.mgr.actor_crashed(self.id, was_live, &what);
+    }
+}
+
+fn panic_message(panic: &(dyn Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".into())
 }
 
 fn enumerate_rows(lines: Vec<LineSnapshot>) -> Vec<(u16, LineSnapshot)> {

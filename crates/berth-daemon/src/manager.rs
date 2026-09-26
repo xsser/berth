@@ -294,6 +294,26 @@ impl Manager {
         }
     }
 
+    /// A session actor panicked (`session::Actor::crashed`). Forget its
+    /// handle — `actor_tx` then starts a history-only actor from the
+    /// snapshot on the next request — and, if a PTY was running, record the
+    /// session as Dormant like an exit without code.
+    pub(crate) fn actor_crashed(&self, sid: SessionId, was_live: bool, what: &str) {
+        if let Some(e) = self.reg.lock().sessions.get_mut(&sid) {
+            e.actor = None;
+        }
+        if was_live {
+            self.session_exited(sid, None);
+            self.broadcast(Event::Exited {
+                session: sid,
+                code: None,
+            });
+        }
+        self.broadcast(Event::Error {
+            message: format!("session {sid} stopped after an internal error: {what}"),
+        });
+    }
+
     pub(crate) fn touch(&self, sid: SessionId) {
         if let Some(e) = self.reg.lock().sessions.get_mut(&sid) {
             e.meta.last_active_ms = now_ms();
@@ -400,7 +420,7 @@ impl Manager {
             let order = reg
                 .workspaces
                 .values()
-                .map(|w| w.order + 1)
+                .map(|w| w.order.saturating_add(1))
                 .max()
                 .unwrap_or(0);
             let ws = Workspace {
@@ -480,7 +500,7 @@ impl Manager {
                 .sessions
                 .values()
                 .filter(|e| e.meta.workspace == workspace)
-                .map(|e| e.meta.order + 1)
+                .map(|e| e.meta.order.saturating_add(1))
                 .max()
                 .unwrap_or(0);
             let dims = if dims.cols < 2 || dims.rows < 1 {
@@ -955,6 +975,79 @@ mod tests {
         assert_eq!(shell_quote("0f8c-11aa"), "0f8c-11aa");
         assert_eq!(shell_quote("$(rm -rf ~)"), "'$(rm -rf ~)'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    /// Review high #2: a panicking actor leaves a Dormant session that a
+    /// fresh history-only actor keeps serving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actor_panic_leaves_a_usable_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        paths.ensure_dirs().unwrap();
+        let store = Store::open(&paths).unwrap();
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        let mgr = Manager::start(paths, Config::default(), store, stop_tx).unwrap();
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let dims = Dims { cols: 80, rows: 24 };
+        let sid = mgr
+            .create_session(ws.id, None, Some(vec!["/bin/sh".into()]), None, dims)
+            .await
+            .unwrap()
+            .id;
+        let events = Outbox::new();
+        let conn = mgr.register_conn(ClientRole::Gui, events.clone());
+        let tx = mgr.existing_tx(sid).unwrap().unwrap();
+        tx.send(SessionCmd::Crash).unwrap();
+
+        let (mut exited, mut error) = (false, false);
+        while !(exited && error) {
+            let batch = tokio::time::timeout(Duration::from_secs(10), events.next_batch())
+                .await
+                .expect("crash announced")
+                .expect("outbox open");
+            for msg in batch {
+                match msg.event {
+                    Event::Exited { session, code } if session == sid => {
+                        assert_eq!(code, None);
+                        exited = true;
+                    }
+                    Event::Error { message } if message.contains("internal error") => error = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            mgr.existing_tx(sid).unwrap().is_none(),
+            "dead actor forgotten"
+        );
+        assert!(matches!(
+            mgr.meta(sid).unwrap().status,
+            SessionStatus::Dormant {
+                exit_code: None,
+                ..
+            }
+        ));
+
+        // A fresh actor serves FetchLines, Attach, Revive and Delete.
+        assert!(matches!(
+            mgr.fetch_lines(sid, 0, 10).await.unwrap(),
+            Event::Lines { .. }
+        ));
+        let screen = Outbox::new();
+        mgr.attach(conn, screen.clone(), sid, dims, 7).unwrap();
+        let batch = tokio::time::timeout(Duration::from_secs(5), screen.next_batch())
+            .await
+            .expect("attach answered")
+            .expect("outbox open");
+        assert!(batch
+            .iter()
+            .any(|m| m.reply_to == Some(7) && matches!(m.event, Event::Screen(_))));
+        assert!(mgr.revive(sid, ReviveMode::Shell).await.unwrap().is_live());
+        mgr.delete_session(sid).await.unwrap();
+        assert!(mgr.meta(sid).is_none());
+        mgr.shutdown().await;
     }
 
     #[test]

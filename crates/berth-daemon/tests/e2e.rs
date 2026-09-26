@@ -796,3 +796,43 @@ async fn hook_role_cannot_control_the_daemon() {
     assert_eq!(gui.request(Request::Shutdown).await, Event::Ok);
     daemon.join().await;
 }
+
+/// Review high #2: client-supplied FetchLines ranges cannot crash a session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fetch_lines_with_absurd_range_is_harmless() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    let (_ws, meta) = workspace_and_shell(&mut c, root.path()).await;
+    let sid = meta.id;
+    for (start, count) in [(u64::MAX, u32::MAX), (u64::MAX - 1, 5), (0, u32::MAX)] {
+        let req = Request::FetchLines {
+            session: sid,
+            start,
+            count,
+        };
+        match c.request(req).await {
+            Event::Lines { lines, .. } => {
+                if start > 0 {
+                    assert!(lines.is_empty(), "start={start}: {} lines", lines.len());
+                } else {
+                    assert_eq!(lines.len(), usize::from(DIMS.rows), "whole space");
+                }
+            }
+            other => panic!("FetchLines({start}, {count}) answered {other:?}"),
+        }
+    }
+    // The session survived: still live, attachable and responsive.
+    let mut screen = attach(&mut c, sid).await;
+    c.send(Request::Input {
+        session: sid,
+        data: b"echo ok-$$\n".to_vec(),
+    })
+    .await;
+    c.screen_until(sid, &mut screen, "ok-<pid>", |s| s.has("ok-"))
+        .await;
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
