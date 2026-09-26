@@ -4,9 +4,11 @@
 //! - `Ime::Enabled` arrives the first time marked text appears.
 //! - `Ime::Preedit(text, Some((start, end)))` carries the composition and a
 //!   byte range for the IME caret; empty `text` means the preedit was cleared.
-//! - `Ime::Commit(text)` is preceded by an empty `Preedit`. A key consumed by
-//!   the IME does not also produce `WindowEvent::KeyboardInput`, so committed
-//!   text is never delivered twice.
+//! - `Ime::Commit(text)` is preceded by an empty `Preedit`. winit documents
+//!   that a key consumed by the IME does not also produce
+//!   `WindowEvent::KeyboardInput`; because that is unverified with real IMEs
+//!   here, `input::decide_key` also swallows every non-⌘ key while a preedit
+//!   is showing, so composition keys never reach the PTY.
 //! - `Ime::Disabled` when the input source changes; pending preedit is dropped.
 //!
 //! Only `Commit` produces bytes for the PTY; preedit is drawn at the cursor

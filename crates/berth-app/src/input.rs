@@ -245,6 +245,89 @@ pub fn key_from_winit(logical: &WinitKey, text: Option<&str>) -> Option<KeyInput
     }
 }
 
+/// The parts of a winit `KeyEvent` the routing decision needs. (`KeyEvent`
+/// itself cannot be built in tests: its `platform_specific` field is
+/// crate-private.)
+#[derive(Clone, Copy, Debug)]
+pub struct KeyPress<'a> {
+    pub logical: &'a WinitKey,
+    pub text: Option<&'a str>,
+    pub pressed: bool,
+    pub synthetic: bool,
+    pub mods: ModifiersState,
+}
+
+/// IME state when the key event arrives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImeGate {
+    /// `Ime::Enabled` seen and not yet `Disabled`.
+    pub enabled: bool,
+    /// A non-empty preedit is showing (composition in progress).
+    pub composing: bool,
+}
+
+/// GUI shortcuts (⌘ chords). They never reach the PTY.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Shortcut {
+    /// ⌘Q / ⌘W: quit the spike.
+    Quit,
+    /// Any other ⌘ chord (⌘K palette, ⌘N … arrive in M1+).
+    Unbound(String),
+}
+
+/// What a key press does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyAction {
+    /// Write `bytes` to the PTY; `desc` names the chord (status row, logs).
+    Forward { desc: String, bytes: Vec<u8> },
+    /// ⌘ chord for the app. Passes even while the IME is composing.
+    Shortcut(Shortcut),
+    /// The IME is composing: the key belongs to it (Backspace edits the
+    /// preedit, Enter commits it, arrows move within it), not to the PTY.
+    SwallowedByIme { desc: String },
+    /// Release, synthetic, modifier-only or unmapped key.
+    Ignore,
+}
+
+/// Route one key press (DESIGN §8.2).
+///
+/// winit 0.30 on macOS documents that keys consumed by the input method do
+/// not also arrive as `KeyboardInput`, but that is unverified with real IMEs
+/// here, so the terminal enforces it itself: while a preedit is showing,
+/// every key except ⌘ chords is swallowed. With no preedit — IME enabled or
+/// not — keys are encoded normally. Option composes characters (not Meta,
+/// Ghostty's default), so Alt is never applied on top of the composed text.
+pub fn decide_key(press: &KeyPress, ime: ImeGate, modes: TermModes) -> KeyAction {
+    if !press.pressed || press.synthetic {
+        return KeyAction::Ignore;
+    }
+    if press.mods.super_key() {
+        return KeyAction::Shortcut(shortcut_for(press.logical));
+    }
+    let mods = Mods::from_winit(press.mods, false);
+    let Some(key) = key_from_winit(press.logical, press.text) else {
+        return KeyAction::Ignore;
+    };
+    let desc = describe(&key, mods);
+    if ime.composing {
+        return KeyAction::SwallowedByIme { desc };
+    }
+    match encode(&key, mods, modes) {
+        Some(bytes) => KeyAction::Forward { desc, bytes },
+        None => KeyAction::Ignore,
+    }
+}
+
+fn shortcut_for(logical: &WinitKey) -> Shortcut {
+    match logical {
+        WinitKey::Character(c) if c.eq_ignore_ascii_case("q") || c.eq_ignore_ascii_case("w") => {
+            Shortcut::Quit
+        }
+        WinitKey::Character(c) => Shortcut::Unbound(format!("⌘{}", c.to_uppercase())),
+        other => Shortcut::Unbound(format!("⌘{other:?}")),
+    }
+}
+
 /// Short description of a key chord for the status line ("Ctrl+C", "Shift+Up").
 pub fn describe(key: &KeyInput, mods: Mods) -> String {
     let mut s = String::new();
@@ -551,5 +634,165 @@ mod tests {
         assert_eq!(describe(&KeyInput::Char('A'), Mods::SHIFT), "A");
         assert_eq!(describe(&KeyInput::Char(' '), Mods::NONE), "Space");
         assert_eq!(describe(&KeyInput::F(5), Mods::ALT), "Alt+F5");
+    }
+
+    fn press(key: &WinitKey, text: Option<&'static str>, mods: ModifiersState) -> KeyAction {
+        press_with(key, text, mods, COMPOSING)
+    }
+
+    fn press_with(
+        key: &WinitKey,
+        text: Option<&'static str>,
+        mods: ModifiersState,
+        ime: ImeGate,
+    ) -> KeyAction {
+        let p = KeyPress {
+            logical: key,
+            text,
+            pressed: true,
+            synthetic: false,
+            mods,
+        };
+        decide_key(&p, ime, TermModes::SHOW_CURSOR)
+    }
+
+    const COMPOSING: ImeGate = ImeGate {
+        enabled: true,
+        composing: true,
+    };
+    const IME_IDLE: ImeGate = ImeGate {
+        enabled: true,
+        composing: false,
+    };
+
+    fn editing_keys() -> Vec<(
+        WinitKey,
+        Option<&'static str>,
+        ModifiersState,
+        &'static [u8],
+    )> {
+        vec![
+            (
+                WinitKey::Character(SmolStr::new("a")),
+                Some("a"),
+                ModifiersState::empty(),
+                b"a",
+            ),
+            (
+                WinitKey::Named(NamedKey::Enter),
+                Some("\r"),
+                ModifiersState::empty(),
+                b"\r",
+            ),
+            (
+                WinitKey::Named(NamedKey::Backspace),
+                None,
+                ModifiersState::empty(),
+                b"\x7f",
+            ),
+            (
+                WinitKey::Named(NamedKey::ArrowLeft),
+                None,
+                ModifiersState::empty(),
+                b"\x1b[D",
+            ),
+            (
+                WinitKey::Named(NamedKey::Space),
+                Some(" "),
+                ModifiersState::empty(),
+                b" ",
+            ),
+            (
+                WinitKey::Named(NamedKey::Escape),
+                None,
+                ModifiersState::empty(),
+                b"\x1b",
+            ),
+            (
+                WinitKey::Character(SmolStr::new("c")),
+                None,
+                ModifiersState::CONTROL,
+                b"\x03",
+            ),
+        ]
+    }
+
+    #[test]
+    fn composing_swallows_letters_enter_backspace_and_arrows() {
+        for (key, text, mods, _) in editing_keys() {
+            match press(&key, text, mods) {
+                KeyAction::SwallowedByIme { .. } => {}
+                other => panic!("{key:?} while composing: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn after_composition_the_same_keys_are_forwarded() {
+        for (key, text, mods, bytes) in editing_keys() {
+            let expected = press_with(&key, text, mods, IME_IDLE);
+            match &expected {
+                KeyAction::Forward { bytes: got, .. } => {
+                    assert_eq!(got.as_slice(), bytes, "{key:?}")
+                }
+                other => panic!("{key:?} after composition: {other:?}"),
+            }
+            // An enabled-but-idle IME routes exactly like no IME at all.
+            assert_eq!(
+                press_with(&key, text, mods, ImeGate::default()),
+                expected,
+                "{key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_shortcuts_pass_during_composition() {
+        let k = WinitKey::Character(SmolStr::new("k"));
+        let q = WinitKey::Character(SmolStr::new("q"));
+        for ime in [COMPOSING, IME_IDLE] {
+            assert_eq!(
+                press_with(&k, Some("k"), ModifiersState::SUPER, ime),
+                KeyAction::Shortcut(Shortcut::Unbound("⌘K".into()))
+            );
+            assert_eq!(
+                press_with(&q, Some("q"), ModifiersState::SUPER, ime),
+                KeyAction::Shortcut(Shortcut::Quit)
+            );
+        }
+    }
+
+    #[test]
+    fn releases_synthetic_and_modifier_only_keys_are_ignored() {
+        let a = WinitKey::Character(SmolStr::new("a"));
+        for ime in [COMPOSING, IME_IDLE] {
+            let release = KeyPress {
+                logical: &a,
+                text: None,
+                pressed: false,
+                synthetic: false,
+                mods: ModifiersState::empty(),
+            };
+            assert_eq!(
+                decide_key(&release, ime, TermModes::empty()),
+                KeyAction::Ignore
+            );
+            let synthetic = KeyPress {
+                logical: &a,
+                text: Some("a"),
+                pressed: true,
+                synthetic: true,
+                mods: ModifiersState::empty(),
+            };
+            assert_eq!(
+                decide_key(&synthetic, ime, TermModes::empty()),
+                KeyAction::Ignore
+            );
+            let shift = WinitKey::Named(NamedKey::Shift);
+            assert_eq!(
+                press_with(&shift, None, ModifiersState::SHIFT, ime),
+                KeyAction::Ignore
+            );
+        }
     }
 }

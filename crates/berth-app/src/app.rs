@@ -22,13 +22,13 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, ModifiersState};
+use winit::keyboard::ModifiersState;
 use winit::window::{ImePurpose, Window, WindowId};
 
 use crate::config::Config;
 use crate::fixture::{COLS, ROWS};
 use crate::ime::{ImeOutcome, ImeState};
-use crate::input::{self, Mods};
+use crate::input::{self, ImeGate, KeyAction, KeyPress, Shortcut};
 use crate::renderer::{CellMetrics, FrameInput, GridLayout, GridRenderer, PrepareStats};
 use crate::sidebar::Sidebar;
 use crate::stats::{FrameStats, FrameTiming};
@@ -319,36 +319,52 @@ impl ApplicationHandler for App {
                 is_synthetic,
                 ..
             } => {
-                if is_synthetic || event.state != ElementState::Pressed {
-                    return;
-                }
-                if gfx.mods.super_key() {
-                    // ⌘ chords are GUI shortcuts; ⌘Q / ⌘W quit the spike.
-                    if let Key::Character(c) = &event.logical_key {
-                        if c.eq_ignore_ascii_case("q") || c.eq_ignore_ascii_case("w") {
-                            self.phase = Phase::Exiting;
-                            event_loop.exit();
+                let press = KeyPress {
+                    logical: &event.logical_key,
+                    text: event.text.as_deref(),
+                    pressed: event.state == ElementState::Pressed,
+                    synthetic: is_synthetic,
+                    mods: gfx.mods,
+                };
+                let gate = ImeGate {
+                    enabled: gfx.ime.enabled(),
+                    composing: gfx.ime.preedit().is_some(),
+                };
+                match input::decide_key(&press, gate, gfx.terminal.screen.modes) {
+                    KeyAction::Forward { desc, bytes } => {
+                        if gfx.ime.debug() {
+                            eprintln!("[key] {desc} -> {:?}", input::caret_notation(&bytes));
+                        }
+                        gfx.terminal.input_bytes(&desc, &bytes);
+                        gfx.blink_epoch = Instant::now();
+                        gfx.window.request_redraw();
+                    }
+                    KeyAction::Shortcut(Shortcut::Quit) => {
+                        self.phase = Phase::Exiting;
+                        event_loop.exit();
+                    }
+                    KeyAction::Shortcut(Shortcut::Unbound(chord)) => {
+                        if gfx.ime.debug() {
+                            eprintln!(
+                                "[key] {chord}: GUI shortcut (unbound in M0), not sent to the PTY"
+                            );
                         }
                     }
-                    return;
+                    KeyAction::SwallowedByIme { desc } => {
+                        if gfx.ime.debug() {
+                            let preedit = gfx
+                                .ime
+                                .preedit()
+                                .map(|p| p.text.as_str())
+                                .unwrap_or_default();
+                            eprintln!(
+                                "[key] {desc} swallowed by IME (enabled={}, composing {preedit:?}); not sent to the PTY",
+                                gate.enabled
+                            );
+                        }
+                    }
+                    KeyAction::Ignore => {}
                 }
-                // Option composes characters (Ghostty default `macos-option-as-alt`
-                // unset); the composed text is already in `logical_key`.
-                let mods = Mods::from_winit(gfx.mods, false);
-                let Some(key) = input::key_from_winit(&event.logical_key, event.text.as_deref())
-                else {
-                    return;
-                };
-                let Some(bytes) = input::encode(&key, mods, gfx.terminal.screen.modes) else {
-                    return;
-                };
-                let desc = input::describe(&key, mods);
-                if gfx.ime.debug() {
-                    eprintln!("[key] {desc} -> {:?}", input::caret_notation(&bytes));
-                }
-                gfx.terminal.input_bytes(&desc, &bytes);
-                gfx.blink_epoch = Instant::now();
-                gfx.window.request_redraw();
             }
             WindowEvent::Ime(ime) => {
                 if let ImeOutcome::Commit(text) = gfx.ime.handle(&ime) {
