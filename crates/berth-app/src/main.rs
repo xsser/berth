@@ -11,6 +11,7 @@
 //! (`--bench` data), `theme`, `config`, `stats`.
 
 mod app;
+mod cli;
 mod client;
 mod config;
 mod controller;
@@ -32,7 +33,7 @@ mod theme;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use berth_core::CursorShape;
+use berth_core::{CursorShape, Paths};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
@@ -160,6 +161,9 @@ enum Cmd {
     SetupHooks,
     /// Read-only checks: daemon, socket permissions, hooks, login PATH.
     Doctor,
+    /// Scripted checks against a running daemon.
+    #[command(hide = true, subcommand)]
+    Debug(cli::DebugCmd),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -172,10 +176,12 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         None => app::run(gui_options(cli.gui)),
-        Some(c) => {
-            eprintln!("berth {c:?}: not implemented yet");
-            Ok(())
-        }
+        Some(Cmd::List) => cli::list(&Paths::resolve()),
+        Some(Cmd::Doctor) => cli::doctor(&Paths::resolve()),
+        Some(Cmd::Debug(cmd)) => cli::debug(&Paths::resolve(), cmd),
+        Some(Cmd::SetupHooks) => anyhow::bail!(
+            "berth setup-hooks 属于 M3，尚未实现；没有写入任何文件（~/.claude、~/.codex 均未改动）"
+        ),
     }
 }
 
@@ -252,5 +258,29 @@ mod tests {
         assert!(opts.stats);
         assert!(Cli::try_parse_from(["berth", "--screenshot-delay-ms", "5"]).is_err());
         assert!(Cli::try_parse_from(["berth", "--stats", "--bench", "5"]).is_err());
+        let cli = Cli::try_parse_from(["berth", "debug", "send", "ab12", "ls\\r"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Debug(cli::DebugCmd::Send { ref session, .. })) if session == "ab12"
+        ));
+        let cli = Cli::try_parse_from([
+            "berth",
+            "debug",
+            "new-session",
+            "--dir",
+            "/tmp",
+            "--",
+            "/bin/sh",
+            "-c",
+            "true",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Some(Cmd::Debug(cli::DebugCmd::NewSession { command, size, .. })) => {
+                assert_eq!(command, ["/bin/sh", "-c", "true"]);
+                assert_eq!(size, (120, 40));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
