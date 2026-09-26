@@ -1,7 +1,8 @@
 //! CLI subcommands (integrate.md §5): `berth list`, `berth doctor`, and the
 //! hidden `berth debug …` helpers used for scripted end-to-end checks.
 //!
-//! None of them launches `berthd`. `doctor` only reads: metadata of the
+//! None of them launches `berthd`, except `berth debug restart-daemon`
+//! (stop the running one, start this build's). `doctor` only reads: metadata of the
 //! data directory and socket, the daemon's status, the login shell's PATH,
 //! which hook events of `~/.claude/settings.json` and whether the `notify`
 //! of `~/.codex/config.toml` go through `berth-hook` (judged as `berth
@@ -18,6 +19,7 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use berth_core::{
     AgentInfo, AgentKind, AgentState, ClientRole, Dims, Event, EventEntry, Paths, Request,
     ReviveMode, SessionId, SessionMeta, SessionStatus, StateSource, SubscribeMode, Workspace,
+    PROTOCOL_VERSION,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -98,11 +100,26 @@ pub enum DebugCmd {
     /// What `revive --agent` would run for the session, and in which
     /// directory (nothing is started).
     Resume { session: String },
+    /// What the GUI's 「重启 berthd」 does: stop the running berthd (in its
+    /// own protocol version when that differs), wait until it is gone, and
+    /// start this build's. Its sessions come back dormant / restored.
+    RestartDaemon,
+}
+
+/// How to get past a berthd of another protocol version.
+fn restart_advice() -> String {
+    format!(
+        "在 berth 窗口点「重启 berthd」，或运行 `berth debug restart-daemon`；{}。",
+        client::RESTART_EFFECT
+    )
 }
 
 fn connect(paths: &Paths) -> Result<SyncClient> {
-    SyncClient::connect(paths, ClientRole::Cli).map_err(|e| {
-        anyhow!("无法连接 berthd：{e:#}\n（CLI 不会自动启动 berthd；启动 berth GUI 会拉起它）")
+    SyncClient::connect(paths, ClientRole::Cli).map_err(|e| match client::incompatible(&e) {
+        Some(i) => anyhow!("{i}，版本不一致。{}", restart_advice()),
+        None => {
+            anyhow!("无法连接 berthd：{e:#}\n（CLI 不会自动启动 berthd；启动 berth GUI 会拉起它）")
+        }
     })
 }
 
@@ -711,7 +728,8 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<Check> {
                     Level::Ok,
                     "berthd",
                     format!(
-                        "可达：版本 {}，pid {}，已运行 {}，session {} live / {} 共",
+                        "可达：版本 {}，协议 v{PROTOCOL_VERSION}（与客户端一致），pid {}，\
+                         已运行 {}，session {} live / {} 共",
                         s.version,
                         s.pid,
                         format_elapsed(s.uptime_ms),
@@ -735,7 +753,13 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<Check> {
                 .chain()
                 .filter_map(|c| c.downcast_ref::<std::io::Error>())
                 .any(client::daemon_absent);
-            if absent {
+            if let Some(i) = client::incompatible(&e) {
+                checks.push(Check::new(
+                    Level::Fail,
+                    "berthd",
+                    format!("可达，但{i}，版本不一致。{}", restart_advice()),
+                ));
+            } else if absent {
                 checks.push(Check::new(
                     Level::Info,
                     "berthd",
@@ -981,8 +1005,16 @@ fn dims_of((cols, rows): (u16, u16)) -> Dims {
 }
 
 pub fn debug(paths: &Paths, cmd: DebugCmd) -> Result<()> {
-    let mut c = connect(paths)?;
+    let mut c = match cmd {
+        // Before connecting: the running berthd may speak another protocol.
+        DebugCmd::RestartDaemon => {
+            print!("{}", restart_daemon(paths, &mut client::launch_berthd)?);
+            return Ok(());
+        }
+        _ => connect(paths)?,
+    };
     match cmd {
+        DebugCmd::RestartDaemon => {} // Done above, without a connection.
         DebugCmd::Status => match c.request(Request::DaemonStatus, TIMEOUT)? {
             Event::Status(s) => {
                 println!(
@@ -1188,6 +1220,39 @@ pub fn debug(paths: &Paths, cmd: DebugCmd) -> Result<()> {
     Ok(())
 }
 
+/// `berth debug restart-daemon`: stop the running berthd, whatever its
+/// protocol version, then connect to a new one started by `launch`.
+fn restart_daemon(paths: &Paths, launch: &mut dyn FnMut() -> Result<()>) -> Result<String> {
+    let mut out = String::new();
+    match client::stop_daemon(paths, client::STOP_WAIT)? {
+        Some(stopped) => {
+            let pid = stopped
+                .pid
+                .map(|p| format!("，pid {p}"))
+                .unwrap_or_default();
+            writeln!(
+                out,
+                "已停止 berthd {}（协议 v{}{pid}）",
+                stopped.version, stopped.protocol
+            )?;
+        }
+        None => writeln!(out, "berthd 未在运行")?,
+    }
+    let (stream, launched) = client::connect_or_spawn(paths, launch)?;
+    let c = SyncClient::start(stream, ClientRole::Cli)?;
+    let how = if launched {
+        "已启动"
+    } else {
+        "已连接到另一方启动的"
+    };
+    writeln!(
+        out,
+        "{how} berthd {}（协议 v{PROTOCOL_VERSION}）",
+        c.daemon_version()
+    )?;
+    Ok(out)
+}
+
 /// `berth debug events`: the daemon's list (newest first) as a table,
 /// oldest first.
 pub fn render_events(events: &[EventEntry]) -> String {
@@ -1214,7 +1279,7 @@ pub fn render_events(events: &[EventEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::TestDaemon;
+    use crate::testutil::{fake_old_daemon, refuse_hellos, TestDaemon};
 
     fn meta(title: &str, ws: berth_core::WorkspaceId, status: SessionStatus) -> SessionMeta {
         SessionMeta {
@@ -1586,6 +1651,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{label} missing:\n{text}"))
         };
         assert_eq!(find("berthd").level, Level::Ok, "{text}");
+        let same = format!("协议 v{PROTOCOL_VERSION}（与客户端一致）");
+        assert!(find("berthd").detail.contains(&same), "{text}");
         assert_eq!(find("socket").level, Level::Ok, "{text}");
         assert_eq!(find("claude").level, Level::Warn);
         assert_eq!(find("codex").level, Level::Ok);
@@ -1593,6 +1660,95 @@ mod tests {
         assert!(find("Codex notify").detail.contains("不存在"));
         assert_eq!(find("berthd 可执行文件").level, Level::Fail);
         assert!(text.contains("shell 集成"));
+    }
+
+    #[test]
+    fn a_daemon_of_another_protocol_is_named_with_both_versions_and_the_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let old = PROTOCOL_VERSION - 1;
+        let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        let daemon = std::thread::spawn(move || refuse_hellos(&listener, old, 3));
+        let want = format!("berthd 协议 v{old}，本客户端协议 v{PROTOCOL_VERSION}，版本不一致");
+
+        let err = format!("{:#}", connect(&paths).err().expect("refused"));
+        assert!(err.contains(&want), "{err}");
+        assert!(err.contains("berth debug restart-daemon"), "{err}");
+        assert!(err.contains(client::RESTART_EFFECT), "{err}");
+        assert_eq!(format!("{:#}", list(&paths).unwrap_err()), err);
+
+        let login = LoginEnv {
+            shell: PathBuf::from("/bin/zsh"),
+            path: Some("/usr/bin:/bin".into()),
+            claude: None,
+            codex: None,
+            error: None,
+        };
+        let checks = doctor_checks(&DoctorInput {
+            paths: &paths,
+            home: None,
+            uid: current_uid(),
+            login: &login,
+            berthd: None,
+        });
+        let check = checks.iter().find(|c| c.label == "berthd").unwrap();
+        assert_eq!(check.level, Level::Fail);
+        assert!(check.detail.contains(&want), "{}", check.detail);
+        assert!(check.detail.contains("「重启 berthd」"), "{}", check.detail);
+        assert!(
+            check.detail.contains(client::RESTART_EFFECT),
+            "{}",
+            check.detail
+        );
+
+        for hello in daemon.join().unwrap() {
+            assert!(
+                matches!(hello, Request::Hello { role: ClientRole::Cli, protocol, .. } if protocol == PROTOCOL_VERSION),
+                "{hello:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_daemon_stops_an_old_berthd_before_starting_this_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let old = PROTOCOL_VERSION - 1;
+        let fake = fake_old_daemon(&paths, old);
+        let mut started = None;
+        let mut launch = || {
+            assert!(
+                !paths.socket.exists(),
+                "launched while the old berthd listened"
+            );
+            started = Some(TestDaemon::start_at(paths.clone()));
+            Ok(())
+        };
+        let out = restart_daemon(&paths, &mut launch).unwrap();
+        let first = format!("已停止 berthd 0.0.1（协议 v{old}）\n");
+        assert!(out.starts_with(&first), "{out}");
+        let restarted = format!(
+            "已启动 berthd {}（协议 v{PROTOCOL_VERSION}）\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(out.ends_with(&restarted), "{out}");
+        assert_eq!(fake.join().unwrap().last(), Some(&Request::Shutdown));
+        let mut c = connect(&paths).expect("this build's berthd answers");
+        assert!(matches!(
+            c.request(Request::DaemonStatus, TIMEOUT).unwrap(),
+            Event::Status(_)
+        ));
+        drop(c);
+
+        // Nothing running: only the start.
+        drop(started.take());
+        let mut launch = || {
+            started = Some(TestDaemon::start_at(paths.clone()));
+            Ok(())
+        };
+        let out = restart_daemon(&paths, &mut launch).unwrap();
+        assert!(out.starts_with("berthd 未在运行\n已启动 berthd "), "{out}");
+        assert!(started.is_some());
     }
 
     #[test]

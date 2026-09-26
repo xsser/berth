@@ -36,6 +36,7 @@ crossbeam-channel.workspace = true
 png.workspace = true
 rustc-hash.workspace = true
 libc.workspace = true
+postcard.workspace = true
 # `berth setup-hooks`: format-preserving edit of ~/.codex/config.toml and the
 # preview diff.
 toml_edit = "0.25"
