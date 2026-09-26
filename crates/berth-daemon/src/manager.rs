@@ -847,8 +847,22 @@ impl Manager {
             let reg = self.reg.lock();
             hooks::resolve_target(&envelope, reg.sessions.values().map(|e| &e.meta))
         };
-        let Some(sid) = target else {
-            return;
+        let sid = match target {
+            hooks::Target::Live(sid) => sid,
+            hooks::Target::Late(sid) => {
+                if let Some(meta) = self.meta(sid) {
+                    let detail = hooks::event_name(&envelope.signal);
+                    self.record(
+                        sid,
+                        now_ms(),
+                        "hook:late".into(),
+                        &meta.agent.state,
+                        Some(detail),
+                    );
+                }
+                return;
+            }
+            hooks::Target::Unmatched => return,
         };
         match envelope.signal {
             AgentSignal::Claude(hook) => {
@@ -1194,6 +1208,56 @@ mod tests {
         for sid in &sids {
             assert!(mgr.existing_tx(*sid).unwrap().is_none(), "actor handed off");
         }
+    }
+
+    /// Review #19: a hook naming a session whose PTY has exited is dropped
+    /// (not re-routed) and noted as `hook:late`; the state stays Exited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_hook_for_an_exited_session_is_recorded_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        paths.ensure_dirs().unwrap();
+        let store = Store::open(&paths).unwrap();
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        let mgr = Manager::start(paths, Config::default(), store, stop_tx).unwrap();
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let dims = Dims { cols: 80, rows: 24 };
+        let exits = vec!["/bin/sh".into(), "-c".into(), "exit 0".into()];
+        let sid = mgr
+            .create_session(ws.id, None, Some(exits), None, dims)
+            .await
+            .unwrap()
+            .id;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while mgr.meta(sid).unwrap().is_live() {
+            assert!(std::time::Instant::now() < deadline, "session did not exit");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let before = mgr.meta(sid).unwrap().agent;
+        assert!(matches!(before.state, AgentState::Exited { .. }));
+        mgr.handle_hook(HookEnvelope {
+            berth_session: Some(sid),
+            pid: 1,
+            sent_at_ms: 0,
+            signal: AgentSignal::Claude(berth_core::ClaudeHook {
+                session_id: "late-1".into(),
+                cwd: None,
+                transcript_path: None,
+                permission_mode: None,
+                event: ClaudeHookEvent::PreToolUse {
+                    tool_name: "Bash".into(),
+                },
+            }),
+        });
+        assert_eq!(mgr.meta(sid).unwrap().agent, before);
+        let events = mgr.store.list_events(sid, 10).unwrap();
+        assert_eq!(
+            (events[0].kind.as_str(), events[0].detail.as_deref()),
+            ("hook:late", Some("PreToolUse"))
+        );
+        mgr.shutdown().await;
     }
 
     #[test]

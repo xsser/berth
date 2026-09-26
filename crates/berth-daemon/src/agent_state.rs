@@ -504,6 +504,22 @@ impl AgentMachine {
     }
 }
 
+/// Hook event name as Claude Code reports it (`hook_event_name`).
+pub fn claude_event_name(event: &ClaudeHookEvent) -> &str {
+    match event {
+        ClaudeHookEvent::SessionStart { .. } => "SessionStart",
+        ClaudeHookEvent::UserPromptSubmit => "UserPromptSubmit",
+        ClaudeHookEvent::PreToolUse { .. } => "PreToolUse",
+        ClaudeHookEvent::PostToolUse { .. } => "PostToolUse",
+        ClaudeHookEvent::Notification { .. } => "Notification",
+        ClaudeHookEvent::Stop { .. } => "Stop",
+        ClaudeHookEvent::SubagentStop => "SubagentStop",
+        ClaudeHookEvent::PreCompact { .. } => "PreCompact",
+        ClaudeHookEvent::SessionEnd { .. } => "SessionEnd",
+        ClaudeHookEvent::Other { hook_event_name } => hook_event_name,
+    }
+}
+
 /// Agent session ids (Claude `session_id`, Codex `thread-id`) are UUID-like:
 /// `[A-Za-z0-9._-]{1,128}`. Anything else is refused.
 pub fn is_valid_external_id(id: &str) -> bool {
