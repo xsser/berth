@@ -125,7 +125,7 @@ pub fn run(opts: GuiOptions) -> Result<()> {
         .run_app(&mut app)
         .context("running the event loop")?;
     if let Some(live) = app.live_stats.take() {
-        live.print_final();
+        live.print_final(&traffic_label(&mut app.ctl));
     }
     match app.error.take() {
         Some(e) => Err(e),
@@ -188,30 +188,46 @@ impl LiveStats {
         }
     }
 
-    fn record(&mut self, start: Instant, t: FrameTiming, label: impl FnOnce() -> String) {
+    /// Record a frame; true when the current window is complete.
+    fn record(&mut self, start: Instant, t: FrameTiming) -> bool {
         self.window.record(start, t);
         self.total_frames += 1;
-        if self.started.elapsed() >= STATS_WINDOW {
-            self.windows += 1;
-            let title = format!("live window {} ({})", self.windows, label());
-            eprint!("{}", self.window.report(&title, TARGET_MS));
-            self.window = FrameStats::default();
-            self.started = Instant::now();
-        }
+        self.started.elapsed() >= STATS_WINDOW
     }
 
-    fn print_final(&self) {
+    /// Print the current window and start the next one.
+    fn report(&mut self, traffic: &str) {
+        self.windows += 1;
+        let title = format!("live window {} ({traffic})", self.windows);
+        eprint!("{}", self.window.report(&title, TARGET_MS));
+        self.window = FrameStats::default();
+        self.started = Instant::now();
+    }
+
+    fn print_final(&self, traffic: &str) {
         if self.window.frames() > 0 {
-            eprint!(
-                "{}",
-                self.window.report("live, last partial window", TARGET_MS)
-            );
+            let title = format!("live, last partial window ({traffic})");
+            eprint!("{}", self.window.report(&title, TARGET_MS));
         }
         eprintln!(
             "[stats] {} frames rendered in total ({} full windows)",
             self.total_frames, self.windows
         );
     }
+}
+
+/// What the daemon sent during a stats window.
+fn traffic_label(ctl: &mut Controller) -> String {
+    let c = ctl.take_counters();
+    let dims = ctl.view().map(|v| v.dims()).unwrap_or_default();
+    format!(
+        "focused {}×{}: {} screen updates applied; sidebar: {} preview updates from {} sessions",
+        dims.cols,
+        dims.rows,
+        c.screens,
+        c.previews,
+        c.preview_sessions.len()
+    )
 }
 
 /// Requests while no connection exists fail with a visible error.
@@ -874,16 +890,9 @@ impl App {
             .is_some_and(|v| v.has_screen() && v.cursor_blinking());
         self.apply_ui(actions);
         if let Some(live) = self.live_stats.as_mut() {
-            let ctl = &self.ctl;
-            live.record(start, timing, || {
-                let dims = ctl.view().map(|v| v.dims()).unwrap_or_default();
-                format!(
-                    "focused {}×{}, {} sessions listed",
-                    dims.cols,
-                    dims.rows,
-                    ctl.jump_order().len()
-                )
-            });
+            if live.record(start, timing) {
+                live.report(&traffic_label(&mut self.ctl));
+            }
         }
         match &mut self.mode {
             Mode::Bench { current, .. } => {

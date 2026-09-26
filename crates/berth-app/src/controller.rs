@@ -90,6 +90,16 @@ pub enum Confirm {
     Delete { session: SessionId, title: String },
 }
 
+/// Traffic seen since the last [`Controller::take_counters`] (`--stats`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Counters {
+    /// `Screen` updates applied to the focused view.
+    pub screens: u64,
+    /// Sidebar `Preview` updates, and how many sessions they came from.
+    pub previews: u64,
+    pub preview_sessions: HashSet<SessionId>,
+}
+
 /// Something only the app can do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
@@ -146,6 +156,7 @@ pub struct Controller {
     auto_created: bool,
     /// Command for new sessions (`None`: the daemon's login shell).
     pub new_session_command: Option<Vec<String>>,
+    counters: Counters,
 }
 
 impl Controller {
@@ -176,6 +187,7 @@ impl Controller {
             auto_session: true,
             auto_created: false,
             new_session_command: None,
+            counters: Counters::default(),
         }
     }
 
@@ -289,6 +301,11 @@ impl Controller {
     }
 
     /// The text of the current selection (⌘C).
+    /// Counters since the previous call.
+    pub fn take_counters(&mut self) -> Counters {
+        std::mem::take(&mut self.counters)
+    }
+
     pub fn copy_text(&self) -> Option<String> {
         let view = self.view.as_ref()?;
         let span = view.selection_span()?;
@@ -478,6 +495,8 @@ impl Controller {
                 lines,
                 styles,
             } => {
+                self.counters.previews += 1;
+                self.counters.preview_sessions.insert(session);
                 let p = self.previews.entry(session).or_default();
                 p.lines = lines;
                 p.styles = StyleTable::new();
@@ -719,7 +738,9 @@ impl Controller {
         } else if self.attach_id.is_some() {
             return; // waiting for the Attach answer
         }
-        view.apply_screen(u, baseline);
+        if view.apply_screen(u, baseline) {
+            self.counters.screens += 1;
+        }
     }
 
     // -- focus, visibility, geometry ------------------------------------
@@ -1324,6 +1345,40 @@ mod tests {
             .find(|(_, r)| matches!(r, Request::Attach { session, .. } if *session == sid))
             .map(|(id, _)| *id)
             .expect("Attach sent")
+    }
+
+    #[test]
+    fn counters_report_applied_screens_and_preview_traffic() {
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        let w = ws(0);
+        let a = session(&w, 0, true);
+        let b = session(&w, 1, true);
+        let sent = listed(&mut c, &mut out, vec![w], vec![a.clone(), b.clone()]);
+        let now = Instant::now();
+        c.handle(
+            &mut out,
+            reply(attach_id(&sent, a.id), Event::Screen(screen(a.id, 5, "x"))),
+            now,
+        );
+        c.handle(&mut out, push(Event::Screen(screen(a.id, 6, "y"))), now);
+        // Out of order: dropped, not counted.
+        c.handle(&mut out, push(Event::Screen(screen(a.id, 4, "z"))), now);
+        for _ in 0..3 {
+            c.handle(
+                &mut out,
+                push(Event::Preview {
+                    session: b.id,
+                    lines: vec![],
+                    styles: vec![],
+                }),
+                now,
+            );
+        }
+        let got = c.take_counters();
+        assert_eq!((got.screens, got.previews), (2, 3));
+        assert_eq!(got.preview_sessions, HashSet::from([b.id]));
+        assert_eq!(c.take_counters(), Counters::default(), "reset after taking");
     }
 
     #[test]

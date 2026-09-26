@@ -186,6 +186,22 @@ fn tilde(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// Text format of a preview run: the cell's colors, with non-default
+/// backgrounds drawn behind the text (so reverse video, e.g. vim's status
+/// line, stays readable on the dark card).
+fn preview_format(theme: &Theme, style: &berth_core::Style) -> TextFormat {
+    let colors = theme.resolve(style, false);
+    let mut format = TextFormat {
+        font_id: mono(11.0),
+        color: c32(colors.fg).gamma_multiply(colors.fg_alpha),
+        ..Default::default()
+    };
+    if !colors.bg_is_default {
+        format.background = c32(colors.bg);
+    }
+    format
+}
+
 /// A click or a visibility report from the UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiAction {
@@ -625,7 +641,7 @@ impl Sidebar {
         }
     }
 
-    /// Preview line with the session's colors (backgrounds omitted).
+    /// Preview line with the session's colors.
     fn preview_job(&self, line: &LineSnapshot, styles: &StyleTable, max_w: f32) -> LayoutJob {
         let mut job = LayoutJob::default();
         let trimmed_end = line.text().trim_end().chars().count();
@@ -637,16 +653,10 @@ impl Sidebar {
             let n = run.text.chars().count().min(trimmed_end - taken);
             let text: String = run.text.chars().take(n).collect();
             taken += n;
-            let colors = self.theme.resolve(&styles.get(run.style), false);
-            let color = c32(colors.fg).gamma_multiply(colors.fg_alpha);
             job.append(
                 &text,
                 0.0,
-                TextFormat {
-                    font_id: mono(11.0),
-                    color,
-                    ..Default::default()
-                },
+                preview_format(&self.theme, &styles.get(run.style)),
             );
         }
         job.wrap = TextWrapping::truncate_at_width(max_w.max(1.0));
@@ -1360,6 +1370,32 @@ impl Sidebar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reverse_video_previews_keep_a_readable_background() {
+        use berth_core::{CellFlags, Color, Style};
+        let theme = Theme::ghostty_default();
+        let plain = preview_format(&theme, &Style::default());
+        assert_eq!(plain.background, Color32::TRANSPARENT);
+        assert_eq!(plain.color, c32(theme.foreground));
+        let inverse = preview_format(
+            &theme,
+            &Style {
+                flags: CellFlags::INVERSE,
+                ..Style::default()
+            },
+        );
+        assert_eq!(inverse.background, c32(theme.foreground));
+        assert_eq!(inverse.color, c32(theme.background));
+        let red_bg = preview_format(
+            &theme,
+            &Style {
+                bg: Color::Indexed(1),
+                ..Style::default()
+            },
+        );
+        assert_eq!(red_bg.background, c32(theme.palette[1]));
+    }
 
     #[test]
     fn elapsed_labels() {
