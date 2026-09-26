@@ -11,6 +11,8 @@ mod app;
 #[allow(dead_code)] // wired into the app in the following commits
 mod client;
 mod config;
+#[allow(dead_code)]
+mod controller;
 mod fixture;
 mod ime;
 mod input;
