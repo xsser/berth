@@ -494,7 +494,10 @@ mod tests {
                 reply_to: Some(1),
                 event,
             };
-            assert_eq!(postcard::to_stdvec(&msg).unwrap(), [&[1, 1], bytes].concat());
+            assert_eq!(
+                postcard::to_stdvec(&msg).unwrap(),
+                [&[1, 1], bytes].concat()
+            );
         }
     }
 
