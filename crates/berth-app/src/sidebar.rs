@@ -508,6 +508,21 @@ fn mono(size: f32) -> FontId {
 
 const LINE_H: f32 = 14.0;
 
+/// [`egui::Ui::put`] for a widget inside an already allocated card. `put`
+/// also moves the list's cursor to just below the widget (egui assigns
+/// `cursor.min.y` rather than taking the max), so the next card would start
+/// there and cover whatever the card draws below it, like the resume line.
+fn put_inside(ui: &mut egui::Ui, r: Rect, widget: impl egui::Widget) -> egui::Response {
+    ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(r)
+            .layout(egui::Layout::centered_and_justified(
+                egui::Direction::TopDown,
+            )),
+    )
+    .add(widget)
+}
+
 impl Sidebar {
     pub fn new(
         window: &Window,
@@ -1197,7 +1212,7 @@ impl Sidebar {
                 let r = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, 20.0));
                 x += w + 6.0;
                 let b = egui::Button::new(egui::RichText::new(label).size(11.0));
-                if ui.put(r, b).on_hover_text(tip).clicked() {
+                if put_inside(ui, r, b).on_hover_text(tip).clicked() {
                     actions.push(UiAction::Revive(m.id, mode));
                 }
             };
@@ -1638,6 +1653,27 @@ mod tests {
             "shell 集成（OSC 133）"
         );
         assert_eq!(clean("a\u{1b}[2Jb"), "a?[2Jb");
+    }
+
+    #[test]
+    fn buttons_inside_a_card_leave_the_next_card_where_it_was() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let (card, _) = ui.allocate_exact_size(Vec2::new(200.0, 100.0), Sense::hover());
+            let next = ui.cursor().top();
+            assert!(next >= card.bottom());
+            let r = Rect::from_min_size(card.min + Vec2::new(10.0, 40.0), Vec2::new(60.0, 20.0));
+            let revive = put_inside(ui, r, egui::Button::new("Revive"));
+            let resume = put_inside(
+                ui,
+                r.translate(Vec2::new(70.0, 0.0)),
+                egui::Button::new("Resume"),
+            );
+            assert_ne!(revive.id, resume.id);
+            assert_eq!(ui.cursor().top(), next, "the next card would overlap");
+        });
+        // No renderer here: the font atlas upload is dropped on purpose.
+        out.textures_delta.clear();
     }
 
     #[test]
