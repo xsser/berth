@@ -2,14 +2,22 @@
 //!
 //! Inputs are `Signal`s from three tiers: hooks (Claude Code / Codex), shell
 //! integration (OSC 133) and heuristics (foreground process, output activity,
-//! silence). Rules:
-//! - a hook signal within the last 30 s wins over heuristics;
-//! - heuristics never leave `WaitingPermission` (nor the other "sticky"
-//!   states `Done`, `WaitingInput`, `Error`, `Exited`): activity only moves
-//!   `Idle → Thinking`, silence only moves busy states `→ Idle`;
-//! - only the nine core Claude hook events (and `Notification` types with a
-//!   clear meaning) move the state; the other hook events (`Other`) are
-//!   recorded but never change it;
+//! silence). Rules (see also the `StateSource` contract in berth-core):
+//! - a hook-sourced state changes only through hooks, OSC 133, PTY exit,
+//!   user input and an agent → non-agent foreground switch; the output
+//!   heuristics (activity, silence) never touch it, whatever its age;
+//! - the output heuristics never leave the "sticky" states either
+//!   (`WaitingPermission`, `WaitingInput`, `Done`, `Error`, `Exited`):
+//!   activity only moves `Idle → Thinking`, silence only moves busy states
+//!   `→ Idle`;
+//! - a foreground agent name sets the kind unless a hook spoke within 30 s;
+//! - OSC 133 marks while an agent owns the session (the shell is back at
+//!   its prompt), and a foreground switch from an agent name to another
+//!   name, are "agent left": kind back to `Shell`, ids and transcript kept;
+//! - the nine core Claude hook events, `Notification` types with a clear
+//!   meaning and `PermissionRequest` / `PermissionDenied` /
+//!   `PostToolUseFailure` / `StopFailure` move the state; the other hook
+//!   events (`Other`) are recorded but never change it;
 //! - every applied signal is reported as `Applied` so the manager can write
 //!   an `EventRecord` (kind + short detail, never prompt text).
 
@@ -19,7 +27,8 @@ use berth_core::{
 };
 use berth_vt::{OscEvent, PromptMark};
 
-/// How long a hook keeps heuristics from changing the state.
+/// How long a hook keeps the foreground-process heuristic from changing the
+/// agent kind.
 pub const HOOK_PRIORITY_MS: i64 = 30_000;
 /// Output silence after which a busy agent is considered idle.
 pub const SILENCE_IDLE_SECS: u64 = 3;
@@ -76,6 +85,8 @@ pub struct AgentMachine {
     info: AgentInfo,
     last_hook_ms: Option<i64>,
     subagent_stops: u32,
+    /// Previous `ForegroundProcess` name, to recognise an agent leaving.
+    last_fg: Option<String>,
 }
 
 impl AgentMachine {
@@ -84,6 +95,7 @@ impl AgentMachine {
             info,
             last_hook_ms: None,
             subagent_stops: 0,
+            last_fg: None,
         }
     }
 
@@ -96,6 +108,7 @@ impl AgentMachine {
         self.info = info;
         self.last_hook_ms = None;
         self.subagent_stops = 0;
+        self.last_fg = None;
     }
 
     pub fn subagent_stops(&self) -> u32 {
@@ -124,6 +137,31 @@ impl AgentMachine {
         self.info.source = source;
         self.info.confidence = confidence;
         changed || meta_changed
+    }
+
+    /// The agent process is gone and the shell is back: kind `Shell` and
+    /// `state`; external id and transcript stay (for a later resume).
+    /// Returns whether the state changed.
+    fn agent_left(
+        &mut self,
+        state: AgentState,
+        source: StateSource,
+        confidence: f32,
+        now_ms: i64,
+    ) -> bool {
+        self.info.kind = AgentKind::Shell;
+        let before = self.info.state.clone();
+        self.enter(state, source, confidence, now_ms);
+        before != self.info.state
+    }
+
+    /// Tool of the running (or permission-blocked) tool call, if known.
+    fn current_tool(&self) -> Option<String> {
+        match &self.info.state {
+            AgentState::ToolRunning { tool } => Some(tool.clone()),
+            AgentState::WaitingPermission { tool } => tool.clone(),
+            _ => None,
+        }
     }
 
     fn set_kind(&mut self, kind: AgentKind) -> bool {
@@ -162,23 +200,10 @@ impl AgentMachine {
             Signal::Hook(hook) => Some(self.apply_claude(hook, now_ms)),
             Signal::Codex(n) => Some(self.apply_codex(n, now_ms)),
             Signal::Osc(ev) => self.apply_osc(ev, now_ms),
-            Signal::ForegroundProcess(name) => {
-                let kind = agent_kind_for_process(name)?;
-                if self.hook_recent(now_ms) || !self.set_kind(kind) {
-                    return None;
-                }
-                if self.info.source == StateSource::Heuristic {
-                    self.info.confidence = HEURISTIC_CONFIDENCE;
-                }
-                Some(Applied {
-                    kind: "heuristic:foreground".into(),
-                    detail: Some(name.clone()),
-                    state_changed: false,
-                })
-            }
+            Signal::ForegroundProcess(name) => self.apply_foreground(name, now_ms),
             Signal::OutputActivity => {
                 if !self.info.kind.is_agent()
-                    || self.hook_recent(now_ms)
+                    || self.info.source == StateSource::Hook
                     || self.info.state != AgentState::Idle
                 {
                     return None;
@@ -200,7 +225,7 @@ impl AgentMachine {
                 cursor_at_line_start,
             } => {
                 if !self.info.kind.is_agent()
-                    || self.hook_recent(now_ms)
+                    || self.info.source == StateSource::Hook
                     || *secs < SILENCE_IDLE_SECS
                     || !cursor_at_line_start
                     || !self.info.state.is_busy()
@@ -247,6 +272,48 @@ impl AgentMachine {
         }
     }
 
+    /// An agent name sets the kind (unless a hook spoke within
+    /// `HOOK_PRIORITY_MS`); a switch from an agent name to any other name
+    /// means the agent left — also out of a hook-sourced state, but not out
+    /// of `Exited`.
+    fn apply_foreground(&mut self, name: &str, now_ms: i64) -> Option<Applied> {
+        let previous = self.last_fg.replace(name.to_owned());
+        if let Some(kind) = agent_kind_for_process(name) {
+            if self.hook_recent(now_ms) || !self.set_kind(kind) {
+                return None;
+            }
+            if self.info.source == StateSource::Heuristic {
+                self.info.confidence = HEURISTIC_CONFIDENCE;
+            }
+            return Some(Applied {
+                kind: "heuristic:foreground".into(),
+                detail: Some(name.to_owned()),
+                state_changed: false,
+            });
+        }
+        let agent_was_foreground = previous
+            .as_deref()
+            .and_then(agent_kind_for_process)
+            .is_some();
+        if !agent_was_foreground
+            || !self.info.kind.is_agent()
+            || matches!(self.info.state, AgentState::Exited { .. })
+        {
+            return None;
+        }
+        let state_changed = self.agent_left(
+            AgentState::Idle,
+            StateSource::Heuristic,
+            HEURISTIC_CONFIDENCE,
+            now_ms,
+        );
+        Some(Applied {
+            kind: "heuristic:agent_left".into(),
+            detail: Some(name.to_owned()),
+            state_changed,
+        })
+    }
+
     fn apply_claude(&mut self, hook: &ClaudeHook, now_ms: i64) -> Applied {
         self.last_hook_ms = Some(now_ms);
         self.set_kind(AgentKind::Claude);
@@ -278,11 +345,12 @@ impl AgentMachine {
                 message,
             } => {
                 let next = match classify_notification(notification_type.as_deref(), message) {
-                    // The notification does not name the tool, and with
-                    // parallel tool calls the last PreToolUse may be another.
-                    NotificationClass::Permission => {
-                        Some(AgentState::WaitingPermission { tool: None })
-                    }
+                    // The notification does not name the tool: keep the one
+                    // `PermissionRequest` / `PreToolUse` named (with parallel
+                    // tool calls that may be another call's tool).
+                    NotificationClass::Permission => Some(AgentState::WaitingPermission {
+                        tool: self.current_tool(),
+                    }),
                     NotificationClass::Input => Some(AgentState::WaitingInput),
                     NotificationClass::Working => Some(AgentState::Thinking),
                     NotificationClass::Completed => Some(AgentState::Done),
@@ -303,10 +371,37 @@ impl AgentMachine {
                 reason.clone(),
                 Some(AgentState::Exited { code: None }),
             ),
-            // The events beyond the nine core ones (PermissionRequest,
-            // StopFailure, PostCompact, ...) are recorded but never move the
-            // state.
-            ClaudeHookEvent::Other { hook_event_name } => (hook_event_name.as_str(), None, None),
+            ClaudeHookEvent::Other { hook_event_name } => {
+                let name = hook_event_name.as_str();
+                match name {
+                    // The dialog is up now (the `permission_prompt`
+                    // notification only follows after ~6 s without input).
+                    "PermissionRequest" => {
+                        let tool = self.current_tool();
+                        (
+                            name,
+                            tool.clone(),
+                            Some(AgentState::WaitingPermission { tool }),
+                        )
+                    }
+                    // The tool call is over (refused / failed); the model
+                    // carries on.
+                    "PermissionDenied" | "PostToolUseFailure" => {
+                        (name, None, Some(AgentState::Thinking))
+                    }
+                    // The turn ended on an API error.
+                    "StopFailure" => (
+                        name,
+                        None,
+                        Some(AgentState::Error {
+                            message: "turn failed (StopFailure)".into(),
+                        }),
+                    ),
+                    // Everything else (PostCompact, CwdChanged, ...) is
+                    // recorded but never moves the state.
+                    _ => (name, None, None),
+                }
+            }
         };
         let state_changed = match next {
             Some(state) => {
@@ -355,6 +450,22 @@ impl AgentMachine {
             ),
             PromptMark::CommandStart => return None,
         };
+        // Prompt marks come from the shell, so an agent that still owns the
+        // session has left: that ends even a hook-sourced (or SessionEnd)
+        // state, as an "agent left" rather than a plain flip.
+        if self.info.kind.is_agent() {
+            let state_changed =
+                self.agent_left(state, StateSource::ShellIntegration, OSC_CONFIDENCE, now_ms);
+            let mark = &kind["osc:".len()..];
+            return Some(Applied {
+                kind: "osc:agent_left".into(),
+                detail: Some(match detail {
+                    Some(code) => format!("{mark}:{code}"),
+                    None => mark.to_owned(),
+                }),
+                state_changed,
+            });
+        }
         let before = self.info.state.clone();
         self.enter(state, StateSource::ShellIntegration, OSC_CONFIDENCE, now_ms);
         let changed = before != self.info.state;

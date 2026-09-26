@@ -121,8 +121,13 @@ fn row_notification_permission_and_idle_prompt() {
     m.apply(&pre("Bash"), T0);
     let a = m.apply(&notification("permission_prompt"), T0 + 1).unwrap();
     assert_eq!(a.detail.as_deref(), Some("permission_prompt"));
-    // The notification does not name the tool.
-    assert_eq!(m.info().state, AgentState::WaitingPermission { tool: None });
+    // The notification does not name the tool; the running call's is used.
+    assert_eq!(
+        m.info().state,
+        AgentState::WaitingPermission {
+            tool: Some("Bash".into())
+        }
+    );
     m.apply(&notification("idle_prompt"), T0 + 2);
     assert_eq!(m.info().state, AgentState::WaitingInput);
     // Informational notifications do not move the state.
@@ -362,8 +367,10 @@ fn row_pty_eof_exited() {
     assert_eq!(m.apply(&Signal::Exited(Some(0)), T0 + 2), None);
 }
 
+/// Review #8: activity and silence never override a hook-sourced state, no
+/// matter how old the hook is; only the kind detection keeps the 30 s window.
 #[test]
-fn hook_within_30s_beats_heuristics() {
+fn output_heuristics_never_override_hook_states() {
     let mut m = heuristic_claude();
     m.apply(
         &hook(ClaudeHookEvent::Stop {
@@ -372,35 +379,40 @@ fn hook_within_30s_beats_heuristics() {
         T0,
     );
     m.apply(&Signal::UserInput, T0 + 1);
-    assert_eq!(m.info().state, AgentState::Idle);
-    // Idle + output activity would normally be Thinking, but a hook is fresh.
-    assert_eq!(m.apply(&Signal::OutputActivity, T0 + 29_999), None);
     assert_eq!(
-        m.apply(&Signal::ForegroundProcess("codex".into()), T0 + 10),
+        (m.info().state.clone(), m.info().source),
+        (AgentState::Idle, StateSource::Hook)
+    );
+    let hour = 3_600_000;
+    assert_eq!(m.apply(&Signal::OutputActivity, T0 + 2), None);
+    assert_eq!(m.apply(&Signal::OutputActivity, T0 + hour), None);
+    m.apply(&hook(ClaudeHookEvent::UserPromptSubmit), T0 + hour);
+    let silence = Signal::Silence {
+        secs: 60,
+        cursor_at_line_start: true,
+    };
+    assert_eq!(m.apply(&silence, T0 + hour + 60_000), None);
+    assert_eq!(m.apply(&silence, T0 + 9 * hour), None);
+    assert_eq!(m.info().state, AgentState::Thinking);
+    // Kind detection still yields to a hook for 30 s.
+    assert_eq!(
+        m.apply(&Signal::ForegroundProcess("codex".into()), T0 + hour + 10),
         None
     );
-    m.apply(&hook(ClaudeHookEvent::UserPromptSubmit), T0 + 20_000);
+    assert_eq!(m.info().kind, AgentKind::Claude);
+
+    // Shell-integration and heuristic states are fair game.
+    let mut m = machine();
+    m.apply(&Signal::Osc(OscEvent::Prompt(PromptMark::OutputStart)), T0);
+    m.apply(&Signal::ForegroundProcess("claude".into()), T0 + 1);
     assert_eq!(
-        m.apply(
-            &Signal::Silence {
-                secs: 9,
-                cursor_at_line_start: true
-            },
-            T0 + 49_999
-        ),
-        None
+        (m.info().state.clone(), m.info().source),
+        (AgentState::Thinking, StateSource::ShellIntegration)
     );
-    // After the window heuristics apply again.
-    assert!(m
-        .apply(
-            &Signal::Silence {
-                secs: 9,
-                cursor_at_line_start: true
-            },
-            T0 + 50_000
-        )
-        .is_some());
+    assert!(m.apply(&silence, T0 + 2).is_some());
     assert_eq!(m.info().state, AgentState::Idle);
+    assert!(m.apply(&Signal::OutputActivity, T0 + 3).is_some());
+    assert_eq!(m.info().state, AgentState::Thinking);
 }
 
 #[test]
@@ -424,7 +436,12 @@ fn heuristics_never_override_waiting_permission() {
         m.apply(&Signal::ForegroundProcess("claude".into()), later),
         None
     );
-    assert_eq!(m.info().state, AgentState::WaitingPermission { tool: None });
+    assert_eq!(
+        m.info().state,
+        AgentState::WaitingPermission {
+            tool: Some("Edit".into())
+        }
+    );
     // Only a real signal leaves it.
     m.apply(
         &hook(ClaudeHookEvent::PostToolUse {
@@ -435,6 +452,45 @@ fn heuristics_never_override_waiting_permission() {
     assert_eq!(m.info().state, AgentState::Thinking);
 }
 
+fn other(name: &str) -> Signal {
+    hook(ClaudeHookEvent::Other {
+        hook_event_name: name.into(),
+    })
+}
+
+/// Review #10: the permission / failure events beyond the nine core ones.
+#[test]
+fn permission_and_failure_events_move_the_state() {
+    let mut m = machine();
+    m.apply(&pre("Bash"), T0);
+    let a = m.apply(&other("PermissionRequest"), T0 + 1).unwrap();
+    assert_eq!(
+        (a.kind.as_str(), a.detail.as_deref(), a.state_changed),
+        ("hook:PermissionRequest", Some("Bash"), true)
+    );
+    let waiting = AgentState::WaitingPermission {
+        tool: Some("Bash".into()),
+    };
+    assert_eq!(m.info().state, waiting);
+    // The permission_prompt notification ~6 s later keeps the tool.
+    m.apply(&notification("permission_prompt"), T0 + 6_000);
+    assert_eq!(m.info().state, waiting);
+    m.apply(&other("PermissionDenied"), T0 + 7_000);
+    assert_eq!(m.info().state, AgentState::Thinking);
+
+    m.apply(&pre("Edit"), T0 + 8_000);
+    m.apply(&other("PostToolUseFailure"), T0 + 8_001);
+    assert_eq!(m.info().state, AgentState::Thinking);
+    // No tool running: the dialog is for an unknown tool.
+    m.apply(&other("PermissionRequest"), T0 + 8_002);
+    assert_eq!(m.info().state, AgentState::WaitingPermission { tool: None });
+
+    let a = m.apply(&other("StopFailure"), T0 + 9_000).unwrap();
+    assert!(a.state_changed);
+    assert!(matches!(m.info().state, AgentState::Error { .. }));
+    assert_eq!(m.info().source, StateSource::Hook);
+}
+
 #[test]
 fn other_claude_events_are_recorded_but_never_change_state() {
     let mut m = machine();
@@ -442,30 +498,125 @@ fn other_claude_events_are_recorded_but_never_change_state() {
     let running = AgentState::ToolRunning {
         tool: "Bash".into(),
     };
-    assert_eq!(m.info().state, running);
-    for (i, name) in [
-        "PermissionRequest",
-        "PostToolUseFailure",
-        "PermissionDenied",
-        "StopFailure",
-        "PostCompact",
-        "CwdChanged",
-    ]
-    .into_iter()
-    .enumerate()
+    for (i, name) in ["PostCompact", "CwdChanged", "InstructionsLoaded", "Brand"]
+        .into_iter()
+        .enumerate()
     {
-        let a = m
-            .apply(
-                &hook(ClaudeHookEvent::Other {
-                    hook_event_name: name.into(),
-                }),
-                T0 + 1 + i as i64,
-            )
-            .unwrap();
+        let a = m.apply(&other(name), T0 + 1 + i as i64).unwrap();
         assert_eq!(a.kind, format!("hook:{name}"));
         assert_eq!((a.detail, a.state_changed), (None, false));
         assert_eq!(m.info().state, running, "{name}");
     }
+}
+
+/// Review #9: the foreground switching from an agent to anything else means
+/// the agent left — even out of a hook state, never out of `Exited`.
+#[test]
+fn foreground_agent_to_non_agent_is_agent_left() {
+    let mut m = machine();
+    m.apply(&Signal::ForegroundProcess("claude".into()), T0);
+    m.apply(&pre("Bash"), T0 + 1);
+    let a = m
+        .apply(&Signal::ForegroundProcess("zsh".into()), T0 + 2)
+        .unwrap();
+    assert_eq!(
+        (a.kind.as_str(), a.detail.as_deref(), a.state_changed),
+        ("heuristic:agent_left", Some("zsh"), true)
+    );
+    let info = m.info();
+    assert_eq!(info.kind, AgentKind::Shell);
+    assert_eq!(
+        (info.state.clone(), info.source, info.confidence),
+        (
+            AgentState::Idle,
+            StateSource::Heuristic,
+            HEURISTIC_CONFIDENCE
+        )
+    );
+    assert_eq!(info.external_id.as_deref(), Some("claude-uuid"));
+    assert_eq!(info.transcript_path, Some(PathBuf::from("/t.jsonl")));
+    // Now a shell: heuristics no longer apply, and the same name twice is
+    // not another switch.
+    assert_eq!(m.apply(&Signal::OutputActivity, T0 + 3), None);
+    assert_eq!(
+        m.apply(&Signal::ForegroundProcess("vim".into()), T0 + 4),
+        None
+    );
+
+    // Not after `Exited` (SessionEnd).
+    let mut m = machine();
+    m.apply(&Signal::ForegroundProcess("claude".into()), T0);
+    m.apply(&hook(ClaudeHookEvent::SessionEnd { reason: None }), T0 + 1);
+    assert_eq!(
+        m.apply(&Signal::ForegroundProcess("zsh".into()), T0 + 2),
+        None
+    );
+    assert_eq!(m.info().state, AgentState::Exited { code: None });
+
+    // Only a switch *from an agent name* counts: `node` hosting Claude.
+    let mut m = machine();
+    m.apply(&Signal::ForegroundProcess("node".into()), T0);
+    m.apply(&hook(ClaudeHookEvent::UserPromptSubmit), T0 + 1);
+    assert_eq!(
+        m.apply(&Signal::ForegroundProcess("zsh".into()), T0 + 2),
+        None
+    );
+    assert_eq!(m.info().kind, AgentKind::Claude);
+    // ...and a revive forgets the previous foreground.
+    let mut m = heuristic_claude();
+    m.reset(m.info().clone());
+    assert_eq!(
+        m.apply(&Signal::ForegroundProcess("zsh".into()), T0 + 1),
+        None
+    );
+}
+
+/// `StateSource` contract: OSC 133 marks while an agent owns the session end
+/// its state as "agent left" (kind back to `Shell`), SessionEnd included.
+#[test]
+fn osc_prompt_marks_end_an_agent_as_agent_left() {
+    let osc = |mark| Signal::Osc(OscEvent::Prompt(mark));
+    let mut m = machine();
+    m.apply(
+        &hook(ClaudeHookEvent::Stop {
+            stop_hook_active: false,
+        }),
+        T0,
+    );
+    let a = m
+        .apply(&osc(PromptMark::CommandEnd { exit_code: Some(0) }), T0 + 1)
+        .unwrap();
+    assert_eq!(
+        (a.kind.as_str(), a.detail.as_deref(), a.state_changed),
+        ("osc:agent_left", Some("133D:0"), true)
+    );
+    let info = m.info();
+    assert_eq!(
+        (info.kind.clone(), info.state.clone(), info.source),
+        (
+            AgentKind::Shell,
+            AgentState::Idle,
+            StateSource::ShellIntegration
+        )
+    );
+    assert_eq!(info.external_id.as_deref(), Some("claude-uuid"));
+    // Back to plain shell marks.
+    assert_eq!(
+        m.apply(&osc(PromptMark::OutputStart), T0 + 2).unwrap().kind,
+        "osc:133C"
+    );
+
+    let mut m = machine();
+    m.apply(&hook(ClaudeHookEvent::SessionEnd { reason: None }), T0);
+    let a = m.apply(&osc(PromptMark::PromptStart), T0 + 1).unwrap();
+    assert_eq!(
+        (a.kind.as_str(), a.detail.as_deref()),
+        ("osc:agent_left", Some("133A"))
+    );
+    assert_eq!(
+        (m.info().kind.clone(), m.info().state.clone()),
+        (AgentKind::Shell, AgentState::Idle)
+    );
 }
 
 #[test]
