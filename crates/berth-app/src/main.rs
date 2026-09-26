@@ -24,6 +24,7 @@ mod paste;
 mod renderer;
 mod selection;
 mod session_view;
+mod setup_hooks;
 mod sidebar;
 mod stats;
 #[cfg(test)]
@@ -156,9 +157,10 @@ fn parse_cells(s: &str) -> std::result::Result<(u16, u16), String> {
 enum Cmd {
     /// List workspaces and sessions known to the daemon.
     List,
-    /// Install / preview / undo Claude Code and Codex hook entries (M3;
-    /// not implemented, writes nothing).
-    SetupHooks,
+    /// Show / install / undo berth's hook entries for Claude Code
+    /// (~/.claude/settings.json) or Codex (~/.codex/config.toml). Only
+    /// `--yes` writes, after a backup.
+    SetupHooks(setup_hooks::Args),
     /// Read-only checks: daemon, socket permissions, hooks, login PATH.
     Doctor,
     /// Scripted checks against a running daemon.
@@ -179,9 +181,11 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::List) => cli::list(&Paths::resolve()),
         Some(Cmd::Doctor) => cli::doctor(&Paths::resolve()),
         Some(Cmd::Debug(cmd)) => cli::debug(&Paths::resolve(), cmd),
-        Some(Cmd::SetupHooks) => anyhow::bail!(
-            "berth setup-hooks 属于 M3，尚未实现；没有写入任何文件（~/.claude、~/.codex 均未改动）"
-        ),
+        Some(Cmd::SetupHooks(args)) => {
+            let report = setup_hooks::run(&args, &setup_hooks::Env::from_process()?)?;
+            print!("{report}");
+            Ok(())
+        }
     }
 }
 
