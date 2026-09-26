@@ -108,6 +108,8 @@ pub(crate) struct ActorConfig {
     pub scrollback: usize,
     pub snapshot_interval: Duration,
     pub max_restored_lines: usize,
+    /// `[terminal] osc52_store`.
+    pub osc52_store: bool,
 }
 
 pub(crate) struct ActorHandle {
@@ -284,6 +286,7 @@ impl Actor {
             kitty_keyboard: true,
         });
         *term.interner() = interner;
+        term.set_clipboard_store_allowed(self.cfg.osc52_store);
         self.term = Some(term);
         self.live = Some(Live { pty, rx });
         self.child_exit_code = None;
@@ -504,9 +507,14 @@ impl Actor {
                         }
                     }
                 }
-                TermEvent::ClipboardStore(_) => {
-                    tracing::debug!(session = %self.id, "OSC 52 clipboard store ignored")
-                }
+                // Only surfaced with `[terminal] osc52_store = true`. The
+                // protocol has no clipboard event yet: log the size, never
+                // the text.
+                TermEvent::ClipboardStore(text) => tracing::debug!(
+                    session = %self.id,
+                    bytes = text.len(),
+                    "OSC 52 clipboard store (no protocol event yet)"
+                ),
                 TermEvent::CursorBlinkingChanged => self.mark_screen_dirty(Instant::now()),
                 TermEvent::ChildExit(code) => self.child_exit_code = Some(code),
             }

@@ -27,6 +27,9 @@ pub struct TerminalConfig {
     /// `auto` | `none` (shell integration injection is not implemented yet;
     /// parsed so configs stay valid).
     pub shell_integration: String,
+    /// Surface OSC 52 clipboard *stores* (DESIGN §11: off unless enabled;
+    /// clipboard loads are always refused by berth-vt).
+    pub osc52_store: bool,
 }
 
 impl Default for TerminalConfig {
@@ -34,6 +37,7 @@ impl Default for TerminalConfig {
         Self {
             scrollback: 20_000,
             shell_integration: "auto".into(),
+            osc52_store: false,
         }
     }
 }
@@ -128,6 +132,7 @@ mod tests {
     fn defaults_match_design() {
         let c = Config::default();
         assert_eq!(c.scrollback(), 20_000);
+        assert!(!c.terminal.osc52_store, "OSC 52 stores need an opt-in");
         assert_eq!(c.snapshot_interval(), Duration::from_secs(5));
         assert!(!c.persist.journal);
         assert_eq!(c.max_restored_lines(), 50_000);
@@ -152,6 +157,7 @@ size = 13
 [terminal]
 scrollback = 500000
 shell_integration = "none"
+osc52_store = true
 [persist]
 snapshot_interval_s = 0
 journal = true
@@ -170,6 +176,7 @@ action = "command_palette"
         .unwrap();
         assert_eq!(c.scrollback(), MAX_SCROLLBACK);
         assert_eq!(c.terminal.shell_integration, "none");
+        assert!(c.terminal.osc52_store);
         assert_eq!(c.snapshot_interval(), Duration::from_secs(1));
         assert!(c.persist.journal);
         assert_eq!(c.max_restored_lines(), 100);

@@ -137,6 +137,7 @@ impl Manager {
             scrollback: self.config.scrollback(),
             snapshot_interval: self.config.snapshot_interval(),
             max_restored_lines: self.config.max_restored_lines(),
+            osc52_store: self.config.terminal.osc52_store,
         }
     }
 
