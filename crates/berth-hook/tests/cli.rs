@@ -32,10 +32,26 @@ fn run(args: &[&str], socket: &Path, sid: Option<SessionId>, stdin: &[u8]) -> (O
     (out, start.elapsed())
 }
 
-/// Accept one connection and decode every frame it carries.
+/// Accept one connection and decode every frame it carries. Waits at most
+/// 5 s: a hook that dropped its event must fail the test, not hang it.
 fn receive(listener: &UnixListener) -> Vec<ClientMsg> {
-    listener.set_nonblocking(false).unwrap();
-    let (mut conn, _) = listener.accept().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut conn = loop {
+        match listener.accept() {
+            Ok((conn, _)) => break conn,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the hook delivered nothing within 5 s"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    // Accepted sockets inherit O_NONBLOCK from the listener on macOS.
+    conn.set_nonblocking(false).unwrap();
     // macOS rejects SO_RCVTIMEO (EINVAL) once the peer has already closed,
     // which is the normal case here: the hook writes and exits immediately.
     let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
