@@ -17,3 +17,6 @@
 - `feat/daemon`（d8385bb）对抗审查：3 high（Revive 未校验 external_id 可注入命令、FetchLines 算术溢出可 panic actor、客户端角色未鉴权）+ 若干 medium（OSC 133 无条件覆盖粘性状态、outbox 合并丢 reply_to、Gui/Cli 可伪造 Hook、purge 顺序、statusline stdin 无期限、codex --chain exec 失败码），14 项已发回 impl-daemon 修复，合并前逐项复核。
 - berth-core：`ensure_dirs` 对单独创建的 socket 父目录设 0700（568311e）；`StateSource` 契约注释写明 heuristics 不覆盖 hook 态、OSC 133/前台进程离开走 agent_left 转移（6fa3b5b）。
 - M2 任务书 `docs/tasks/integrate.md` §6 追加审查得出的协议约束。
+- `feat/daemon` 合并到 main（b293c61）：19 项审查发现全部修复并经独立复核（Revive 白名单 id + argv exec、FetchLines 饱和运算 + actor catch_unwind、双向角色鉴权、statusline 1s 期限、codex --chain 127、并发 shutdown 5s、writer 线程 + 1 MiB 背压、状态机 agent_left/Exited 终态/hook:late、outbox reply_to、purge 顺序、hook 50 ms 硬预算）。合并后 workspace 全绿：app 69、core 13、daemon 50+13、hook 8+7、store 11、vt 59+11；clippy、fmt 干净。M1 完成。
+- 设计澄清：`AgentState::Exited` 只表示 PTY 子进程退出（⇔ `SessionStatus::Dormant`），Claude `SessionEnd` 走 agent 离开转移（DESIGN §9，e147a89）。
+- 下一步 M2：`feat/integrate`（worktree `~/projects/berth-wt-integrate`），按 `docs/tasks/integrate.md`（含 §6 审查约束与登录 shell PATH 要求）。
