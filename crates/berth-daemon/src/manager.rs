@@ -21,6 +21,7 @@ use berth_vt::PtySpawn;
 use crossbeam_channel::Sender;
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, watch};
+use tokio::task::JoinSet;
 
 use crate::agent_state::{is_valid_external_id, AgentMachine, Signal, HEURISTIC_CONFIDENCE};
 use crate::config::Config;
@@ -31,7 +32,8 @@ use crate::view::ConnId;
 
 pub type Result<T> = std::result::Result<T, String>;
 
-/// How long `shutdown` waits for each session to write its snapshot.
+/// How long `shutdown` waits, in total, for the sessions to write their
+/// snapshots.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "elvish", "xonsh",
@@ -886,6 +888,14 @@ impl Manager {
 
     /// Every actor writes its final snapshot and stops; metadata is flushed.
     pub async fn shutdown(&self) {
+        self.shutdown_within(SHUTDOWN_WAIT).await;
+    }
+
+    /// Stop every actor concurrently and wait at most `total` for all of
+    /// them; stragglers are logged and left behind (their threads are not
+    /// joined, so nothing can hold up the daemon's exit).
+    async fn shutdown_within(&self, total: Duration) {
+        let deadline = tokio::time::Instant::now() + total;
         let actors: Vec<(SessionId, ActorHandle)> = {
             let mut reg = self.reg.lock();
             reg.sessions
@@ -893,21 +903,42 @@ impl Manager {
                 .filter_map(|(id, e)| e.actor.take().map(|a| (*id, a)))
                 .collect()
         };
-        let mut waits = Vec::new();
+        let mut waits = JoinSet::new();
+        let mut outstanding = Vec::new();
         for (sid, actor) in actors {
             let (reply, rx) = oneshot::channel();
-            if actor.tx.send(SessionCmd::Shutdown { reply }).is_ok() {
-                waits.push((sid, rx, actor.join));
+            if actor.tx.send(SessionCmd::Shutdown { reply }).is_err() {
+                continue;
             }
-        }
-        for (sid, rx, join) in waits {
-            match tokio::time::timeout(SHUTDOWN_WAIT, rx).await {
-                Ok(_) => {
+            outstanding.push(sid);
+            let join = actor.join;
+            waits.spawn(async move {
+                if rx.await.is_ok() {
                     if let Some(join) = join {
-                        let _ = tokio::task::spawn_blocking(move || join.join()).await;
+                        // Replied: the thread is on its way out. Poll rather
+                        // than `spawn_blocking(join)`: a blocking task would
+                        // keep the runtime (and the daemon) from exiting.
+                        while !join.is_finished() {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        let _ = join.join();
                     }
                 }
-                Err(_) => tracing::warn!(session = %sid, "session did not stop in time"),
+                sid
+            });
+        }
+        loop {
+            match tokio::time::timeout_at(deadline, waits.join_next()).await {
+                Ok(Some(Ok(sid))) => outstanding.retain(|s| *s != sid),
+                Ok(Some(Err(e))) => tracing::warn!(error = %e, "session stop task failed"),
+                Ok(None) => break,
+                Err(_) => {
+                    for sid in &outstanding {
+                        tracing::warn!(session = %sid, "session did not stop in time");
+                    }
+                    waits.detach_all();
+                    break;
+                }
             }
         }
         let metas: Vec<SessionMeta> = self
@@ -1108,6 +1139,45 @@ mod tests {
         mgr.delete_session(sid).await.unwrap();
         assert!(mgr.meta(sid).is_none());
         mgr.shutdown().await;
+    }
+
+    /// Review medium #6: one deadline for all sessions, not one each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_all_sessions_concurrently_with_one_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        paths.ensure_dirs().unwrap();
+        let store = Store::open(&paths).unwrap();
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        let mgr = Manager::start(paths, Config::default(), store, stop_tx).unwrap();
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let dims = Dims { cols: 80, rows: 24 };
+        let mut sids = Vec::new();
+        for _ in 0..4 {
+            let meta = mgr
+                .create_session(ws.id, None, Some(vec!["/bin/sh".into()]), None, dims)
+                .await
+                .unwrap();
+            sids.push(meta.id);
+        }
+        // Three sessions cannot stop; one can.
+        for sid in &sids[..3] {
+            let tx = mgr.existing_tx(*sid).unwrap().unwrap();
+            tx.send(SessionCmd::Stall(Duration::from_secs(5))).unwrap();
+        }
+        let total = Duration::from_millis(400);
+        let started = std::time::Instant::now();
+        mgr.shutdown_within(total).await;
+        let took = started.elapsed();
+        // Sequential waiting would need 3 × 400 ms before even reaching the
+        // healthy session.
+        assert!(took >= total, "returned before the deadline: {took:?}");
+        assert!(took < total * 3, "waited per session: {took:?}");
+        for sid in &sids {
+            assert!(mgr.existing_tx(*sid).unwrap().is_none(), "actor handed off");
+        }
     }
 
     #[test]

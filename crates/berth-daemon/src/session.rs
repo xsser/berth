@@ -106,6 +106,9 @@ pub(crate) enum SessionCmd {
     /// Test-only: panic on the actor thread.
     #[cfg(test)]
     Crash,
+    /// Test hook: block the actor thread (a session that cannot stop).
+    #[cfg(test)]
+    Stall(Duration),
 }
 
 #[derive(Clone, Debug)]
@@ -431,6 +434,8 @@ impl Actor {
             }
             #[cfg(test)]
             SessionCmd::Crash => panic!("injected session actor panic"),
+            #[cfg(test)]
+            SessionCmd::Stall(d) => std::thread::sleep(d),
         }
     }
 }
