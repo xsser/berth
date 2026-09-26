@@ -301,10 +301,13 @@ dependencies = [
  "berth-store",
  "berth-vt",
  "clap",
+ "crossbeam-channel",
  "libc",
  "parking_lot",
+ "serde",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
