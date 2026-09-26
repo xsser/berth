@@ -142,7 +142,13 @@ fn foreground_process_name_and_cwd_then_kill() {
 fn foreground_process_follows_the_shells_job() {
     let dir = tmp_dir();
     // An interactive shell puts the job in its own foreground process group.
-    let (mut handle, rx) = spawn(&spec(&["/bin/sh", "-i"], dir.path()));
+    let mut shell = spec(&["/bin/sh", "-i"], dir.path());
+    // It also saves its history on exit: keep that out of the user's home.
+    let history = dir.path().join("sh_history");
+    shell
+        .env
+        .push(("HISTFILE".into(), history.to_string_lossy().into_owned()));
+    let (mut handle, rx) = spawn(&shell);
     handle.write(b"/bin/sleep 7\n").unwrap();
     let deadline = Instant::now() + TIMEOUT;
     let info = loop {
