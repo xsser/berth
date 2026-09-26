@@ -35,3 +35,11 @@
 4. `pkill -9 berthd` 后打开 `berth`：session 显示为 Restored，历史可滚动；Revive 后新 shell 输出接在历史下方。
 5. 三个 session 同时输出（`yes | head -c 10M` 等），侧栏预览更新且主视图不掉帧（记录帧时间）。
 6. `cargo test --workspace` 全绿，clippy 无告警。
+
+## 6. 审查后追加的约束（2026-09-27，daemon 审查结论）
+- 连接后第一帧必须是 `Hello{role: Gui, ...}`；daemon 按角色鉴权：Gui/Cli 不得发送 `Request::Hook`，Hook 角色只能 Hello/Hook。客户端遇到 `Event::Error` 要显示而不是静默丢弃。
+- Revive 只发 `Revive{mode: ResumeAgent}` 等协议消息，`external_id` 由 daemon 校验（`[A-Za-z0-9._-]{1,128}`）并以 argv 方式启动；客户端绝不拼接 shell 命令字符串。
+- `FetchLines` 单次上限 5000 行（daemon 侧 `MAX_FETCH_LINES`），客户端分页预取；`Input` 有 1 MiB 背压上限，粘贴超大文本要分块并等待 `Ok`。
+- 同一 session 的 `Screen`/`Preview` 可能被 daemon 合并（outbox coalesce），客户端只信任 `seq`，不假设每次输出都对应一帧。
+- agent 状态显示 `source`：Hook 实色、ShellIntegration 普通、Heuristic 淡色/虚线；`AgentChanged` 里 kind 从 Claude/Codex 变回 Shell 表示 agent 已退出（`agent_left`），侧栏徽标随之切回 shell 图标。
+- `berth doctor` 对 `~/.claude/settings.json`、`~/.codex/config.toml` 只读；任何写入都属于 M3 `berth setup-hooks` 且必须显式确认。
