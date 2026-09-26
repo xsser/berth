@@ -19,7 +19,9 @@ pub struct Paths {
 
 impl Paths {
     pub fn resolve() -> Paths {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
         let data_dir = std::env::var_os("BERTH_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| default_data_dir(&home));
@@ -64,7 +66,12 @@ impl Paths {
 
     /// Create data directories with owner-only permissions.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
-        for dir in [&self.data_dir, &self.snapshots_dir, &self.journals_dir, &self.logs_dir] {
+        for dir in [
+            &self.data_dir,
+            &self.snapshots_dir,
+            &self.journals_dir,
+            &self.logs_dir,
+        ] {
             std::fs::create_dir_all(dir)?;
             #[cfg(unix)]
             {
@@ -73,7 +80,16 @@ impl Paths {
             }
         }
         if let Some(parent) = self.socket.parent() {
-            std::fs::create_dir_all(parent)?;
+            // On Linux the socket may live under $XDG_RUNTIME_DIR/berth, a
+            // directory we create ourselves: keep it owner-only as well.
+            if parent != self.data_dir && !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+                }
+            }
         }
         Ok(())
     }
@@ -114,11 +130,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ensure_dirs_creates_owner_only_socket_parent() {
+        let tmp = std::env::temp_dir().join(format!("berth-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut p = Paths::in_dir(&tmp.join("data"));
+        p.socket = tmp.join("run").join("berthd.sock");
+        p.ensure_dirs().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [&p.data_dir, &p.snapshots_dir, &tmp.join("run")] {
+                let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700, "{}", dir.display());
+            }
+        }
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
     fn in_dir_layout() {
         let p = Paths::in_dir(Path::new("/tmp/x"));
         assert_eq!(p.db, PathBuf::from("/tmp/x/berth.sqlite3"));
         assert_eq!(p.socket, PathBuf::from("/tmp/x/berthd.sock"));
         let sid = crate::SessionId::nil();
-        assert!(p.snapshot_file(&sid).to_string_lossy().ends_with(".bin.zst"));
+        assert!(p
+            .snapshot_file(&sid)
+            .to_string_lossy()
+            .ends_with(".bin.zst"));
     }
 }

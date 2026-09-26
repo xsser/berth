@@ -35,7 +35,10 @@ pub struct PersistPolicy {
 
 impl Default for PersistPolicy {
     fn default() -> Self {
-        Self { snapshot: true, journal: false }
+        Self {
+            snapshot: true,
+            journal: false,
+        }
     }
 }
 

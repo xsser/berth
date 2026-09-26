@@ -28,15 +28,23 @@ pub enum AgentState {
     Idle,
     /// Model is generating (or a plain shell command is running).
     Thinking,
-    ToolRunning { tool: String },
-    WaitingPermission { tool: Option<String> },
+    ToolRunning {
+        tool: String,
+    },
+    WaitingPermission {
+        tool: Option<String>,
+    },
     WaitingInput,
     /// Turn finished; cleared to `Idle` when the user interacts again.
     Done,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     Compacting,
     /// Child process exited.
-    Exited { code: Option<i32> },
+    Exited {
+        code: Option<i32>,
+    },
 }
 
 impl AgentState {
@@ -75,7 +83,18 @@ impl AgentState {
 }
 
 /// Where the current state came from. Priority: Hook > ShellIntegration >
-/// Heuristic; a lower-priority source never overrides `WaitingPermission`.
+/// Heuristic.
+///
+/// Contract (implemented by the daemon's state machine):
+/// - Heuristics (output activity, silence, foreground process) never
+///   override a hook-sourced state and never leave the sticky states
+///   `WaitingPermission`, `WaitingInput`, `Done`, `Error`, `Exited`.
+/// - Shell-integration prompt marks (OSC 133) only appear once the shell is
+///   back at its prompt, i.e. the agent process is gone; they may therefore
+///   end a hook-sourced agent state, but do so as an "agent left" transition
+///   (kind reset to `Shell`) rather than a plain state flip.
+/// - A foreground-process change from an agent to a non-agent is the
+///   heuristic equivalent of the above and takes the same transition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum StateSource {
     #[default]
@@ -109,16 +128,33 @@ pub struct AgentInfo {
 /// hook CLI maps unknown events to `Other`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClaudeHookEvent {
-    SessionStart { source: Option<String> },
+    SessionStart {
+        source: Option<String>,
+    },
     UserPromptSubmit,
-    PreToolUse { tool_name: String },
-    PostToolUse { tool_name: String },
-    Notification { notification_type: Option<String>, message: String },
-    Stop { stop_hook_active: bool },
+    PreToolUse {
+        tool_name: String,
+    },
+    PostToolUse {
+        tool_name: String,
+    },
+    Notification {
+        notification_type: Option<String>,
+        message: String,
+    },
+    Stop {
+        stop_hook_active: bool,
+    },
     SubagentStop,
-    PreCompact { trigger: Option<String> },
-    SessionEnd { reason: Option<String> },
-    Other { hook_event_name: String },
+    PreCompact {
+        trigger: Option<String>,
+    },
+    SessionEnd {
+        reason: Option<String>,
+    },
+    Other {
+        hook_event_name: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
