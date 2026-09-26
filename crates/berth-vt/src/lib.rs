@@ -19,6 +19,7 @@
 
 pub mod convert;
 pub mod osc;
+mod palette;
 pub mod pty;
 pub mod terminal;
 
@@ -32,4 +33,17 @@ pub enum VtError {
     Pty(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Shell-style exit code: the exit status, or 128 + signal number when the
+/// process was killed by a signal.
+pub(crate) fn exit_status_code(status: std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    status.code().unwrap_or(-1)
 }

@@ -179,10 +179,8 @@ fn split_once(bytes: &[u8], separator: u8) -> Option<(&[u8], &[u8])> {
 fn parse_cwd(url: &[u8]) -> Option<PathBuf> {
     let (rest, percent_encoded) = if let Some(rest) = url.strip_prefix(b"file://") {
         (rest, true)
-    } else if let Some(rest) = url.strip_prefix(b"kitty-shell-cwd://") {
-        (rest, false)
     } else {
-        return None;
+        (url.strip_prefix(b"kitty-shell-cwd://")?, false)
     };
     let path_start = rest.iter().position(|&b| b == b'/')?;
     let path = &rest[path_start..];
