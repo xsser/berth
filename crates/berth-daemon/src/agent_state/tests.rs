@@ -111,13 +111,8 @@ fn row_notification_permission_and_idle_prompt() {
     m.apply(&pre("Bash"), T0);
     let a = m.apply(&notification("permission_prompt"), T0 + 1).unwrap();
     assert_eq!(a.detail.as_deref(), Some("permission_prompt"));
-    // The pending tool is carried into the waiting state.
-    assert_eq!(
-        m.info().state,
-        AgentState::WaitingPermission {
-            tool: Some("Bash".into())
-        }
-    );
+    // The notification does not name the tool.
+    assert_eq!(m.info().state, AgentState::WaitingPermission { tool: None });
     m.apply(&notification("idle_prompt"), T0 + 2);
     assert_eq!(m.info().state, AgentState::WaitingInput);
     // Informational notifications do not move the state.
@@ -177,9 +172,18 @@ fn row_pre_compact_and_session_end() {
         T0,
     );
     assert_eq!(m.info().state, AgentState::Compacting);
+    // PostCompact is not a core event; SessionStart{compact} (hooks
+    // reference: fires after auto or manual compaction) ends the phase.
     m.apply(
         &hook(ClaudeHookEvent::Other {
             hook_event_name: "PostCompact".into(),
+        }),
+        T0 + 1,
+    );
+    assert_eq!(m.info().state, AgentState::Compacting);
+    m.apply(
+        &hook(ClaudeHookEvent::SessionStart {
+            source: Some("compact".into()),
         }),
         T0 + 1,
     );
@@ -274,6 +278,21 @@ fn row_foreground_process_and_activity_heuristics() {
         ("heuristic:foreground", false)
     );
     assert_eq!(m.info().kind, AgentKind::Codex);
+    // The native Claude Code build reports `claude.exe`.
+    for name in ["claude", "claude.exe", "/Users/me/.local/bin/claude.exe"] {
+        assert_eq!(
+            agent_kind_for_process(name),
+            Some(AgentKind::Claude),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        agent_kind_for_process("codex-aarch64-apple-darwin"),
+        Some(AgentKind::Codex)
+    );
+    for name in ["node", "zsh", "nvim"] {
+        assert_eq!(agent_kind_for_process(name), None, "{name}");
+    }
     let mut m = heuristic_claude();
     assert_eq!(m.info().kind, AgentKind::Claude);
 
@@ -395,12 +414,7 @@ fn heuristics_never_override_waiting_permission() {
         m.apply(&Signal::ForegroundProcess("claude".into()), later),
         None
     );
-    assert_eq!(
-        m.info().state,
-        AgentState::WaitingPermission {
-            tool: Some("Edit".into())
-        }
-    );
+    assert_eq!(m.info().state, AgentState::WaitingPermission { tool: None });
     // Only a real signal leaves it.
     m.apply(
         &hook(ClaudeHookEvent::PostToolUse {
@@ -412,47 +426,62 @@ fn heuristics_never_override_waiting_permission() {
 }
 
 #[test]
-fn newer_claude_events_via_other() {
+fn other_claude_events_are_recorded_but_never_change_state() {
     let mut m = machine();
     m.apply(&pre("Bash"), T0);
-    m.apply(
-        &hook(ClaudeHookEvent::Other {
-            hook_event_name: "PermissionRequest".into(),
-        }),
-        T0 + 1,
-    );
-    assert_eq!(
-        m.info().state,
-        AgentState::WaitingPermission {
-            tool: Some("Bash".into())
-        }
-    );
-    m.apply(
-        &hook(ClaudeHookEvent::Other {
-            hook_event_name: "PostToolUseFailure".into(),
-        }),
-        T0 + 2,
-    );
-    assert_eq!(m.info().state, AgentState::Thinking);
-    m.apply(
-        &hook(ClaudeHookEvent::Other {
-            hook_event_name: "StopFailure".into(),
-        }),
-        T0 + 3,
-    );
-    assert!(matches!(m.info().state, AgentState::Error { .. }));
-    let a = m
-        .apply(
-            &hook(ClaudeHookEvent::Other {
-                hook_event_name: "CwdChanged".into(),
-            }),
-            T0 + 4,
-        )
-        .unwrap();
-    assert_eq!(
-        (a.kind.as_str(), a.state_changed),
-        ("hook:CwdChanged", false)
-    );
+    let running = AgentState::ToolRunning {
+        tool: "Bash".into(),
+    };
+    assert_eq!(m.info().state, running);
+    for (i, name) in [
+        "PermissionRequest",
+        "PostToolUseFailure",
+        "PermissionDenied",
+        "StopFailure",
+        "PostCompact",
+        "CwdChanged",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let a = m
+            .apply(
+                &hook(ClaudeHookEvent::Other {
+                    hook_event_name: name.into(),
+                }),
+                T0 + 1 + i as i64,
+            )
+            .unwrap();
+        assert_eq!(a.kind, format!("hook:{name}"));
+        assert_eq!((a.detail, a.state_changed), (None, false));
+        assert_eq!(m.info().state, running, "{name}");
+    }
+}
+
+#[test]
+fn notification_types_follow_hooks_reference() {
+    let mut m = machine();
+    for (kind, want) in [
+        ("elicitation_dialog", AgentState::WaitingInput),
+        ("elicitation_response", AgentState::Thinking),
+        ("elicitation_url_dialog", AgentState::WaitingInput),
+        ("elicitation_complete", AgentState::Thinking),
+        ("agent_needs_input", AgentState::WaitingInput),
+        ("agent_completed", AgentState::Done),
+    ] {
+        m.apply(&notification(kind), T0);
+        assert_eq!(m.info().state, want, "{kind}");
+    }
+    // Informational and unknown types are recorded with the type as detail
+    // but leave the state alone.
+    for kind in ["auth_success", "quota_auto_resume_fired", "brand_new_type"] {
+        let a = m.apply(&notification(kind), T0 + 1).unwrap();
+        assert_eq!(
+            (a.kind.as_str(), a.detail.as_deref(), a.state_changed),
+            ("hook:Notification", Some(kind), false)
+        );
+        assert_eq!(m.info().state, AgentState::Done, "{kind}");
+    }
 }
 
 #[test]

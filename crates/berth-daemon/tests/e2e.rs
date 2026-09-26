@@ -372,14 +372,7 @@ async fn attach_hooks_kill_restart_revive() {
         message: "Claude needs your permission to use Bash".into(),
     };
     assert_eq!(c.request(claude(sid, permission)).await, Event::Ok);
-    agent_state(
-        &mut c,
-        sid,
-        AgentState::WaitingPermission {
-            tool: Some("Bash".into()),
-        },
-    )
-    .await;
+    agent_state(&mut c, sid, AgentState::WaitingPermission { tool: None }).await;
     assert_eq!(
         c.request(claude(
             sid,

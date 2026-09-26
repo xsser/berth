@@ -7,8 +7,11 @@
 //! - heuristics never leave `WaitingPermission` (nor the other "sticky"
 //!   states `Done`, `WaitingInput`, `Error`, `Exited`): activity only moves
 //!   `Idle → Thinking`, silence only moves busy states `→ Idle`;
-//! - every applied transition is reported as `Applied` so the manager can
-//!   write an `EventRecord` (kind + short detail, never prompt text).
+//! - only the nine core Claude hook events (and `Notification` types with a
+//!   clear meaning) move the state; the other hook events (`Other`) are
+//!   recorded but never change it;
+//! - every applied signal is reported as `Applied` so the manager can write
+//!   an `EventRecord` (kind + short detail, never prompt text).
 
 use berth_core::{
     AgentInfo, AgentKind, AgentState, ClaudeHook, ClaudeHookEvent, CodexNotify, StateSource,
@@ -53,10 +56,18 @@ pub struct Applied {
     pub state_changed: bool,
 }
 
+/// What a `Notification` hook means for the state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NotificationClass {
+    /// → `WaitingPermission`
     Permission,
+    /// → `WaitingInput`
     Input,
+    /// → `Thinking` (an MCP elicitation was answered)
+    Working,
+    /// → `Done`
+    Completed,
+    /// State unchanged; only the event is recorded.
     Informational,
 }
 
@@ -94,14 +105,6 @@ impl AgentMachine {
     fn hook_recent(&self, now_ms: i64) -> bool {
         self.last_hook_ms
             .is_some_and(|t| now_ms - t < HOOK_PRIORITY_MS)
-    }
-
-    fn current_tool(&self) -> Option<String> {
-        match &self.info.state {
-            AgentState::ToolRunning { tool } => Some(tool.clone()),
-            AgentState::WaitingPermission { tool } => tool.clone(),
-            _ => None,
-        }
     }
 
     /// Enter `state`; returns whether anything visible changed.
@@ -262,10 +265,14 @@ impl AgentMachine {
                 message,
             } => {
                 let next = match classify_notification(notification_type.as_deref(), message) {
-                    NotificationClass::Permission => Some(AgentState::WaitingPermission {
-                        tool: self.current_tool(),
-                    }),
+                    // The notification does not name the tool, and with
+                    // parallel tool calls the last PreToolUse may be another.
+                    NotificationClass::Permission => {
+                        Some(AgentState::WaitingPermission { tool: None })
+                    }
                     NotificationClass::Input => Some(AgentState::WaitingInput),
+                    NotificationClass::Working => Some(AgentState::Thinking),
+                    NotificationClass::Completed => Some(AgentState::Done),
                     NotificationClass::Informational => None,
                 };
                 ("Notification", notification_type.clone(), next)
@@ -283,24 +290,10 @@ impl AgentMachine {
                 reason.clone(),
                 Some(AgentState::Exited { code: None }),
             ),
-            ClaudeHookEvent::Other { hook_event_name } => {
-                // Newer events the core enum does not name (hooks reference,
-                // 2026-09): map the ones that carry clear state meaning.
-                let next = match hook_event_name.as_str() {
-                    "PermissionRequest" => Some(AgentState::WaitingPermission {
-                        tool: self.current_tool(),
-                    }),
-                    "PostToolUseFailure" | "PermissionDenied" => Some(AgentState::Thinking),
-                    "StopFailure" => Some(AgentState::Error {
-                        message: "stop failure".into(),
-                    }),
-                    "PostCompact" if self.info.state == AgentState::Compacting => {
-                        Some(AgentState::Idle)
-                    }
-                    _ => None,
-                };
-                (hook_event_name.as_str(), None, next)
-            }
+            // The events beyond the nine core ones (PermissionRequest,
+            // StopFailure, PostCompact, ...) are recorded but never move the
+            // state.
+            ClaudeHookEvent::Other { hook_event_name } => (hook_event_name.as_str(), None, None),
         };
         let state_changed = match next {
             Some(state) => {
@@ -387,11 +380,12 @@ impl AgentMachine {
     }
 }
 
-/// `claude` / `codex` foreground processes set the agent kind; anything
-/// else (shells, `node` without argv evidence, editors) leaves it alone.
+/// `claude*` (the native build reports `claude.exe`) and `codex` foreground
+/// processes set the agent kind; anything else (shells, `node` without argv
+/// evidence, editors) leaves it alone.
 pub fn agent_kind_for_process(name: &str) -> Option<AgentKind> {
     let base = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
-    if base == "claude" || base.starts_with("claude-") {
+    if base.starts_with("claude") {
         Some(AgentKind::Claude)
     } else if base == "codex" || base.starts_with("codex-") {
         Some(AgentKind::Codex)
@@ -400,12 +394,17 @@ pub fn agent_kind_for_process(name: &str) -> Option<AgentKind> {
     }
 }
 
+/// `notification_type` values of the hooks reference (2026-09). Anything
+/// else (`auth_success`, `quota_auto_resume_*`, future types) is
+/// informational: recorded with the type as detail, state unchanged.
 fn classify_notification(kind: Option<&str>, message: &str) -> NotificationClass {
     match kind {
         Some("permission_prompt") => NotificationClass::Permission,
         Some(
             "idle_prompt" | "elicitation_dialog" | "elicitation_url_dialog" | "agent_needs_input",
         ) => NotificationClass::Input,
+        Some("elicitation_complete" | "elicitation_response") => NotificationClass::Working,
+        Some("agent_completed") => NotificationClass::Completed,
         Some(_) => NotificationClass::Informational,
         // Older Claude Code versions sent no `notification_type`.
         None => {
