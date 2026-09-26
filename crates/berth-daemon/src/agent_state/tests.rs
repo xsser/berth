@@ -175,6 +175,15 @@ fn row_stop_done_then_user_input_idle_and_subagent_stop_counts() {
     m.apply(&hook(ClaudeHookEvent::SubagentStop), T0 + 6);
     assert_eq!(m.subagent_stops(), 2);
     assert_eq!(m.info().state, before);
+    // M3: SubagentStart is counted the same way and changes nothing.
+    for n in ["1", "2"] {
+        let a = m.apply(&other("SubagentStart"), T0 + 7).unwrap();
+        assert_eq!(
+            (a.kind.as_str(), a.detail.as_deref(), a.state_changed),
+            ("hook:SubagentStart", Some(n), false)
+        );
+    }
+    assert_eq!(m.info().state, before);
 }
 
 fn pre_compact(trigger: &str) -> Signal {
@@ -508,7 +517,7 @@ fn other_claude_events_are_recorded_but_never_change_state() {
     let running = AgentState::ToolRunning {
         tool: "Bash".into(),
     };
-    for (i, name) in ["SubagentStart", "CwdChanged", "InstructionsLoaded", "Brand"]
+    for (i, name) in ["CwdChanged", "InstructionsLoaded", "Brand"]
         .into_iter()
         .enumerate()
     {

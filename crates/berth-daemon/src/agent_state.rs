@@ -95,6 +95,7 @@ pub struct AgentMachine {
     info: AgentInfo,
     last_hook_ms: Option<i64>,
     subagent_stops: u32,
+    subagent_starts: u32,
     /// Previous `ForegroundProcess` name, to recognise an agent leaving.
     last_fg: Option<String>,
     /// The current compaction began while the agent was busy.
@@ -107,6 +108,7 @@ impl AgentMachine {
             info,
             last_hook_ms: None,
             subagent_stops: 0,
+            subagent_starts: 0,
             last_fg: None,
             compact_from_busy: false,
         }
@@ -121,6 +123,7 @@ impl AgentMachine {
         self.info = info;
         self.last_hook_ms = None;
         self.subagent_stops = 0;
+        self.subagent_starts = 0;
         self.last_fg = None;
         self.compact_from_busy = false;
     }
@@ -468,9 +471,15 @@ impl AgentMachine {
                     // the user or a hook), the model carries on.
                     "Elicitation" => (name, None, Some(AgentState::WaitingInput)),
                     "ElicitationResult" => (name, None, Some(AgentState::Thinking)),
-                    // Everything else (SubagentStart, CwdChanged — the
-                    // manager moves the cwd —, unknown events) is recorded
-                    // but never moves the state.
+                    // Counted like `SubagentStop`; the main agent's state
+                    // stays.
+                    "SubagentStart" => {
+                        self.subagent_starts += 1;
+                        (name, Some(self.subagent_starts.to_string()), None)
+                    }
+                    // Everything else (CwdChanged — the manager moves the
+                    // cwd —, unknown events) is recorded but never moves
+                    // the state.
                     _ => (name, None, None),
                 }
             }
