@@ -314,8 +314,8 @@ name = "berth-hook"
 version = "0.1.0"
 dependencies = [
  "berth-core",
- "postcard",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

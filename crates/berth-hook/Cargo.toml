@@ -12,4 +12,6 @@ path = "src/main.rs"
 [dependencies]
 berth-core.workspace = true
 serde_json.workspace = true
-postcard.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
