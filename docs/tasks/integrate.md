@@ -43,3 +43,4 @@
 - 同一 session 的 `Screen`/`Preview` 可能被 daemon 合并（outbox coalesce），客户端只信任 `seq`，不假设每次输出都对应一帧。
 - agent 状态显示 `source`：Hook 实色、ShellIntegration 普通、Heuristic 淡色/虚线；`AgentChanged` 里 kind 从 Claude/Codex 变回 Shell 表示 agent 已退出（`agent_left`），侧栏徽标随之切回 shell 图标。
 - `berth doctor` 对 `~/.claude/settings.json`、`~/.codex/config.toml` 只读；任何写入都属于 M3 `berth setup-hooks` 且必须显式确认。
+- `berthd` 以 argv 直接 exec `claude --resume <id>`（不经 shell），程序名按 daemon 进程的 PATH 解析。GUI 从 Finder/launchd 启动时 PATH 很短，因此 `berth` 拉起 `berthd` 前要用登录 shell 取一次环境（`$SHELL -lc 'command -v claude; printf %s "$PATH"'` 之类，5s 超时），把 PATH 传给 `berthd`；`berth doctor` 要报告 `claude`/`codex` 在该 PATH 下是否可解析。
