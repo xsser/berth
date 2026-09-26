@@ -303,10 +303,13 @@ dependencies = [
  "berth-store",
  "berth-vt",
  "clap",
+ "crossbeam-channel",
  "libc",
  "parking_lot",
+ "serde",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
@@ -316,8 +319,8 @@ name = "berth-hook"
 version = "0.1.0"
 dependencies = [
  "berth-core",
- "postcard",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -327,6 +330,7 @@ dependencies = [
  "berth-core",
  "postcard",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
