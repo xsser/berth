@@ -214,14 +214,27 @@ fn codex_chain_execs_original_with_same_argv() {
     };
     assert_eq!(n.event_type, "agent-turn-complete");
     assert_eq!(n.thread_id.as_deref(), Some("t-1"));
+}
 
-    // Chain target missing: still a silent 0.
+/// Review medium #5: when the chained notify command cannot be executed the
+/// hook reports it like a shell (127) — still silently, still after sending.
+#[test]
+fn codex_chain_exec_failure_exits_127() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let json = r#"{"type":"agent-turn-complete","thread-id":"t-1"}"#;
     let (out, _) = run(
         &["codex", "--chain", "/nonexistent/notifier", json],
         &socket,
         None,
         b"",
     );
+    assert_eq!(out.status.code(), Some(127));
+    assert!(out.stdout.is_empty() && out.stderr.is_empty());
+    let env = envelope(&receive(&listener));
+    assert!(matches!(env.signal, AgentSignal::Codex(_)));
+    // Without --chain there is nothing to fail.
+    let (out, _) = run(&["codex", json], &dir.path().join("x.sock"), None, b"");
     assert_eq!(out.status.code(), Some(0));
-    drop(receive(&listener));
 }

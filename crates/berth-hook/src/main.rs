@@ -109,10 +109,10 @@ fn codex(args: &[String]) -> i32 {
     if let Some(json) = parsed.json {
         cmd.arg(json);
     }
-    // Only returns on failure.
+    // Only returns on failure: report it like a shell would.
     let err = cmd.exec();
     log(format!("exec {program}: {err}"));
-    0
+    127
 }
 
 fn statusline(args: &[String]) -> i32 {
