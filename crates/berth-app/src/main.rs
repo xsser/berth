@@ -5,6 +5,11 @@
 //! (daemon connection + mirrored state), `config`, `keybinds`, `notify`,
 //! `setup_hooks`.
 
+mod config;
+mod ime;
+mod input;
+mod theme;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
