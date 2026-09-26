@@ -27,7 +27,7 @@ use crate::agent_state::{is_valid_external_id, AgentMachine, Signal, HEURISTIC_C
 use crate::config::Config;
 use crate::hooks;
 use crate::outbox::Outbox;
-use crate::session::{self, ActorConfig, ActorHandle, SessionCmd};
+use crate::session::{self, ActorConfig, ActorHandle, SessionCmd, MAX_PENDING_INPUT};
 use crate::view::ConnId;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -605,18 +605,34 @@ impl Manager {
         Ok(())
     }
 
+    /// Queue input for the PTY. Beyond `MAX_PENDING_INPUT` queued bytes
+    /// (the child is not reading) input is dropped; the first drop of an
+    /// episode is logged and answered with an error, later ones silently.
     pub fn input(&self, sid: SessionId, data: Vec<u8>) -> Result<()> {
-        let tx = {
+        let (tx, budget) = {
             let reg = self.reg.lock();
             let e = reg.sessions.get(&sid).ok_or_else(|| unknown(sid))?;
             if !e.meta.is_live() {
                 return Err("session is not live".into());
             }
-            e.actor.as_ref().map(|a| a.tx.clone())
+            let a = e.actor.as_ref().ok_or_else(stopped)?;
+            (a.tx.clone(), a.input.clone())
         };
-        tx.ok_or_else(stopped)?
-            .send(SessionCmd::Input(data))
-            .map_err(|_| stopped())
+        let n = data.len();
+        if !budget.reserve(n) {
+            if budget.first_drop() {
+                tracing::warn!(session = %sid, bytes = n, "session is not reading its input; dropping input");
+                return Err(format!(
+                    "input dropped: session {sid} is not reading its input ({} KiB queued)",
+                    MAX_PENDING_INPUT / 1024
+                ));
+            }
+            return Ok(());
+        }
+        tx.send(SessionCmd::Input(data)).map_err(|_| {
+            budget.release(n);
+            stopped()
+        })
     }
 
     pub async fn fetch_lines(
@@ -764,7 +780,7 @@ impl Manager {
                 .actor
                 .take()
         };
-        if let Some(ActorHandle { tx, join }) = actor {
+        if let Some(ActorHandle { tx, join, .. }) = actor {
             let (reply, rx) = oneshot::channel();
             if tx.send(SessionCmd::Remove { reply }).is_ok() {
                 let _ = rx.await;

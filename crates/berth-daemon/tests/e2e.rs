@@ -972,3 +972,53 @@ async fn hostile_agent_session_id_is_never_resumed() {
     assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
     daemon.join().await;
 }
+
+/// Review medium #7: input for a child that does not read it is capped at
+/// 1 MiB queued; the excess is dropped with a single error, and the session
+/// still finishes normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_for_a_child_that_does_not_read_is_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    // Raw mode: a full tty input queue blocks the writer (canonical mode
+    // would discard instead).
+    let (_ws, meta) = workspace_and_command(
+        &mut c,
+        root.path(),
+        &["/bin/sh", "-c", "stty raw -echo; echo raw-ready; sleep 2"],
+    )
+    .await;
+    let sid = meta.id;
+    let mut screen = attach(&mut c, sid).await;
+    c.screen_until(sid, &mut screen, "raw-ready", |s| {
+        s.rows.values().any(|t| t.contains("raw-ready"))
+    })
+    .await;
+    let chunk = vec![b'x'; 64 * 1024];
+    for _ in 0..40 {
+        c.send(Request::Input {
+            session: sid,
+            data: chunk.clone(),
+        })
+        .await;
+    }
+    let dropped = c
+        .wait_for("input dropped", |m| {
+            matches!(&m.event, Event::Error { message } if message.contains("not reading its input"))
+        })
+        .await;
+    assert!(dropped.reply_to.is_some());
+    // `sleep` ends, the blocked write fails, the queue drains, exit.
+    exited(&mut c, sid).await;
+    let errors: Vec<_> = c
+        .backlog
+        .iter()
+        .filter(|m| matches!(m.event, Event::Error { .. }))
+        .collect();
+    assert!(errors.is_empty(), "warned more than once: {errors:?}");
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}

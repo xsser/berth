@@ -13,6 +13,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -123,6 +124,60 @@ pub(crate) struct ActorConfig {
 pub(crate) struct ActorHandle {
     pub tx: Sender<SessionCmd>,
     pub join: Option<JoinHandle<()>>,
+    pub input: Arc<InputBudget>,
+}
+
+/// Cap on PTY input queued for a session (`SessionCmd::Input` not yet
+/// written). The actor writes synchronously, so input for a child that does
+/// not read it would otherwise pile up without bound. One message is always
+/// admitted into an empty queue, so a single paste larger than the cap still
+/// goes through (memory per session: cap + one frame).
+pub const MAX_PENDING_INPUT: usize = 1024 * 1024;
+
+/// Input bytes handed to the actor but not yet written to the PTY.
+#[derive(Default)]
+pub(crate) struct InputBudget {
+    pending: AtomicUsize,
+    dropping: AtomicBool,
+}
+
+impl InputBudget {
+    /// Account for `n` more bytes; `false` if they exceed the cap.
+    pub fn reserve(&self, n: usize) -> bool {
+        let mut cur = self.pending.load(Ordering::Acquire);
+        loop {
+            if cur != 0 && cur.saturating_add(n) > MAX_PENDING_INPUT {
+                return false;
+            }
+            match self.pending.compare_exchange_weak(
+                cur,
+                cur.saturating_add(n),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(now) => cur = now,
+            }
+        }
+    }
+
+    /// Whether this is the first drop since the queue last drained (warn
+    /// once per episode).
+    pub fn first_drop(&self) -> bool {
+        !self.dropping.swap(true, Ordering::AcqRel)
+    }
+
+    /// `n` reserved bytes were written (or discarded) by the actor.
+    pub fn release(&self, n: usize) {
+        if self.pending.fetch_sub(n, Ordering::AcqRel) == n {
+            self.dropping.store(false, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    fn pending(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
+    }
 }
 
 struct Live {
@@ -166,6 +221,8 @@ pub(crate) struct Actor {
     child_exit_code: Option<i32>,
     journal: Option<JournalWriter>,
     stopped: bool,
+    /// Shared with `ActorHandle::input`; released after each write.
+    input_budget: Arc<InputBudget>,
 }
 
 /// Start a session with a fresh PTY. The receiver yields the spawn result.
@@ -209,6 +266,7 @@ fn start_thread(
     init: impl FnOnce(&mut Actor) -> bool + Send + 'static,
 ) -> std::io::Result<ActorHandle> {
     let (tx, rx) = crossbeam_channel::unbounded();
+    let input = actor.input_budget.clone();
     let join = std::thread::Builder::new()
         .name(format!("session-{}", actor.id.short()))
         .spawn(move || {
@@ -224,6 +282,7 @@ fn start_thread(
     Ok(ActorHandle {
         tx,
         join: Some(join),
+        input,
     })
 }
 
@@ -265,6 +324,7 @@ impl Actor {
             child_exit_code: None,
             journal: None,
             stopped: false,
+            input_budget: Arc::default(),
         }
     }
 
@@ -364,7 +424,10 @@ impl Actor {
 
     fn handle_cmd(&mut self, cmd: SessionCmd) {
         match cmd {
-            SessionCmd::Input(data) => self.input(&data),
+            SessionCmd::Input(data) => {
+                self.input(&data);
+                self.input_budget.release(data.len());
+            }
             SessionCmd::Attach {
                 conn,
                 outbox,
@@ -1200,5 +1263,35 @@ fn wait_exit(pty: &mut PtyHandle, max: Duration) -> Option<i32> {
                 return None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review medium #7: pending input is capped; an empty queue always
+    /// takes one message; one warning per overflow episode.
+    #[test]
+    fn input_budget_caps_pending_bytes() {
+        let b = InputBudget::default();
+        assert!(
+            b.reserve(3 * MAX_PENDING_INPUT),
+            "one big paste into an empty queue"
+        );
+        assert!(!b.reserve(1), "anything behind it waits for the write");
+        assert!(b.first_drop());
+        assert!(!b.first_drop(), "warned once");
+        b.release(3 * MAX_PENDING_INPUT);
+        assert_eq!(b.pending(), 0);
+        assert!(b.first_drop(), "a new episode warns again");
+        b.release(0);
+
+        let chunk = 64 * 1024;
+        let admitted = (0..40).filter(|_| b.reserve(chunk)).count();
+        assert_eq!(admitted, MAX_PENDING_INPUT / chunk);
+        assert_eq!(b.pending(), MAX_PENDING_INPUT);
+        b.release(chunk);
+        assert!(b.reserve(chunk), "room again after a write");
     }
 }
