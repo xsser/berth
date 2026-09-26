@@ -757,7 +757,7 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<Check> {
                 checks.push(Check::new(
                     Level::Fail,
                     "berthd",
-                    format!("可达，但{i}，版本不一致。{}", restart_advice()),
+                    format!("可达，但 {i}，版本不一致。{}", restart_advice()),
                 ));
             } else if absent {
                 checks.push(Check::new(
