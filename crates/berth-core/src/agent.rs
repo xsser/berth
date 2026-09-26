@@ -83,7 +83,18 @@ impl AgentState {
 }
 
 /// Where the current state came from. Priority: Hook > ShellIntegration >
-/// Heuristic; a lower-priority source never overrides `WaitingPermission`.
+/// Heuristic.
+///
+/// Contract (implemented by the daemon's state machine):
+/// - Heuristics (output activity, silence, foreground process) never
+///   override a hook-sourced state and never leave the sticky states
+///   `WaitingPermission`, `WaitingInput`, `Done`, `Error`, `Exited`.
+/// - Shell-integration prompt marks (OSC 133) only appear once the shell is
+///   back at its prompt, i.e. the agent process is gone; they may therefore
+///   end a hook-sourced agent state, but do so as an "agent left" transition
+///   (kind reset to `Shell`) rather than a plain state flip.
+/// - A foreground-process change from an agent to a non-agent is the
+///   heuristic equivalent of the above and takes the same transition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum StateSource {
     #[default]
