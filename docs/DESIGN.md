@@ -241,19 +241,20 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 
 分工（按既有约定）：Fable 5 设计 / 验收 / 审核；opus（effort max）或 codex 在各自 worktree 按 crate 所有权并发实现（`berth-vt` / `berth-daemon` / `berth-app` 三条线，`berth-core` 先冻结接口）。
 
-## 14. 风险与待验证
+## 14. 风险与待验证（2026-09-26 更新）
 
-| 风险 | 影响 | 验证方式 |
+| 风险 | 状态 | 证据 / 验证方式 |
 |---|---|---|
-| alacritty `Handler` 是否有未处理 OSC 回调 | 决定预扫描器去留 | 读 0.26 源码 |
-| alacritty serde 是否覆盖 `Term` 全状态 | 决定 L2 是否需要自有格式（设计已按自有格式） | 编译期验证 |
-| cosmic-text 按 cell 定位是否会破坏连字 / 簇 | 渲染质量 | M0 实测 |
-| winit IME 在 macOS 26 的行为 | 中文输入 | M0 实测 |
-| libghostty-vt 成熟度 | 是否值得作为 D2 备选 | 后台调研结论 |
-| gpui crates.io 停更 | D3 备选可行性 | 后台调研结论 |
-| Claude hooks 2026 新增事件 / 字段 | 状态机覆盖度 | 官方文档核对 |
-| Codex hook 机制 | D6 实现路径 | 官方文档核对 |
-| 快照体积（100k 行长输出） | 磁盘 / 启动耗时 | M4 基准 |
+| alacritty `Handler` 是否有未处理 OSC 回调 | **已否定** → 保留预扫描器 | vte 0.15 `ansi.rs` `osc_dispatch` 未知分支只调 `unhandled()` 打 debug 日志；`Handler` 无 OSC 7 方法 |
+| alacritty serde / damage API | **已肯定** | 0.26.0 源码：`default = ["serde"]`，`Grid`/`Cell` 派生 serde；`Term::damage()` 返回 `TermDamage::{Full, Partial}`，`reset_damage()` |
+| cosmic-text 按 cell 定位是否破坏连字 / 簇 | 待 M0 实测 | app-spike 截图 |
+| winit IME 在 macOS 26 的行为 | 待人工验证 | app-spike 保留 `BERTH_IME_DEBUG` |
+| libghostty-vt 成熟度 | **部分肯定，暂不采用** | 有非官方 Rust 绑定 `libghostty-vt` 0.2.1（MIT OR Apache-2.0）但需联编 Ghostty Zig 源码、pre-1.0 API 漂移；作为 v2 可选 VT 后端 |
+| gpui 备选可行性 | **可行但有缺口** | gpui Apache-2.0（与 Zed GPL 主体分离），gpui-component 有 Sidebar/Tree/Resizable；CJK IME 无成熟证据（第三方 Crux 项目列为待攻克）|
+| Claude hooks 事件 / 字段 | **已肯定** | 约 32 个事件；通用字段含 `prompt_id`；`notification_type` 高置信值 `permission_prompt` / `idle_prompt` / `auth_success` / `elicitation_dialog`，其余低置信值按通用分支处理 |
+| Codex hook 机制 | **旧机制为准** | 稳定版仍是 `notify` argv JSON、仅 `agent-turn-complete`；新 hooks 过渡中（部分 handler 未实现），本期不接入 |
+| 快照体积（100k 行长输出） | 待 M4 基准 | — |
+| 「重启后从磁盘恢复终端内容」无业界先例 | 已确认为差异化点 | wezterm mux 靠进程常驻，跨重启依赖第三方插件；Conductor / Superset / Warp 均未见此能力 |
 
 ## 15. 待用户决策
 
@@ -262,3 +263,12 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 3. v1 范围：是否必须包含 splits / 多窗口 / Linux？（推荐都放 v2）
 4. 项目名与路径：工作名 `berth`（泊位：session 停靠处），路径 `~/projects/berth`；备选 `quay` / `moor` / 自定义。
 5. 许可证：MIT / Apache-2.0 双许可（避免引入 Zed GPL 代码）。
+
+## 16. 调研结论摘要（2026-09-26，来源见调研报告）
+
+- **VT 核心**：alacritty_terminal 0.26（Apache-2.0，Zed 生产使用）为 v1 选择；libghostty-vt 保留为 v2 可选后端。
+- **UI 栈**：D3 按用户决策执行；gpui + gpui-component 作为 M0 失败时的备选，其 Sidebar/Tree 组件契合本项目，CJK IME 需专项验证。
+- **持久化参照**：wezterm mux server 的 SequenceNo 脏区跟踪 + `ClientPane` 缓存远端状态，与本设计的 `seq` + 客户端镜像一致；磁盘快照恢复需自研。
+- **Agent 集成**：Claude 9 个核心事件足以驱动状态机；Codex 短期只用 `notify`；Codex 会话文件 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` 可供 v1.1 会话发现。
+- **竞品范式**：Conductor / Superset / Warp 都采用「workspace 侧栏 + 实时预览 + 状态徽标」；Warp 2026-04 起开源（MIT + AGPLv3）；Crystal 已停更。本项目差异化 = 关窗不杀 agent + 重启后仍可看并恢复内容。
+- **现成终端 widget**：iced_term / egui_term 均标注开发中，不作生产依赖。
