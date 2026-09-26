@@ -729,6 +729,40 @@ fn session_end_is_agent_left_not_exited() {
         (m.info().kind.clone(), m.info().external_id.as_deref()),
         (AgentKind::Claude, Some("new-run"))
     );
+    // The usual exit: Claude idle at its prompt, then `/exit`. Still a new
+    // state (a shell now): source Hook, since = now, reason as detail.
+    assert_eq!(m.info().state, AgentState::Idle);
+    let a = m
+        .apply(
+            &hook_from(
+                "new-run",
+                ClaudeHookEvent::SessionEnd {
+                    reason: Some("prompt_input_exit".into()),
+                },
+            ),
+            T0 + 9,
+        )
+        .unwrap();
+    assert_eq!(
+        (a.kind.as_str(), a.detail.as_deref()),
+        ("hook:SessionEnd", Some("prompt_input_exit"))
+    );
+    let info = m.info();
+    assert_eq!(
+        (
+            info.kind.clone(),
+            info.state.clone(),
+            info.source,
+            info.since_ms
+        ),
+        (
+            AgentKind::Shell,
+            AgentState::Idle,
+            StateSource::Hook,
+            T0 + 9
+        )
+    );
+    assert_eq!(info.external_id.as_deref(), Some("new-run"));
 }
 
 #[test]
