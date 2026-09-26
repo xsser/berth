@@ -1,0 +1,14 @@
+[package]
+name = "berth-core"
+description = "Shared domain types, snapshot format and wire protocol for berth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+uuid.workspace = true
+bitflags.workspace = true
+thiserror.workspace = true
+unicode-width.workspace = true

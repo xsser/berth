@@ -1,0 +1,38 @@
+[package]
+name = "berth-app"
+description = "berth GUI client (winit + wgpu grid renderer + egui sidebar) and CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "berth"
+path = "src/main.rs"
+
+[dependencies]
+berth-core.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+cosmic-text.workspace = true
+swash.workspace = true
+etagere.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+arboard.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+toml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+notify.workspace = true
+unicode-width.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mac-notification-sys.workspace = true

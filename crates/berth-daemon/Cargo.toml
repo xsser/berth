@@ -1,0 +1,25 @@
+[package]
+name = "berth-daemon"
+description = "berthd: session daemon owning PTYs, VT state, agent state and persistence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "berthd"
+path = "src/main.rs"
+
+[dependencies]
+berth-core.workspace = true
+berth-vt.workspace = true
+berth-store.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

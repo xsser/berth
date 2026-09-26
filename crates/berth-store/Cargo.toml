@@ -1,0 +1,17 @@
+[package]
+name = "berth-store"
+description = "SQLite metadata, zstd snapshots and raw journals for berth sessions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+berth-core.workspace = true
+rusqlite.workspace = true
+zstd.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

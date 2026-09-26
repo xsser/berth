@@ -1,0 +1,15 @@
+[package]
+name = "berth-hook"
+description = "Tiny CLI invoked by Claude Code hooks / Codex notify / statusline; forwards events to berthd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "berth-hook"
+path = "src/main.rs"
+
+[dependencies]
+berth-core.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
