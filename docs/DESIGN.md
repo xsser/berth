@@ -286,7 +286,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 
 - `SessionMeta.archived_at_ms: Option<i64>`（追加为最后一个字段，`#[serde(default)]`）。归档与 `Live | Dormant | Restored` 正交，但**归档的 session 一定不是 Live**：归档 live session 时 daemon 先 `kill`（等 PTY 收尾，最长沿用现有 30 s 上限）再打标记。
 - 语义：**归档** = 从 workspace 列表移到侧栏「归档」区，历史、快照、事件、agent 信息原样保留；**恢复** = 清标记，回到原 workspace，以 Dormant/Restored 呈现，Enter/Revive 照旧；**彻底删除** = 现有 `Delete`（purge），需二次确认。
-- 归档的 session：不接受 `Attach`/`Input`/`Resize`/`Revive`/`Subscribe`（返回 `Error`「已归档，先恢复」）；不参与 hook 路由的 cwd 兜底；不计入通知、Dock 角标、「需关注」；`MoveSession`/`Rename` 允许。
+- 归档的 session：不接受 `Attach`/`Input`/`Resize`/`Revive`/`Subscribe`（返回 `Error`「已归档，先恢复」）；不参与 hook 路由的 cwd 兜底；不计入通知、Dock 角标、「需关注」；`MoveSession`/`Rename`/`FetchLines`/`ListEvents`/`MarkRead`/`Delete` 允许（归档区要能读历史、彻底删除）。`Unarchive` 把 `last_active_ms` 刷成当前时间，否则下一轮扫描会立刻把它再归档。`DaemonStatus.sessions_total` 仍是「daemon 知道的全部 session」（含归档）；排除归档的是「需关注」计数与通知。
 - 自动归档（daemon 扫描：启动 60 s 后一次，之后每 10 min）：配置 `[archive] auto_after_days = 7`（0 = 关闭）。条件：`now − last_active_ms > days`，且满足其一：(a) 非 live；(b) live 且 `agent.kind` 不是 agent、`agent.state` 不 busy、且没有前台命令（前台进程就是 shell 本身）。live 的先 kill 再归档。`[archive] purge_after_days = 0`（0 = 永不；>0 时 `now − archived_at_ms > days` 的归档 session 自动 purge）。每次自动归档/清理各写一条 `info!` 日志。
 - 协议 v3（只追加）：`Request::Archive { session }`、`Request::Unarchive { session }` → 成功回 `Event::SessionUpdated(meta)`；daemon 主动归档/清理走现有 `SessionUpdated` / `SessionRemoved` 广播。`PROTOCOL_VERSION = 3`；旧 GUI 对新 daemon 沿用现有 Incompatible/横幅与 `berth debug restart-daemon` 流程。
 - 快照：meta 是 JSON（格式 2），新字段靠 `serde(default)`，格式号不升。registry（SQLite）沿用 `meta_json`，`list_sessions` 保持返回全部（含归档），由客户端过滤。
@@ -296,7 +296,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 
 - 侧栏 session 行：`在右侧分屏打开`、`在下方分屏打开`（已在分屏中时禁用，提示「已在分屏中」）、`重命名…`、`标记已读`、`归档`（live 且 agent 运行/命令忙时二次确认，否则立即）、非 live 时 `恢复运行`（= Revive）。
 - 侧栏「归档」区（折叠标题「归档 (N)」，默认折叠，放在 workspace 列表之后、footer 之前）：每行 = 标题 · workspace 名 · 归档时间（相对）；右键/悬停：`恢复`、`彻底删除…`（确认框沿用现有 Confirm::Delete）。
-- workspace 头：`新建 session`、`重命名…`、`删除 workspace…`（仅当其下无 session 时可用；否则禁用并提示「先归档或移走其中的 session」）。
+- workspace 头：`新建 session`、`重命名…`、`删除 workspace…`（其下还有任何 session 时禁用，**归档的也算**，提示「先移走或彻底删除其中的 session」）。理由：连同归档一起删会产生指向已删 workspace 的孤儿，恢复后无处可归。
 - 终端区域右键：`复制`（有选区时）、`粘贴`、`向右分屏`、`向下分屏`、`从分屏移除`（保留 session）、`关闭 pane`（= ⌘W 语义）、`归档 session`、`重命名…`。程序开启鼠标上报时，⇧+右键透传给程序，普通右键仍开菜单。
 
 ### 17.3 分屏（仅 GUI 侧，daemon 不改）
