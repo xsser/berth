@@ -569,8 +569,8 @@ impl Manager {
     }
 
     /// Refuses while sessions still belong to the workspace, archived ones
-    /// included (DESIGN §17.2): deleting them would purge history, and the
-    /// client must do that explicitly.
+    /// included (DESIGN §17.2), saying how many: deleting them would purge
+    /// history, and the client must do that explicitly.
     pub fn delete_workspace(&self, id: WorkspaceId) -> Result<()> {
         {
             let mut reg = self.reg.lock();
@@ -579,8 +579,17 @@ impl Manager {
             }
             // Archived sessions count too (DESIGN §17.2): deleting the
             // workspace with them would leave orphans nowhere to go.
-            if reg.sessions.values().any(|e| e.meta.workspace == id) {
-                return Err("workspace still has sessions".into());
+            let (left, archived) = reg
+                .sessions
+                .values()
+                .filter(|e| e.meta.workspace == id)
+                .fold((0, 0), |(n, a), e| {
+                    (n + 1, a + usize::from(e.meta.is_archived()))
+                });
+            if left > 0 {
+                return Err(format!(
+                    "workspace 下还有 {left} 个 session（含 {archived} 个已归档），先移走或彻底删除"
+                ));
             }
             reg.workspaces.remove(&id);
         }
@@ -1005,6 +1014,8 @@ impl Manager {
                 return Ok(e.meta.clone());
             }
             e.meta.archived_at_ms = None;
+            // Otherwise the next scan archives it again at once: it was
+            // archived for being idle (DESIGN §17.1).
             e.meta.last_active_ms = now;
             e.meta.clone()
         };
@@ -1967,7 +1978,8 @@ mod tests {
     }
 
     /// DESIGN §17.2: archived sessions keep their workspace like any other
-    /// session. It is deleted only once none is left, moved away or purged.
+    /// session. It is deleted only once none is left, moved away or purged;
+    /// the refusal says how many are left and how many are archived.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn archived_sessions_keep_their_workspace() {
         let dir = tempfile::tempdir().unwrap();
@@ -1978,25 +1990,65 @@ mod tests {
         let other = mgr
             .create_workspace("other".into(), dir.path().to_path_buf())
             .unwrap();
+        let kept = shell(&mgr, ws.id).await;
         let moved = shell(&mgr, ws.id).await;
         let purged = shell(&mgr, ws.id).await;
         mgr.archive(moved).await.unwrap();
         mgr.archive(purged).await.unwrap();
-        assert_eq!(
-            mgr.delete_workspace(ws.id).unwrap_err(),
-            "workspace still has sessions"
-        );
-        mgr.move_session(moved, other.id, 0).unwrap();
-        assert_eq!(
-            mgr.delete_workspace(ws.id).unwrap_err(),
-            "workspace still has sessions"
-        );
+        let refusal = |n: usize, m: usize| {
+            format!("workspace 下还有 {n} 个 session（含 {m} 个已归档），先移走或彻底删除")
+        };
+        assert_eq!(mgr.delete_workspace(ws.id).unwrap_err(), refusal(3, 2));
+        mgr.move_session(kept, other.id, 0).unwrap();
+        mgr.move_session(moved, other.id, 1).unwrap();
+        assert_eq!(mgr.delete_workspace(ws.id).unwrap_err(), refusal(1, 1));
         mgr.delete_session(purged).await.unwrap();
         mgr.delete_workspace(ws.id).unwrap();
         let left: Vec<_> = mgr.list_workspaces().iter().map(|w| w.id).collect();
         assert_eq!(left, vec![other.id]);
         let m = mgr.meta(moved).unwrap();
         assert!(m.is_archived() && m.workspace == other.id, "{m:?}");
+        mgr.shutdown().await;
+    }
+
+    /// Unarchive sets `last_active_ms` to now: with a threshold of seconds
+    /// (`auto_after_days = 0.0001`, 8.64 s), a session archived by the scan
+    /// for being idle is not archived again by the scan right after it is
+    /// restored; the threshold still applies, counted from the restore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_right_after_unarchive_does_not_archive_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::parse("[archive]\nauto_after_days = 0.0001\n").unwrap();
+        assert_eq!(config.archive.auto_after_ms(), Some(8_640));
+        let mgr = test_manager(dir.path(), config);
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        mgr.kill(sid).unwrap();
+        exited(&mgr, sid).await;
+        // Idle for long: the scan archives it.
+        mgr.reg
+            .lock()
+            .sessions
+            .get_mut(&sid)
+            .unwrap()
+            .meta
+            .last_active_ms = 1;
+        let done = mgr.scan_archive(&now_ms).await;
+        assert!(
+            matches!(done.as_slice(), [(s, ScanAction::Archive { live: false, .. })] if *s == sid),
+            "{done:?}"
+        );
+        mgr.unarchive(sid).unwrap();
+        assert!(
+            mgr.scan_archive(&now_ms).await.is_empty(),
+            "not archived again right away"
+        );
+        assert!(!mgr.meta(sid).unwrap().is_archived());
+        let later = || now_ms() + 10_000;
+        assert_eq!(mgr.scan_archive(&later).await.len(), 1);
+        assert!(mgr.meta(sid).unwrap().is_archived());
         mgr.shutdown().await;
     }
 
