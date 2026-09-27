@@ -1088,44 +1088,51 @@ async fn the_agent_that_left_is_resumed_even_after_a_restart() {
 /// the agent survive the upgrade.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_format_1_snapshot_of_an_older_berthd_is_restored() {
+    // Written by the berthd of main c606246 (M2: snapshot format 1) for a
+    // session with simulated Claude hooks.
     let file = include_bytes!("fixtures/format1-claude.bin.zst");
-    let raw = zstd::stream::decode_all(&file[..]).unwrap();
-    let old = berth_core::snapshot::v1::decode(&raw).unwrap();
-    let meta = old.session.clone();
-    let a = &meta.agent;
-    let id = "0f8c2e1a-1111-4222-8333-000000000f01";
-    assert_eq!(
-        (
-            &a.kind,
-            a.external_id.as_deref(),
-            a.model.as_deref(),
-            a.context_pct,
-            a.cost_usd
-        ),
-        (
-            &AgentKind::Claude,
-            Some(id),
-            Some("claude-opus-5-5"),
-            Some(12.0),
-            Some(0.04)
-        )
-    );
-    assert_eq!(
-        (a.state.clone(), a.source),
-        (AgentState::Thinking, StateSource::Hook)
-    );
-    let transcript = format!("/tmp/berth-m3/v1fix/projects/-w/{id}.jsonl");
-    assert_eq!(a.transcript_path.as_deref(), Some(Path::new(&transcript)));
-    assert_eq!(
-        (meta.title_user.as_deref(), meta.cols, meta.rows),
-        (Some("v1-claude"), 90, 20)
-    );
-
+    let sid: SessionId = "f72f6b6f-0724-4534-b6d4-55efc64119e2".parse().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::in_dir(dir.path());
     paths.ensure_dirs().unwrap();
-    {
+    std::fs::create_dir_all(&paths.snapshots_dir).unwrap();
+    std::fs::write(paths.snapshot_file(&sid), file).unwrap();
+    let id = "0f8c2e1a-1111-4222-8333-000000000f01";
+    let meta = {
         let store = berth_store::Store::open(&paths).unwrap();
+        // berth-store reads it into the current types.
+        let old = store.read_snapshot(sid).unwrap().expect("the fixture");
+        assert_eq!(old.format_version, 1);
+        let meta = old.session;
+        let a = &meta.agent;
+        assert_eq!(
+            (
+                &a.kind,
+                a.external_id.as_deref(),
+                a.model.as_deref(),
+                a.context_pct,
+                a.cost_usd,
+                &a.last_agent
+            ),
+            (
+                &AgentKind::Claude,
+                Some(id),
+                Some("claude-opus-5-5"),
+                Some(12.0),
+                Some(0.04),
+                &None
+            )
+        );
+        assert_eq!(
+            (a.state.clone(), a.source),
+            (AgentState::Thinking, StateSource::Hook)
+        );
+        let transcript = format!("/tmp/berth-m3/v1fix/projects/-w/{id}.jsonl");
+        assert_eq!(a.transcript_path.as_deref(), Some(Path::new(&transcript)));
+        assert_eq!(
+            (meta.title_user.as_deref(), meta.cols, meta.rows),
+            (Some("v1-claude"), 90, 20)
+        );
         let ws = Workspace {
             id: meta.workspace,
             name: "work".into(),
@@ -1136,13 +1143,8 @@ async fn a_format_1_snapshot_of_an_older_berthd_is_restored() {
         };
         store.upsert_workspace(&ws).unwrap();
         store.upsert_session(&meta).unwrap();
-        std::fs::create_dir_all(&paths.snapshots_dir).unwrap();
-        std::fs::write(paths.snapshot_file(&meta.id), file).unwrap();
-        assert!(matches!(
-            store.read_snapshot(meta.id),
-            Err(berth_store::StoreError::Format { found: 1, .. })
-        ));
-    }
+        meta
+    };
     let daemon = start_daemon(&paths);
     let mut c = Client::connect(&paths.socket).await;
     let restored = session_meta(&mut c, meta.id).await;

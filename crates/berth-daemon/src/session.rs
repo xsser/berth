@@ -24,11 +24,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use berth_core::{
-    now_ms, CursorState, DaemonMsg, Dims, Event, LineSnapshot, Paths, PersistPolicy, ScreenUpdate,
+    now_ms, CursorState, DaemonMsg, Dims, Event, LineSnapshot, PersistPolicy, ScreenUpdate,
     SessionId, SessionMeta, SessionSnapshotFile, StyleInterner, StyleTable, SubscribeMode,
     TermModes, SNAPSHOT_FORMAT_VERSION,
 };
-use berth_store::{JournalWriter, StoreError};
+use berth_store::JournalWriter;
 use berth_vt::{
     Damage, OscEvent, ProcessOutcome, PtyHandle, PtyOutput, PtySpawn, TermEvent, Terminal,
     TerminalConfig, KILL_GRACE,
@@ -349,16 +349,16 @@ impl Actor {
     }
 
     fn load_restored(&mut self) {
-        let snap = match self.mgr.store.read_snapshot(self.id) {
-            // Left by a berthd of M1 / M2 (e.g. the one a restart replaced):
-            // berth-store reads only the current format.
-            Err(StoreError::Format { found: 1, .. }) => {
-                read_format_1(self.mgr.store.paths(), self.id).map(Some)
-            }
-            other => other.map_err(|e| e.to_string()),
-        };
-        match snap {
+        match self.mgr.store.read_snapshot(self.id) {
             Ok(Some(snap)) => {
+                if snap.format_version != SNAPSHOT_FORMAT_VERSION {
+                    // Left by an older berthd (the one a restart replaced).
+                    tracing::info!(
+                        session = %self.id,
+                        format = snap.format_version,
+                        "snapshot read in an older format"
+                    );
+                }
                 let (prefix, table) = prefix_from_snapshot(snap, self.cfg.max_restored_lines);
                 self.prefix = prefix;
                 self.restored_styles = StyleInterner::from_table(table);
@@ -1490,26 +1490,6 @@ fn spawn_kill_watchdog(id: SessionId, pty: Weak<RwLock<PtyHandle>>, pid: u32) {
     if let Err(e) = spawned {
         tracing::warn!(session = %id, error = %e, "cannot start the kill watchdog thread");
     }
-}
-
-/// A format 1 snapshot (M1 / M2, before `AgentInfo::last_agent`), read the
-/// way berth-store writes files (zstd, then postcard) with the old layout.
-fn read_format_1(paths: &Paths, id: SessionId) -> Result<SessionSnapshotFile, String> {
-    let path = paths.snapshot_file(&id);
-    let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let raw = zstd::stream::decode_all(&bytes[..])
-        .map_err(|e| format!("{}: zstd: {e}", path.display()))?;
-    let snap = berth_core::snapshot::v1::decode(&raw)
-        .map_err(|e| format!("{}: format 1: {e}", path.display()))?;
-    if snap.session.id != id {
-        return Err(format!(
-            "{} contains session {}",
-            path.display(),
-            snap.session.id
-        ));
-    }
-    tracing::info!(session = %id, "read a format 1 snapshot");
-    Ok(snap)
 }
 
 #[cfg(test)]

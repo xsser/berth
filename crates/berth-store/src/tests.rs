@@ -199,20 +199,192 @@ fn snapshot_roundtrip_20k_lines_atomic_and_private() {
     assert_eq!(store.read_snapshot(meta.id).unwrap().unwrap(), smaller);
 }
 
+/// `raw` (uncompressed) as the snapshot file of `id`, the way the store
+/// writes it.
+fn put_snapshot_file(store: &Store, id: SessionId, raw: &[u8]) {
+    std::fs::create_dir_all(&store.paths().snapshots_dir).unwrap();
+    let compressed = zstd::bulk::compress(raw, SNAPSHOT_ZSTD_LEVEL).unwrap();
+    std::fs::write(store.paths().snapshot_file(&id), compressed).unwrap();
+}
+
+/// The format version the snapshot file of `id` is in.
+fn format_on_disk(store: &Store, id: SessionId) -> u32 {
+    let bytes = std::fs::read(store.paths().snapshot_file(&id)).unwrap();
+    let raw = zstd::stream::decode_all(&bytes[..]).unwrap();
+    postcard::take_from_bytes::<u32>(&raw).unwrap().0
+}
+
+/// `m` in the layout of snapshot format 1 (no `last_agent`).
+fn v1_meta(m: &SessionMeta) -> v1::SessionMeta {
+    let a = &m.agent;
+    v1::SessionMeta {
+        id: m.id,
+        workspace: m.workspace,
+        title_auto: m.title_auto.clone(),
+        title_user: m.title_user.clone(),
+        cwd: m.cwd.clone(),
+        command: m.command.clone(),
+        env: m.env.clone(),
+        status: m.status.clone(),
+        agent: v1::AgentInfo {
+            kind: a.kind.clone(),
+            external_id: a.external_id.clone(),
+            transcript_path: a.transcript_path.clone(),
+            model: a.model.clone(),
+            context_pct: a.context_pct,
+            cost_usd: a.cost_usd,
+            state: a.state.clone(),
+            since_ms: a.since_ms,
+            source: a.source,
+            confidence: a.confidence,
+        },
+        created_at_ms: m.created_at_ms,
+        last_active_ms: m.last_active_ms,
+        unread: m.unread,
+        persist: m.persist,
+        order: m.order,
+        cols: m.cols,
+        rows: m.rows,
+    }
+}
+
+/// A file a berthd of M1 / M2 wrote (format 1: the session as postcard,
+/// no `last_agent`) is read into the current types; saved again, it is
+/// format 2.
+#[test]
+fn a_format_1_snapshot_is_read_into_the_current_types() {
+    let (_dir, store) = setup();
+    let mut meta = session(WorkspaceId::new(), 0);
+    meta.agent.transcript_path = Some("/p/-w/abc-123.jsonl".into());
+    meta.agent.model = Some("Opus".into());
+    let current = snapshot(&meta, 50);
+    let old = v1::SessionSnapshotFile {
+        format_version: 1,
+        saved_at_ms: current.saved_at_ms,
+        session: v1_meta(&meta),
+        styles: current.styles.clone(),
+        history: current.history.clone(),
+        screen: current.screen.clone(),
+    };
+    put_snapshot_file(&store, meta.id, &postcard::to_stdvec(&old).unwrap());
+
+    let back = store.read_snapshot(meta.id).unwrap().unwrap();
+    assert_eq!(back.format_version, 1);
+    assert_eq!(back.saved_at_ms, old.saved_at_ms);
+    assert_eq!(back.session.agent.last_agent, None);
+    assert_eq!(back.session, meta);
+    assert_eq!(back.history.len(), old.history.len());
+    for (i, (got, want)) in back.history.iter().zip(&old.history).enumerate() {
+        assert_eq!(got, want, "history line {i}");
+    }
+    assert_eq!(back.screen, old.screen);
+    assert_eq!(back.styles, old.styles);
+
+    store.write_snapshot(&back).unwrap();
+    assert_eq!(format_on_disk(&store, meta.id), 2);
+    let again = store.read_snapshot(meta.id).unwrap().unwrap();
+    assert_eq!(again.format_version, 2);
+    assert_eq!(
+        SessionSnapshotFile {
+            format_version: 1,
+            ..again
+        },
+        back
+    );
+}
+
+/// Format 2 round trip, whatever version the snapshot was read in; the
+/// session goes in as JSON.
+#[test]
+fn snapshots_are_written_as_format_2_with_the_session_as_json() {
+    let (_dir, store) = setup();
+    let mut meta = session(WorkspaceId::new(), 0);
+    meta.agent.kind = AgentKind::Shell;
+    meta.agent.last_agent = Some(AgentKind::Codex);
+    let mut snap = snapshot(&meta, 5);
+    snap.format_version = 1;
+    store.write_snapshot(&snap).unwrap();
+    assert_eq!(format_on_disk(&store, meta.id), 2);
+    let bytes = std::fs::read(store.paths().snapshot_file(&meta.id)).unwrap();
+    let raw = zstd::stream::decode_all(&bytes[..]).unwrap();
+    let file: FileV2 = postcard::from_bytes(&raw).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&file.session_json).unwrap();
+    assert_eq!(json["agent"]["last_agent"], "Codex");
+    let back = store.read_snapshot(meta.id).unwrap().unwrap();
+    assert_eq!(
+        back,
+        SessionSnapshotFile {
+            format_version: 2,
+            ..snap
+        }
+    );
+}
+
+/// Why the session is JSON in format 2: a field missing from the file
+/// (written before it existed) reads as its default, one the file has but
+/// this build does not know (written by a newer one) is ignored. Neither
+/// needs a new format version.
+#[test]
+fn session_fields_added_later_need_no_new_format() {
+    let (_dir, store) = setup();
+    let meta = session(WorkspaceId::new(), 0);
+    let snap = snapshot(&meta, 3);
+    let mut json = serde_json::to_value(&meta).unwrap();
+    let agent = json["agent"].as_object_mut().unwrap();
+    assert!(agent.remove("last_agent").is_some());
+    agent.insert("from_a_newer_build".into(), 7.into());
+    let file = FileV2Out {
+        format_version: 2,
+        saved_at_ms: snap.saved_at_ms,
+        session_json: json.to_string(),
+        styles: &snap.styles,
+        history: &snap.history,
+        screen: &snap.screen,
+    };
+    put_snapshot_file(&store, meta.id, &postcard::to_stdvec(&file).unwrap());
+    let back = store.read_snapshot(meta.id).unwrap().unwrap();
+    assert_eq!(back.session.agent.last_agent, None);
+    assert_eq!(back, snap);
+}
+
 #[test]
 fn snapshot_format_version_is_checked() {
     let (_dir, store) = setup();
     let meta = session(WorkspaceId::new(), 0);
-    let mut snap = snapshot(&meta, 1);
-    snap.format_version = SNAPSHOT_FORMAT_VERSION + 1;
-    store.write_snapshot(&snap).unwrap();
-    match store.read_snapshot(meta.id) {
-        Err(StoreError::Format { found, want }) => {
-            assert_eq!(found, SNAPSHOT_FORMAT_VERSION + 1);
-            assert_eq!(want, SNAPSHOT_FORMAT_VERSION);
+    let snap = snapshot(&meta, 1);
+    let file = FileV2Out {
+        format_version: 2,
+        saved_at_ms: snap.saved_at_ms,
+        session_json: serde_json::to_string(&meta).unwrap(),
+        styles: &snap.styles,
+        history: &snap.history,
+        screen: &snap.screen,
+    };
+    for found in [0, 3, 99] {
+        let file = FileV2Out {
+            format_version: found,
+            session_json: file.session_json.clone(),
+            ..file
+        };
+        put_snapshot_file(&store, meta.id, &postcard::to_stdvec(&file).unwrap());
+        match store.read_snapshot(meta.id) {
+            Err(StoreError::Format { found: f, want }) => {
+                assert_eq!(f, found);
+                assert_eq!(want, SNAPSHOT_FORMAT_VERSION);
+            }
+            other => panic!("expected format error for {found}, got {other:?}"),
         }
-        other => panic!("expected format error, got {other:?}"),
     }
+    // A session that does not decode: an error quoting no value (serde_json
+    // would quote the string here).
+    let file = FileV2Out {
+        session_json: "{\"cols\": \"secret-title\"}".into(),
+        ..file
+    };
+    put_snapshot_file(&store, meta.id, &postcard::to_stdvec(&file).unwrap());
+    let err = store.read_snapshot(meta.id).unwrap_err().to_string();
+    assert!(err.contains("snapshot session"), "{err}");
+    assert!(!err.contains("secret-title"), "{err}");
     // Garbage is a codec/io error, not a panic.
     std::fs::write(store.paths().snapshot_file(&meta.id), b"not zstd").unwrap();
     assert!(store.read_snapshot(meta.id).is_err());

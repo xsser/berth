@@ -28,10 +28,14 @@ pub use style::*;
 /// - 2: M3: `ListEvents` / `ResumeCommand` and their answers,
 ///   `AgentInfo::last_agent`.
 pub const PROTOCOL_VERSION: u32 = 2;
-/// On-disk snapshot format version (`SessionSnapshotFile`). postcard is
-/// positional: a field added to any type in the file changes its layout.
-/// - 1: M1 / M2 (read with [`snapshot::v1`]).
-/// - 2: M3: `AgentInfo::last_agent`.
+/// On-disk snapshot format version (berth-store's `snapshots/<sid>.bin.zst`,
+/// zstd over postcard). postcard is positional: a field added to a type it
+/// encodes changes the layout.
+/// - 1: M1 / M2: `SessionSnapshotFile` as postcard ([`snapshot::v1`]).
+/// - 2: M3: the same envelope with the session (`SessionMeta`, which gained
+///   `AgentInfo::last_agent`) as a JSON string, so a field added to it with
+///   `#[serde(default)]` needs no new version (as in the SQLite metadata);
+///   styles, history and screen stay postcard.
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 /// Milliseconds since the Unix epoch.

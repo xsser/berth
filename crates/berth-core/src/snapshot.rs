@@ -168,7 +168,10 @@ pub struct ScreenSnapshot {
     pub title: String,
 }
 
-/// On-disk snapshot of one session (`SNAPSHOT_FORMAT_VERSION`).
+/// On-disk snapshot of one session, as berth-store reads and writes it
+/// (the file layouts are listed at [`crate::SNAPSHOT_FORMAT_VERSION`]).
+/// `format_version` is the format the file was read in; berth-store always
+/// writes the current one.
 ///
 /// Lifecycle across daemon restarts:
 /// - While live: `history` = restored prefix from earlier lives ++ current
@@ -186,14 +189,15 @@ pub struct SessionSnapshotFile {
     pub screen: Option<ScreenSnapshot>,
 }
 
-/// Snapshot files of format 1, written before `AgentInfo::last_agent`
-/// existed. postcard is positional, so the added field moved everything
-/// after it; these are the old layouts, read into the current types with
-/// `last_agent: None`.
+/// Format 1 (M1 / M2), from before `AgentInfo::last_agent`: the whole
+/// `SessionSnapshotFile` as postcard, which is positional, so the added
+/// field moved everything after it. These are the layouts of then (fields
+/// in the same order), for berth-store to read such files into the current
+/// types (`last_agent: None`), and for tests to write them.
 pub mod v1 {
     use std::path::PathBuf;
 
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
     use super::{LineSnapshot, ScreenSnapshot};
     use crate::style::StyleTable;
@@ -201,53 +205,48 @@ pub mod v1 {
         AgentKind, AgentState, PersistPolicy, SessionId, SessionStatus, StateSource, WorkspaceId,
     };
 
-    /// Decode a decompressed format 1 file.
-    pub fn decode(raw: &[u8]) -> Result<super::SessionSnapshotFile, postcard::Error> {
-        postcard::from_bytes::<SessionSnapshotFile>(raw).map(Into::into)
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct SessionSnapshotFile {
+        pub format_version: u32,
+        pub saved_at_ms: i64,
+        pub session: SessionMeta,
+        pub styles: StyleTable,
+        pub history: Vec<LineSnapshot>,
+        pub screen: Option<ScreenSnapshot>,
     }
 
-    #[derive(Deserialize)]
-    struct SessionSnapshotFile {
-        format_version: u32,
-        saved_at_ms: i64,
-        session: SessionMeta,
-        styles: StyleTable,
-        history: Vec<LineSnapshot>,
-        screen: Option<ScreenSnapshot>,
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct SessionMeta {
+        pub id: SessionId,
+        pub workspace: WorkspaceId,
+        pub title_auto: String,
+        pub title_user: Option<String>,
+        pub cwd: PathBuf,
+        pub command: Vec<String>,
+        pub env: Vec<(String, String)>,
+        pub status: SessionStatus,
+        pub agent: AgentInfo,
+        pub created_at_ms: i64,
+        pub last_active_ms: i64,
+        pub unread: bool,
+        pub persist: PersistPolicy,
+        pub order: u32,
+        pub cols: u16,
+        pub rows: u16,
     }
 
-    #[derive(Deserialize)]
-    struct SessionMeta {
-        id: SessionId,
-        workspace: WorkspaceId,
-        title_auto: String,
-        title_user: Option<String>,
-        cwd: PathBuf,
-        command: Vec<String>,
-        env: Vec<(String, String)>,
-        status: SessionStatus,
-        agent: AgentInfo,
-        created_at_ms: i64,
-        last_active_ms: i64,
-        unread: bool,
-        persist: PersistPolicy,
-        order: u32,
-        cols: u16,
-        rows: u16,
-    }
-
-    #[derive(Deserialize)]
-    struct AgentInfo {
-        kind: AgentKind,
-        external_id: Option<String>,
-        transcript_path: Option<PathBuf>,
-        model: Option<String>,
-        context_pct: Option<f32>,
-        cost_usd: Option<f64>,
-        state: AgentState,
-        since_ms: i64,
-        source: StateSource,
-        confidence: f32,
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct AgentInfo {
+        pub kind: AgentKind,
+        pub external_id: Option<String>,
+        pub transcript_path: Option<PathBuf>,
+        pub model: Option<String>,
+        pub context_pct: Option<f32>,
+        pub cost_usd: Option<f64>,
+        pub state: AgentState,
+        pub since_ms: i64,
+        pub source: StateSource,
+        pub confidence: f32,
     }
 
     impl From<SessionSnapshotFile> for super::SessionSnapshotFile {
@@ -367,11 +366,8 @@ mod tests {
         let at = raw.windows(agent.len()).position(|w| w == agent).unwrap();
         raw.remove(at + agent.len() - 1);
 
-        assert_eq!(v1::decode(&raw).unwrap(), want);
-        // Read as the current format, the same bytes do not come out right:
-        // that is why the format version moved.
-        let as_current = postcard::from_bytes::<SessionSnapshotFile>(&raw).ok();
-        assert_ne!(as_current, Some(want));
+        let read = postcard::from_bytes::<v1::SessionSnapshotFile>(&raw).unwrap();
+        assert_eq!(SessionSnapshotFile::from(read), want);
     }
 
     #[test]
