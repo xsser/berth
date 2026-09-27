@@ -22,10 +22,21 @@ pub use session::*;
 pub use snapshot::*;
 pub use style::*;
 
-/// Wire protocol version. Bump on any incompatible change to `protocol`.
-pub const PROTOCOL_VERSION: u32 = 1;
-/// On-disk snapshot format version (`SessionSnapshotFile`).
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+/// Wire protocol version, checked by `Hello`. Bump on any change to the
+/// protocol messages or the types they carry.
+/// - 1: M1 / M2.
+/// - 2: M3: `ListEvents` / `ResumeCommand` and their answers,
+///   `AgentInfo::last_agent`.
+pub const PROTOCOL_VERSION: u32 = 2;
+/// On-disk snapshot format version (berth-store's `snapshots/<sid>.bin.zst`,
+/// zstd over postcard). postcard is positional: a field added to a type it
+/// encodes changes the layout.
+/// - 1: M1 / M2: `SessionSnapshotFile` as postcard ([`snapshot::v1`]).
+/// - 2: M3: the same envelope with the session (`SessionMeta`, which gained
+///   `AgentInfo::last_agent`) as a JSON string, so a field added to it with
+///   `#[serde(default)]` needs no new version (as in the SQLite metadata);
+///   styles, history and screen stay postcard.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 /// Milliseconds since the Unix epoch.
 pub fn now_ms() -> i64 {

@@ -7,28 +7,33 @@
 //! connection), `controller` (protocol state), `session_view` (screen and
 //! history mirror), `renderer/{grid, atlas, text, metrics, sprites,
 //! shaders.wgsl}`, `sidebar` (egui), `input` (key encoding), `ime`, `mouse`,
-//! `paste`, `selection`, `notify`, `cli` (list / doctor / debug), `fixture`
-//! (`--bench` data), `theme`, `config`, `stats`.
+//! `paste`, `selection`, `notify`, `dock` (Dock badge), `cli` (list / doctor
+//! / debug), `setup_hooks`, `fixture` (`--bench` data), `theme`, `timefmt`,
+//! `config`, `stats`.
 
 mod app;
 mod cli;
 mod client;
 mod config;
 mod controller;
+mod dock;
 mod fixture;
 mod ime;
 mod input;
+mod mismatch;
 mod mouse;
 mod notify;
 mod paste;
 mod renderer;
 mod selection;
 mod session_view;
+mod setup_hooks;
 mod sidebar;
 mod stats;
 #[cfg(test)]
 mod testutil;
 mod theme;
+mod timefmt;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -97,6 +102,14 @@ struct GuiArgs {
     /// Inject a synthetic IME preedit at startup (screenshot check only).
     #[arg(long, hide = true, value_name = "TEXT")]
     demo_preedit: Option<String>,
+    /// Show this live session's hover details without a pointer
+    /// (screenshot check only; id or unique prefix).
+    #[arg(long, hide = true, value_name = "ID")]
+    demo_hover: Option<String>,
+    /// Press 「重启 berthd」 as soon as the version-mismatch banner shows
+    /// (end-to-end check only).
+    #[arg(long, hide = true)]
+    demo_restart: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -156,9 +169,10 @@ fn parse_cells(s: &str) -> std::result::Result<(u16, u16), String> {
 enum Cmd {
     /// List workspaces and sessions known to the daemon.
     List,
-    /// Install / preview / undo Claude Code and Codex hook entries (M3;
-    /// not implemented, writes nothing).
-    SetupHooks,
+    /// Show / install / undo berth's hook entries for Claude Code
+    /// (~/.claude/settings.json) or Codex (~/.codex/config.toml). Only
+    /// `--yes` writes, after a backup.
+    SetupHooks(setup_hooks::Args),
     /// Read-only checks: daemon, socket permissions, hooks, login PATH.
     Doctor,
     /// Scripted checks against a running daemon.
@@ -179,9 +193,11 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::List) => cli::list(&Paths::resolve()),
         Some(Cmd::Doctor) => cli::doctor(&Paths::resolve()),
         Some(Cmd::Debug(cmd)) => cli::debug(&Paths::resolve(), cmd),
-        Some(Cmd::SetupHooks) => anyhow::bail!(
-            "berth setup-hooks 属于 M3，尚未实现；没有写入任何文件（~/.claude、~/.codex 均未改动）"
-        ),
+        Some(Cmd::SetupHooks(args)) => {
+            let report = setup_hooks::run(&args, &setup_hooks::Env::from_process()?)?;
+            print!("{report}");
+            Ok(())
+        }
     }
 }
 
@@ -204,6 +220,8 @@ fn gui_options(gui: GuiArgs) -> app::GuiOptions {
         no_vsync: gui.no_vsync,
         cursor_style: gui.cursor_style.map(CursorShape::from),
         demo_preedit: gui.demo_preedit,
+        demo_hover: gui.demo_hover,
+        demo_restart: gui.demo_restart,
     }
 }
 

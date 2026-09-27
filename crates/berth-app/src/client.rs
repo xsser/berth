@@ -15,6 +15,9 @@
 //!   thread drains a bounded channel of encoded frames. Request ids are
 //!   allocated here; the controller matches `reply_to` against what it asked.
 //! - [`SyncClient`]: blocking request / reply for the CLI subcommands.
+//! - [`Incompatible`]: the daemon speaks another protocol version (an older
+//!   or newer berthd is still running). [`stop_daemon`] shuts it down by
+//!   speaking its version; [`connect_or_spawn`] then starts this build's.
 
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -46,6 +49,37 @@ const WRITE_QUEUE: usize = 4096;
 const READ_BUF: usize = 64 * 1024;
 /// Unsolicited messages a `SyncClient` keeps while waiting for a reply.
 const SYNC_BACKLOG: usize = 1024;
+/// Longest wait for a stopped berthd to go: its sessions get up to 5 s to
+/// write their final snapshots, then it removes the socket and exits.
+pub const STOP_WAIT: Duration = Duration::from_secs(6);
+
+/// What restarting berthd does to the sessions (GUI, `berth doctor`, CLI).
+pub const RESTART_EFFECT: &str = "重启时旧 berthd 先保存各会话的快照再退出，\
+     这些会话随后以休眠 / 已恢复状态出现：历史保留，其中运行的程序会结束，可 Revive";
+
+/// berthd answered `Hello` with another protocol version: a daemon of an
+/// older or newer build is still running, and only restarting it helps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Incompatible {
+    pub daemon: u32,
+}
+
+impl std::fmt::Display for Incompatible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "berthd 协议 v{}，本客户端协议 v{PROTOCOL_VERSION}",
+            self.daemon
+        )
+    }
+}
+
+impl std::error::Error for Incompatible {}
+
+/// The [`Incompatible`] behind an error, if that is what it is.
+pub fn incompatible(e: &anyhow::Error) -> Option<Incompatible> {
+    e.downcast_ref::<Incompatible>().copied()
+}
 
 /// What the reader thread reports.
 #[derive(Debug)]
@@ -174,8 +208,19 @@ fn read_loop(
 }
 
 /// `Hello` first (integrate.md §6); returns the daemon version and any bytes
-/// that arrived after its answer.
+/// that arrived after its answer. Another protocol version is an
+/// [`Incompatible`] error.
 fn handshake(stream: &mut UnixStream, role: ClientRole) -> Result<(String, FrameReader)> {
+    handshake_as(stream, role, PROTOCOL_VERSION)
+}
+
+/// [`handshake`] claiming `protocol` ([`stop_daemon`] speaks an older
+/// daemon's version to reach `Shutdown`).
+fn handshake_as(
+    stream: &mut UnixStream,
+    role: ClientRole,
+    protocol: u32,
+) -> Result<(String, FrameReader)> {
     stream
         .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
         .context("setting the handshake timeout")?;
@@ -183,7 +228,7 @@ fn handshake(stream: &mut UnixStream, role: ClientRole) -> Result<(String, Frame
         id: 0,
         req: Request::Hello {
             role,
-            protocol: PROTOCOL_VERSION,
+            protocol,
             client_version: env!("CARGO_PKG_VERSION").to_string(),
         },
     };
@@ -209,21 +254,24 @@ fn handshake(stream: &mut UnixStream, role: ClientRole) -> Result<(String, Frame
             Err(e) => return Err(e).context("reading the answer to Hello"),
         }
     };
-    stream
-        .set_read_timeout(None)
-        .context("clearing the handshake timeout")?;
     match msg.event {
         Event::Hello {
             daemon_version,
-            protocol,
-        } if protocol == PROTOCOL_VERSION => Ok((daemon_version, frames)),
-        Event::Hello { protocol, .. }
+            protocol: spoken,
+        } if spoken == protocol => {
+            // Only now: a refusing daemon has already closed the socket, and
+            // setsockopt on it fails (EINVAL on macOS), hiding the refusal.
+            stream
+                .set_read_timeout(None)
+                .context("clearing the handshake timeout")?;
+            Ok((daemon_version, frames))
+        }
+        Event::Hello {
+            protocol: daemon, ..
+        }
         | Event::Incompatible {
-            daemon_protocol: protocol,
-        } => bail!(
-            "berthd speaks protocol {protocol}, this berth speaks {PROTOCOL_VERSION}; \
-             restart the daemon with the matching version"
-        ),
+            daemon_protocol: daemon,
+        } => Err(Incompatible { daemon }.into()),
         Event::Error { message } => bail!("berthd refused the connection: {message}"),
         other => bail!("unexpected answer to Hello: {other:?}"),
     }
@@ -281,7 +329,9 @@ impl SyncClient {
     }
 
     /// First message (queued ones first) matching `pred` before `deadline`;
-    /// `None` on timeout. Other messages are kept for later calls.
+    /// `None` on timeout. Other messages are kept for later calls, except
+    /// the one saying berthd could not decode what was sent: then nothing
+    /// is coming, and this fails at once.
     pub fn wait_for(
         &mut self,
         deadline: Instant,
@@ -294,6 +344,11 @@ impl SyncClient {
             match self.read_msg(deadline)? {
                 Some(msg) if pred(&msg) => return Ok(Some(msg)),
                 Some(msg) => {
+                    if let Some(message) = not_decoded(&msg) {
+                        bail!(
+                            "berthd 解不开这个请求（{message}）：它可能是旧版本的 berthd；运行 berth doctor 查看"
+                        );
+                    }
                     if self.backlog.len() >= SYNC_BACKLOG {
                         self.backlog.pop_front();
                     }
@@ -315,7 +370,7 @@ impl SyncClient {
             if left.is_zero() {
                 return Ok(None);
             }
-            self.stream.set_read_timeout(Some(left))?;
+            bound_read(&self.stream, left)?;
             match self.stream.read(&mut self.buf) {
                 Ok(0) => bail!("berthd closed the connection"),
                 Ok(n) => self.frames.push(&self.buf[..n]),
@@ -326,6 +381,24 @@ impl SyncClient {
                 Err(e) => return Err(e).context("reading from berthd"),
             }
         }
+    }
+}
+
+/// The error a berthd pushes (no `reply_to`: it has no id to answer) when
+/// it cannot decode a message; every version so far says "undecodable
+/// message: …", or "bad frame: …" and closes. A request of a newer
+/// protocol than the daemon's gets this and no answer. Other errors without
+/// `reply_to` (a session's actor stopped) concern no request.
+fn not_decoded(msg: &DaemonMsg) -> Option<&str> {
+    match &msg.event {
+        Event::Error { message }
+            if msg.reply_to.is_none()
+                && (message.starts_with("undecodable message")
+                    || message.starts_with("bad frame")) =>
+        {
+            Some(message)
+        }
+        _ => None,
     }
 }
 
@@ -371,6 +444,163 @@ pub fn connect_or_spawn(
 /// No daemon behind the socket path (as opposed to e.g. a permission error).
 pub fn daemon_absent(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused)
+}
+
+/// The berthd [`stop_daemon`] stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stopped {
+    pub version: String,
+    pub protocol: u32,
+    /// From `berthd.lock`, when readable.
+    pub pid: Option<u32>,
+}
+
+/// Shut down the berthd behind `paths.socket`, then wait up to `wait` until
+/// its socket is gone and its process has exited, so that a new daemon can
+/// take the lock. A daemon of another protocol version is asked in its own
+/// version: `Hello` and `Shutdown` keep their bytes in every version, and
+/// anything else it sends is skipped undecoded. `Ok(None)`: none running.
+pub fn stop_daemon(paths: &Paths, wait: Duration) -> Result<Option<Stopped>> {
+    let connect = || {
+        UnixStream::connect(&paths.socket)
+            .with_context(|| format!("connecting to {}", paths.socket.display()))
+    };
+    let mut stream = match UnixStream::connect(&paths.socket) {
+        Ok(s) => s,
+        Err(e) if daemon_absent(&e) => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| format!("connecting to {}", paths.socket.display()))
+        }
+    };
+    let pid = lock_owner(paths);
+    let (version, protocol, frames) = match handshake(&mut stream, ClientRole::Cli) {
+        Ok((version, frames)) => (version, PROTOCOL_VERSION, frames),
+        Err(e) => {
+            let Some(Incompatible { daemon }) = incompatible(&e) else {
+                return Err(e);
+            };
+            stream = connect()?;
+            let (version, frames) = handshake_as(&mut stream, ClientRole::Cli, daemon)?;
+            (version, daemon, frames)
+        }
+    };
+    let id = 1;
+    let shutdown = ClientMsg {
+        id,
+        req: Request::Shutdown,
+    };
+    stream
+        .write_all(&encode_frame(&shutdown)?)
+        .context("sending Shutdown to berthd")?;
+    match await_reply(&mut stream, frames, id, HANDSHAKE_TIMEOUT)? {
+        Event::Ok => {}
+        Event::Error { message } => bail!("berthd refused to shut down: {message}"),
+        other => bail!("unexpected answer to Shutdown: {other:?}"),
+    }
+    drop(stream);
+    wait_stopped(paths, pid, wait)?;
+    Ok(Some(Stopped {
+        version,
+        protocol,
+        pid,
+    }))
+}
+
+/// The answer to request `id`. Other messages are skipped after reading only
+/// their `reply_to`: a daemon of another version may push ones this build
+/// cannot decode.
+fn await_reply(
+    stream: &mut UnixStream,
+    mut frames: FrameReader,
+    id: u32,
+    timeout: Duration,
+) -> Result<Event> {
+    let deadline = Instant::now() + timeout;
+    let mut buf = vec![0u8; READ_BUF];
+    loop {
+        while let Some(payload) = frames.next_frame()? {
+            let (reply_to, _) = postcard::take_from_bytes::<Option<u32>>(&payload)
+                .map_err(|e| anyhow!("undecodable message from berthd: {e}"))?;
+            if reply_to == Some(id) {
+                let msg: DaemonMsg =
+                    decode_payload(&payload).context("decoding the answer from berthd")?;
+                return Ok(msg.event);
+            }
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("berthd did not answer within {} s", timeout.as_secs());
+        }
+        bound_read(stream, left)?;
+        match stream.read(&mut buf) {
+            Ok(0) => bail!("berthd closed the connection before answering"),
+            Ok(n) => frames.push(&buf[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(e).context("reading from berthd"),
+        }
+    }
+}
+
+/// Let the next read wait at most `left`. Once the daemon has closed the
+/// connection macOS refuses setsockopt (EINVAL); reads cannot block then
+/// (what is buffered, then EOF), so there is nothing left to bound, and the
+/// caller must still read what the daemon wrote before closing.
+fn bound_read(stream: &UnixStream, left: Duration) -> Result<()> {
+    match stream.set_read_timeout(Some(left)) {
+        Err(e) if e.raw_os_error() != Some(libc::EINVAL) => {
+            Err(e).context("setting a read timeout on the berthd connection")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The pid the daemon holding `berthd.lock` wrote into it.
+fn lock_owner(paths: &Paths) -> Option<u32> {
+    std::fs::read_to_string(&paths.lock)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Until the socket is gone and process `pid` has exited. This process is
+/// not waited for (tests run the daemon in-process; its lock is released
+/// when `berth_daemon::run` returns, right after the socket is removed).
+fn wait_stopped(paths: &Paths, pid: Option<u32>, wait: Duration) -> Result<()> {
+    let pid = pid.filter(|p| *p != std::process::id());
+    let deadline = Instant::now() + wait;
+    loop {
+        let socket = paths.socket.symlink_metadata().is_ok();
+        let running = pid.filter(|p| process_exists(*p));
+        if !socket && running.is_none() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let what = match running {
+                Some(p) if !socket => format!("process {p} is still running"),
+                _ => format!("{} still exists", paths.socket.display()),
+            };
+            bail!("berthd did not exit within {} s: {what}", wait.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// `kill(pid, 0)`: the process exists (EPERM: it exists, owned by another
+/// user).
+#[allow(unsafe_code)]
+fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 is not delivered; kill only checks that the pid
+    // exists and may be signalled. No memory is involved.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Launch `berthd` in the background with the login shell's PATH. It
@@ -624,7 +854,9 @@ fn run_probe(shell: &Path, timeout: Duration) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{write_script, TestDaemon};
+    use crate::testutil::{
+        fake_old_daemon, read_client_msg, write_daemon_msg, write_script, TestDaemon,
+    };
     use berth_core::{Dims, SessionStatus};
     use std::os::unix::net::UnixListener;
 
@@ -806,6 +1038,63 @@ mod tests {
         assert_eq!(got[1].event, Event::Ok);
     }
 
+    /// Review medium: a berthd that cannot decode a request says so without
+    /// `reply_to` and never answers it (what one of M2 does with the M3
+    /// requests). The request fails at once, naming the likely cause. Other
+    /// errors without `reply_to` (a session's actor stopped) concern no
+    /// request: its answer still counts.
+    #[test]
+    fn a_request_berthd_cannot_decode_fails_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let fake = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut frames = FrameReader::new();
+            let hello = read_client_msg(&mut s, &mut frames);
+            let answer = Event::Hello {
+                daemon_version: "0.0.1".into(),
+                protocol: PROTOCOL_VERSION,
+            };
+            write_daemon_msg(&mut s, Some(hello.id), answer);
+            let first = read_client_msg(&mut s, &mut frames);
+            let crashed = "session 0 stopped after an internal error: panic";
+            write_daemon_msg(
+                &mut s,
+                None,
+                Event::Error {
+                    message: crashed.into(),
+                },
+            );
+            write_daemon_msg(&mut s, Some(first.id), Event::Ok);
+            read_client_msg(&mut s, &mut frames);
+            let message = "undecodable message: Found an enum discriminant that was out of range";
+            write_daemon_msg(
+                &mut s,
+                None,
+                Event::Error {
+                    message: message.into(),
+                },
+            );
+            // The connection stays open, as berthd waits for the next one.
+            let mut rest = Vec::new();
+            s.read_to_end(&mut rest).unwrap();
+        });
+        let mut c = SyncClient::connect(&paths, ClientRole::Cli).unwrap();
+        let t = Duration::from_secs(5);
+        assert_eq!(c.request(Request::DaemonStatus, t).unwrap(), Event::Ok);
+        let start = Instant::now();
+        let err = format!("{:#}", c.request(Request::ListSessions, t).unwrap_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "not at once: {err}"
+        );
+        assert!(err.contains("undecodable message"), "{err}");
+        assert!(err.contains("berth doctor"), "{err}");
+        drop(c);
+        fake.join().unwrap();
+    }
+
     #[test]
     fn an_incompatible_daemon_is_reported() {
         let (_dir, paths, _join) = fake_daemon(Event::Incompatible {
@@ -815,7 +1104,14 @@ mod tests {
         let err = SyncClient::start(stream, ClientRole::Cli)
             .err()
             .expect("handshake must fail");
-        assert!(err.to_string().contains("protocol"), "{err:#}");
+        assert_eq!(
+            incompatible(&err),
+            Some(Incompatible {
+                daemon: PROTOCOL_VERSION + 1
+            }),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("协议"), "{err:#}");
     }
 
     #[test]
@@ -914,5 +1210,143 @@ mod tests {
             }
         }
         drop(daemon);
+    }
+
+    /// Our end of a connection whose daemon side wrote `msgs` and closed.
+    fn closed_after(msgs: &[DaemonMsg]) -> UnixStream {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        for m in msgs {
+            theirs.write_all(&encode_frame(m).unwrap()).unwrap();
+        }
+        drop(theirs);
+        ours
+    }
+
+    #[test]
+    fn answers_left_by_a_daemon_that_closed_right_away_are_read() {
+        // berthd closes the connection right after answering `Shutdown`,
+        // and macOS then refuses setsockopt: that must not hide the answer.
+        let ok = |reply_to| DaemonMsg {
+            reply_to,
+            event: Event::Ok,
+        };
+        let mut s = closed_after(&[ok(None), ok(Some(1))]);
+        let answer = await_reply(&mut s, FrameReader::new(), 1, Duration::from_secs(1));
+        assert_eq!(answer.unwrap(), Event::Ok);
+        let mut s = closed_after(&[]);
+        let err = await_reply(&mut s, FrameReader::new(), 1, Duration::from_secs(1)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("closed the connection before answering"),
+            "{err:#}"
+        );
+
+        let mut c = SyncClient {
+            stream: closed_after(&[ok(None), ok(Some(1))]),
+            frames: FrameReader::new(),
+            next_id: 2,
+            backlog: VecDeque::new(),
+            buf: vec![0u8; READ_BUF],
+            daemon_version: "t".into(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let reply = c.wait_for(deadline, |m| m.reply_to == Some(1)).unwrap();
+        assert_eq!(reply.map(|m| m.event), Some(Event::Ok));
+        let err = c.wait_for(deadline, |m| m.reply_to == Some(2)).unwrap_err();
+        assert_eq!(format!("{err:#}"), "berthd closed the connection");
+    }
+
+    #[test]
+    fn an_older_daemon_is_stopped_in_its_own_protocol_and_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let old = PROTOCOL_VERSION - 1;
+        // The daemon's process, as named in its lock file: gone in 0.3 s.
+        let mut child = Command::new("/bin/sleep").arg("0.3").spawn().unwrap();
+        let pid = child.id();
+        std::fs::write(&paths.lock, format!("{pid}\n")).unwrap();
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
+        let fake = fake_old_daemon(&paths, old);
+        let start = Instant::now();
+        let stopped = stop_daemon(&paths, Duration::from_secs(5))
+            .unwrap()
+            .expect("a daemon was running");
+        assert!(
+            start.elapsed() >= Duration::from_millis(200),
+            "returned before the daemon's process exited"
+        );
+        assert_eq!(
+            stopped,
+            Stopped {
+                version: "0.0.1".into(),
+                protocol: old,
+                pid: Some(pid),
+            }
+        );
+        assert!(!paths.socket.exists());
+        let seen = fake.join().unwrap();
+        assert!(
+            matches!(
+                seen.as_slice(),
+                [
+                    Request::Hello { protocol: ours, role: ClientRole::Cli, .. },
+                    Request::Hello { protocol: theirs, role: ClientRole::Cli, .. },
+                    Request::Shutdown,
+                ] if *ours == PROTOCOL_VERSION && *theirs == old
+            ),
+            "{seen:?}"
+        );
+        reaper.join().unwrap();
+        // Nothing listening: nothing to stop.
+        assert_eq!(stop_daemon(&paths, Duration::from_secs(1)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_daemon_whose_socket_stays_is_reported_after_the_wait() {
+        let (_dir, paths, join) = fake_daemon(Event::Hello {
+            daemon_version: "9.9.9".into(),
+            protocol: PROTOCOL_VERSION,
+        });
+        let err = stop_daemon(&paths, Duration::from_millis(300)).unwrap_err();
+        assert!(err.to_string().contains("did not exit"), "{err:#}");
+        assert!(matches!(join.join().unwrap().req, Request::Hello { .. }));
+    }
+
+    #[test]
+    fn a_stopped_real_daemon_restarts_with_its_sessions_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let daemon = TestDaemon::start_at(paths.clone());
+        let mut c = SyncClient::connect(&paths, ClientRole::Cli).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let t = Duration::from_secs(10);
+        let create = Request::CreateWorkspace {
+            name: "t".into(),
+            root: root.path().to_path_buf(),
+        };
+        let Event::WorkspaceUpdated(ws) = c.request(create, t).unwrap() else {
+            panic!("CreateWorkspace must answer WorkspaceUpdated")
+        };
+        let create = Request::CreateSession {
+            workspace: ws.id,
+            cwd: None,
+            command: Some(vec!["/bin/cat".into()]),
+            title: None,
+            dims: Dims { cols: 80, rows: 24 },
+        };
+        let Event::SessionUpdated(meta) = c.request(create, t).unwrap() else {
+            panic!("CreateSession must answer SessionUpdated")
+        };
+        drop(c);
+        let stopped = stop_daemon(&paths, STOP_WAIT).unwrap().unwrap();
+        assert_eq!(stopped.protocol, PROTOCOL_VERSION);
+        assert!(!paths.socket.exists());
+        drop(daemon);
+        let _again = TestDaemon::start_at(paths.clone());
+        let mut c = SyncClient::connect(&paths, ClientRole::Cli).unwrap();
+        let Event::Sessions(sessions) = c.request(Request::ListSessions, t).unwrap() else {
+            panic!("ListSessions must answer Sessions")
+        };
+        let back = sessions.iter().find(|m| m.id == meta.id).unwrap();
+        assert_eq!(back.status, SessionStatus::Restored);
     }
 }

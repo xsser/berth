@@ -351,6 +351,14 @@ impl Actor {
     fn load_restored(&mut self) {
         match self.mgr.store.read_snapshot(self.id) {
             Ok(Some(snap)) => {
+                if snap.format_version != SNAPSHOT_FORMAT_VERSION {
+                    // Left by an older berthd (the one a restart replaced).
+                    tracing::info!(
+                        session = %self.id,
+                        format = snap.format_version,
+                        "snapshot read in an older format"
+                    );
+                }
                 let (prefix, table) = prefix_from_snapshot(snap, self.cfg.max_restored_lines);
                 self.prefix = prefix;
                 self.restored_styles = StyleInterner::from_table(table);

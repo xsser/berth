@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use berth_core::{
     now_ms, AgentInfo, AgentKind, AgentSignal, AgentState, ClaudeHookEvent, ClientRole, DaemonMsg,
-    DaemonStatus, Dims, Event, HookEnvelope, Paths, PersistPolicy, ReviveMode, SessionId,
-    SessionMeta, SessionStatus, StateSource, SubscribeMode, Workspace, WorkspaceId,
+    DaemonStatus, Dims, Event, EventEntry, HookEnvelope, Paths, PersistPolicy, ReviveMode,
+    SessionId, SessionMeta, SessionStatus, StateSource, SubscribeMode, Workspace, WorkspaceId,
 };
 use berth_store::{EventRecord, Store};
 use berth_vt::PtySpawn;
@@ -28,6 +28,7 @@ use crate::config::Config;
 use crate::hooks;
 use crate::outbox::Outbox;
 use crate::session::{self, ActorConfig, ActorHandle, SessionCmd, MAX_PENDING_INPUT};
+use crate::shell_integration;
 use crate::view::ConnId;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -43,6 +44,8 @@ const ACTOR_REPLY_TIMEOUT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(30)
 };
+/// Most rows one `ListEvents` returns.
+const MAX_EVENT_LIST: u32 = 200;
 const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "elvish", "xonsh",
 ];
@@ -437,6 +440,7 @@ impl Manager {
             "BERTH_SOCKET".into(),
             self.paths.socket.to_string_lossy().into_owned(),
         ));
+        let command = self.with_shell_integration(meta.id, command, &mut env);
         PtySpawn {
             command,
             cwd,
@@ -444,6 +448,38 @@ impl Manager {
             cols: meta.cols.max(2),
             rows: meta.rows.max(1),
         }
+    }
+
+    /// `command` as spawned, plus the zsh integration's environment when
+    /// it is enabled and `command` runs an interactive zsh (then the login
+    /// shell is made explicit, see `shell_integration::interactive_zsh`).
+    /// Anything going wrong leaves the shell as it would start without it.
+    fn with_shell_integration(
+        &self,
+        sid: SessionId,
+        command: Vec<String>,
+        env: &mut Vec<(String, String)>,
+    ) -> Vec<String> {
+        if !self.config.shell_integration() {
+            return command;
+        }
+        let Some(zsh) = shell_integration::interactive_zsh(&command, env) else {
+            return command;
+        };
+        let dir = match shell_integration::install_zsh(&self.paths.data_dir) {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::warn!(session = %sid, error = %e, "cannot install zsh integration; starting without it");
+                return command;
+            }
+        };
+        let Some(vars) = shell_integration::zsh_env(&dir, env) else {
+            tracing::warn!(session = %sid, "ZDOTDIR is not UTF-8; starting zsh without integration");
+            return command;
+        };
+        env.extend(vars);
+        tracing::debug!(session = %sid, "zsh integration enabled");
+        zsh
     }
 
     // -- workspaces -----------------------------------------------------------
@@ -749,13 +785,7 @@ impl Manager {
             return Err("session is live".into());
         }
         let command = revive_argv(&self.config, &meta, mode)?;
-        let root = self
-            .reg
-            .lock()
-            .workspaces
-            .get(&meta.workspace)
-            .map(|w| w.root.clone());
-        let cwd = usable_cwd(&meta.cwd, root.as_deref());
+        let cwd = self.revive_cwd(&meta, mode);
         let spawn = self.pty_spawn(&meta, command, cwd.clone());
         let tx = self.actor_tx(sid)?;
         // Live *before* the PTY starts (registry only, committed below): the
@@ -773,11 +803,22 @@ impl Manager {
             e.meta.cwd = cwd;
             e.meta.last_active_ms = now;
             // Review #17: whatever the agent was doing is over. `Shell` does
-            // not bring it back (kind `Shell`, as when an agent leaves);
-            // `ResumeAgent` does. Ids and transcript stay for a later resume.
+            // not bring it back (kind `Shell` and `last_agent`, as when an
+            // agent leaves); `ResumeAgent` does, also after it left. Ids and
+            // transcript stay for a later resume.
             let mut agent = e.meta.agent.clone();
-            if matches!(mode, ReviveMode::Shell) {
-                agent.kind = AgentKind::Shell;
+            match mode {
+                ReviveMode::Shell => {
+                    if agent.kind.is_agent() {
+                        agent.last_agent = Some(agent.kind.clone());
+                    }
+                    agent.kind = AgentKind::Shell;
+                }
+                ReviveMode::ResumeAgent => {
+                    if let Some(kind) = agent.resume_kind().cloned() {
+                        agent.kind = kind;
+                    }
+                }
             }
             agent.state = AgentState::Idle;
             agent.since_ms = now;
@@ -926,16 +967,22 @@ impl Manager {
         };
         match envelope.signal {
             AgentSignal::Claude(hook) => {
-                // Resume needs Claude's own cwd (it keys transcripts by cwd).
+                // The agent's own cwd: where it started (resume needs it,
+                // see `revive_start_dir`) and where its `cd`s lead.
                 let cwd = match (&hook.event, &hook.cwd) {
                     (ClaudeHookEvent::SessionStart { .. }, Some(cwd)) => Some(cwd.clone()),
+                    (ClaudeHookEvent::Other { hook_event_name }, Some(cwd))
+                        if hook_event_name == "CwdChanged" =>
+                    {
+                        Some(cwd.clone())
+                    }
                     _ => None,
                 };
-                self.transition(sid, Signal::Hook(hook), |m| {
-                    if let Some(cwd) = cwd {
-                        m.cwd = cwd;
-                    }
-                });
+                self.transition(sid, Signal::Hook(hook), |_| {});
+                // Persist + `SessionUpdated` + `Cwd` like an OSC 7 report.
+                if let Some(cwd) = cwd.filter(|c| c.is_absolute()) {
+                    self.set_cwd(sid, cwd);
+                }
             }
             AgentSignal::Codex(notify) => {
                 self.transition(sid, Signal::Codex(notify), |_| {});
@@ -959,6 +1006,48 @@ impl Manager {
                 });
             }
         }
+    }
+
+    /// Where a revive of `meta` starts (see `revive_start_dir`).
+    fn revive_cwd(&self, meta: &SessionMeta, mode: ReviveMode) -> PathBuf {
+        let root = self
+            .reg
+            .lock()
+            .workspaces
+            .get(&meta.workspace)
+            .map(|w| w.root.clone());
+        usable_cwd(&revive_start_dir(meta, mode), root.as_deref())
+    }
+
+    /// The session's most recent agent events, newest first.
+    pub fn list_events(&self, sid: SessionId, limit: u32) -> Result<Vec<EventEntry>> {
+        if self.meta(sid).is_none() {
+            return Err(unknown(sid));
+        }
+        let rows = self
+            .store
+            .list_events(sid, limit.min(MAX_EVENT_LIST))
+            .map_err(|e| format!("cannot read events: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| EventEntry {
+                at_ms: r.at_ms,
+                kind: r.kind,
+                state: r.state,
+                detail: r.detail,
+            })
+            .collect())
+    }
+
+    /// What `revive(sid, ResumeAgent)` would execute and where, computed by
+    /// the same code; nothing is started.
+    pub fn resume_command(&self, sid: SessionId) -> Result<Event> {
+        let meta = self.meta(sid).ok_or_else(|| unknown(sid))?;
+        Ok(Event::ResumeCommand {
+            session: sid,
+            cwd: self.revive_cwd(&meta, ReviveMode::ResumeAgent),
+            command: revive_argv(&self.config, &meta, ReviveMode::ResumeAgent),
+        })
     }
 
     pub fn status(&self) -> DaemonStatus {
@@ -1063,7 +1152,8 @@ fn revive_command(original: &[String]) -> Vec<String> {
 }
 
 /// argv of a revive. `Shell`: the original plain shell, else the login
-/// shell. `ResumeAgent`: the agent's resume command, executed directly —
+/// shell. `ResumeAgent`: the resume command of the running agent, else of
+/// the one that left last (`AgentInfo::resume_kind`), executed directly —
 /// never typed into or parsed by a shell — with the word `{id}` replaced by
 /// the external id, which must be a plain token (ids stored before that
 /// check existed are refused here too).
@@ -1079,9 +1169,54 @@ fn revive_argv(config: &Config, meta: &SessionMeta, mode: ReviveMode) -> Result<
             if !is_valid_external_id(id) {
                 return Err("agent session id is not a plain token; refusing to resume".into());
             }
-            config.resume_argv(&meta.agent.kind, id)
+            let kind = meta.agent.resume_kind().unwrap_or(&meta.agent.kind);
+            config.resume_argv(kind, id)
         }
     }
+}
+
+/// The directory a revive should start in, before the existence fallbacks
+/// of `usable_cwd`. Claude keys a session's transcript by the directory it
+/// was started in, while `cwd` follows the agent's `cd`s (`CwdChanged`), so
+/// a Claude resume starts in the ancestor of `cwd` that owns the transcript
+/// (`claude --resume <id>` elsewhere does not find the session). Without a
+/// match it is `cwd`, as for every other revive.
+fn revive_start_dir(meta: &SessionMeta, mode: ReviveMode) -> PathBuf {
+    let kind = meta.agent.resume_kind();
+    let claude_transcript = match (mode, kind, &meta.agent.transcript_path) {
+        (ReviveMode::ResumeAgent, Some(AgentKind::Claude), Some(t)) => Some(t),
+        _ => None,
+    };
+    claude_transcript
+        .and_then(|t| claude_project_dir(&meta.cwd, t))
+        .unwrap_or_else(|| meta.cwd.clone())
+}
+
+/// The ancestor of `cwd` (itself included) whose Claude project key equals
+/// the name of the transcript's directory
+/// (`~/.claude/projects/<key>/<id>.jsonl`).
+fn claude_project_dir(cwd: &Path, transcript: &Path) -> Option<PathBuf> {
+    let key = transcript.parent()?.file_name()?.to_str()?;
+    cwd.ancestors()
+        .find(|dir| {
+            claude_project_key(dir) == key
+                || std::fs::canonicalize(dir).is_ok_and(|real| claude_project_key(&real) == key)
+        })
+        .map(Path::to_path_buf)
+}
+
+/// Claude Code's directory key: every UTF-16 unit that is not an ASCII
+/// letter or digit becomes `-` (`/Users/me/my.app` → `-Users-me-my-app`).
+fn claude_project_key(dir: &Path) -> String {
+    let mut key = String::new();
+    for c in dir.to_string_lossy().chars() {
+        if c.is_ascii_alphanumeric() {
+            key.push(c);
+        } else {
+            key.extend(std::iter::repeat_n('-', c.len_utf16()));
+        }
+    }
+    key
 }
 
 fn usable_cwd(cwd: &Path, workspace_root: Option<&Path>) -> PathBuf {
@@ -1155,6 +1290,19 @@ mod tests {
             revive_argv(&config, &meta, ReviveMode::Shell).unwrap(),
             v(&["/bin/zsh"])
         );
+
+        // After `/exit` the kind is `Shell` again: the agent that left is
+        // resumed; a plain shell with nothing that left is not.
+        meta.agent.external_id = Some("0f8c2e1a-1111-2222-3333-444455556666".into());
+        meta.agent.kind = AgentKind::Shell;
+        meta.agent.last_agent = Some(AgentKind::Claude);
+        assert_eq!(
+            revive_argv(&config, &meta, ReviveMode::ResumeAgent).unwrap(),
+            v(&["claude", "--resume", "0f8c2e1a-1111-2222-3333-444455556666"])
+        );
+        meta.agent.last_agent = None;
+        let err = revive_argv(&config, &meta, ReviveMode::ResumeAgent).unwrap_err();
+        assert!(err.contains("plain shell"), "{err}");
     }
 
     /// Review high #2: a panicking actor leaves a Dormant session that a
@@ -1462,5 +1610,65 @@ mod tests {
         assert_eq!(usable_cwd(dir.path(), None), dir.path());
         let gone = dir.path().join("gone");
         assert_eq!(usable_cwd(&gone, Some(dir.path())), dir.path());
+    }
+
+    #[test]
+    fn claude_project_key_matches_claude_code() {
+        let key = |p: &str| claude_project_key(Path::new(p));
+        assert_eq!(key("/Users/me/my.app"), "-Users-me-my-app");
+        assert_eq!(key("/Users/me/.claude"), "-Users-me--claude");
+        assert_eq!(key("/private/tmp/a_b c"), "-private-tmp-a-b-c");
+        // One `-` per UTF-16 unit, as JavaScript's replace sees the string.
+        assert_eq!(key("/tmp/中文"), "-tmp---");
+        assert_eq!(key("/tmp/\u{1F600}"), "-tmp---");
+    }
+
+    /// M3: after `CwdChanged` moved `cwd` below the project, a Claude resume
+    /// still starts where the transcript lives; everything else keeps `cwd`.
+    #[test]
+    fn claude_resume_starts_in_the_transcripts_project_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj.x");
+        let sub = project.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Claude sees the real path (`/var` → `/private/var` on macOS).
+        let real = std::fs::canonicalize(&project).unwrap();
+        let transcript = PathBuf::from("/h/.claude/projects")
+            .join(claude_project_key(&real))
+            .join("id.jsonl");
+        let mut meta = SessionMeta {
+            id: SessionId::new(),
+            workspace: WorkspaceId::new(),
+            title_auto: String::new(),
+            title_user: None,
+            cwd: sub.clone(),
+            command: vec!["/bin/zsh".into()],
+            env: Vec::new(),
+            status: SessionStatus::Restored,
+            agent: AgentInfo::default(),
+            created_at_ms: 0,
+            last_active_ms: 0,
+            unread: false,
+            persist: PersistPolicy {
+                snapshot: true,
+                journal: false,
+            },
+            order: 0,
+            cols: 80,
+            rows: 24,
+        };
+        meta.agent.kind = AgentKind::Claude;
+        meta.agent.transcript_path = Some(transcript.clone());
+        assert_eq!(revive_start_dir(&meta, ReviveMode::ResumeAgent), project);
+        assert_eq!(revive_start_dir(&meta, ReviveMode::Shell), sub);
+        meta.agent.transcript_path = Some(PathBuf::from("/h/.claude/projects/-elsewhere/id.jsonl"));
+        assert_eq!(revive_start_dir(&meta, ReviveMode::ResumeAgent), sub);
+        meta.agent.transcript_path = Some(transcript);
+        meta.agent.kind = AgentKind::Codex;
+        assert_eq!(revive_start_dir(&meta, ReviveMode::ResumeAgent), sub);
+        // Claude left (kind `Shell`): still its project directory.
+        meta.agent.kind = AgentKind::Shell;
+        meta.agent.last_agent = Some(AgentKind::Claude);
+        assert_eq!(revive_start_dir(&meta, ReviveMode::ResumeAgent), project);
     }
 }

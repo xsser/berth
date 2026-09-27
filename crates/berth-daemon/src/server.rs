@@ -278,5 +278,10 @@ async fn handle_request(mgr: &Arc<Manager>, conn: ConnId, outbox: &Arc<Outbox>, 
             send(Event::Ok);
             mgr.request_shutdown();
         }
+        Request::ListEvents { session, limit } => done(
+            mgr.list_events(session, limit)
+                .map(|events| Event::Events { session, events }),
+        ),
+        Request::ResumeCommand { session } => done(mgr.resume_command(session)),
     }
 }

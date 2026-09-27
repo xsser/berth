@@ -140,6 +140,21 @@ pub enum Request {
 
     DaemonStatus,
     Shutdown,
+
+    // Added in M3. New variants go last: postcard numbers variants by
+    // position, so an older daemon still decodes every earlier request (and
+    // answers these with an `Error` without `reply_to`).
+    /// The session's most recent agent events (newest first), at most
+    /// `limit`; answered by `Event::Events`.
+    ListEvents {
+        session: SessionId,
+        limit: u32,
+    },
+    /// What `Revive { ResumeAgent }` would run for this session, without
+    /// running it; answered by `Event::ResumeCommand`.
+    ResumeCommand {
+        session: SessionId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -173,6 +188,18 @@ pub struct DaemonStatus {
     pub uptime_ms: i64,
     pub sessions_live: u32,
     pub sessions_total: u32,
+}
+
+/// One row of a session's agent event log (DESIGN §9 / §11: event kind and
+/// a short detail such as a tool name or exit code, never prompt text).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventEntry {
+    pub at_ms: i64,
+    /// e.g. `hook:PreToolUse`, `osc:133D`, `heuristic:idle`, `pty:exit`.
+    pub kind: String,
+    /// `AgentState::name()` after the event.
+    pub state: String,
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -237,6 +264,20 @@ pub enum Event {
     },
 
     Status(DaemonStatus),
+
+    // Added in M3 (appended, see `Request::ListEvents`).
+    /// Answer to `ListEvents`: newest first.
+    Events {
+        session: SessionId,
+        events: Vec<EventEntry>,
+    },
+    /// Answer to `ResumeCommand`: the argv `Revive { ResumeAgent }` would
+    /// execute directly (no shell) in `cwd`, or why it would refuse.
+    ResumeCommand {
+        session: SessionId,
+        cwd: PathBuf,
+        command: Result<Vec<String>, String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -368,5 +409,139 @@ mod tests {
         r.push(&bytes);
         let back: DaemonMsg = decode_payload(&r.next_frame().unwrap().unwrap()).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn m3_messages_roundtrip() {
+        let session = SessionId::new();
+        for req in [
+            Request::ListEvents { session, limit: 5 },
+            Request::ResumeCommand { session },
+        ] {
+            let msg = ClientMsg { id: 3, req };
+            let back: ClientMsg = decode_payload(&encode_frame(&msg).unwrap()[4..]).unwrap();
+            assert_eq!(msg, back);
+        }
+        for event in [
+            Event::Events {
+                session,
+                events: vec![EventEntry {
+                    at_ms: 1,
+                    kind: "hook:PreToolUse".into(),
+                    state: "tool_running".into(),
+                    detail: Some("Bash".into()),
+                }],
+            },
+            Event::ResumeCommand {
+                session,
+                cwd: PathBuf::from("/tmp/p"),
+                command: Ok(vec!["claude".into(), "--resume".into(), "x".into()]),
+            },
+            Event::ResumeCommand {
+                session,
+                cwd: PathBuf::from("/tmp/p"),
+                command: Err("no external id".into()),
+            },
+        ] {
+            let msg = DaemonMsg {
+                reply_to: Some(3),
+                event,
+            };
+            let back: DaemonMsg = decode_payload(&encode_frame(&msg).unwrap()[4..]).unwrap();
+            assert_eq!(msg, back);
+        }
+    }
+
+    /// A client stops a daemon of another protocol version by speaking that
+    /// version (`Hello`, `Shutdown`, answered by `Hello`, `Incompatible`,
+    /// `Ok` or `Error`), so these frames must keep their bytes in every
+    /// protocol version.
+    #[test]
+    fn frames_spoken_across_protocol_versions_keep_their_bytes() {
+        let hello = ClientMsg {
+            id: 0,
+            req: Request::Hello {
+                role: ClientRole::Cli,
+                protocol: 1,
+                client_version: "v".into(),
+            },
+        };
+        assert_eq!(postcard::to_stdvec(&hello).unwrap(), [0, 0, 2, 1, 1, b'v']);
+        let shutdown = ClientMsg {
+            id: 1,
+            req: Request::Shutdown,
+        };
+        assert_eq!(postcard::to_stdvec(&shutdown).unwrap(), [1, 23]);
+        let answers: [(Event, &[u8]); 4] = [
+            (
+                Event::Hello {
+                    daemon_version: "v".into(),
+                    protocol: 1,
+                },
+                &[0, 1, b'v', 1],
+            ),
+            (Event::Incompatible { daemon_protocol: 1 }, &[1, 1]),
+            (Event::Ok, &[2]),
+            (
+                Event::Error {
+                    message: "e".into(),
+                },
+                &[3, 1, b'e'],
+            ),
+        ];
+        for (event, bytes) in answers {
+            let msg = DaemonMsg {
+                reply_to: Some(1),
+                event,
+            };
+            assert_eq!(
+                postcard::to_stdvec(&msg).unwrap(),
+                [&[1, 1], bytes].concat()
+            );
+        }
+    }
+
+    /// The M3 variants are appended: every pre-M3 variant keeps its postcard
+    /// discriminant, so M2 peers still decode each other's old messages.
+    #[test]
+    fn m3_variants_do_not_renumber_existing_ones() {
+        let first_byte = |r: Request| postcard::to_stdvec(&r).unwrap()[0];
+        assert_eq!(first_byte(Request::DaemonStatus), 22);
+        assert_eq!(first_byte(Request::Shutdown), 23);
+        let session = SessionId::new();
+        assert_eq!(first_byte(Request::ListEvents { session, limit: 1 }), 24);
+        assert_eq!(first_byte(Request::ResumeCommand { session }), 25);
+        let status = Event::Status(DaemonStatus {
+            version: String::new(),
+            pid: 0,
+            uptime_ms: 0,
+            sessions_live: 0,
+            sessions_total: 0,
+        });
+        let events = Event::Events {
+            session,
+            events: vec![],
+        };
+        let status_tag = postcard::to_stdvec(&status).unwrap()[0];
+        assert_eq!(postcard::to_stdvec(&events).unwrap()[0], status_tag + 1);
+    }
+
+    /// A protocol 1 berthd (M1 / M2) decodes requests up to `Shutdown`, and
+    /// `AgentInfo` without `last_agent`. Sent as protocol 1, the M3 messages
+    /// would pass its `Hello` check and fail on first use; sent as a newer
+    /// one, they are refused up front (`Incompatible`: the GUI's restart
+    /// banner, `berth doctor`). Catches a merge that takes the bump back.
+    #[test]
+    fn m3_messages_are_not_sent_as_protocol_1() {
+        const PROTOCOL_1_LAST_REQUEST: u8 = 23;
+        let resume = Request::ResumeCommand {
+            session: SessionId::new(),
+        };
+        let tag = postcard::to_stdvec(&resume).unwrap()[0];
+        assert!(
+            tag <= PROTOCOL_1_LAST_REQUEST || crate::PROTOCOL_VERSION > 1,
+            "request {tag} is beyond protocol 1 but sent as protocol {}",
+            crate::PROTOCOL_VERSION
+        );
     }
 }

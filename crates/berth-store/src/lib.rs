@@ -2,8 +2,10 @@
 //!
 //! - `berth.sqlite3`: workspaces, sessions (full `SessionMeta` as JSON plus a
 //!   few indexed columns), agent events timeline. WAL mode, `0600`.
-//! - `snapshots/<sid>.bin.zst`: `SessionSnapshotFile` (postcard + zstd level
-//!   3), written atomically (`.tmp` + fsync + rename).
+//! - `snapshots/<sid>.bin.zst`: a `SessionSnapshotFile` (zstd level 3),
+//!   written atomically (`.tmp` + fsync + rename) in format 2: postcard
+//!   with the session as JSON ([`FileV2`]). Format 1 files (M1 / M2) are
+//!   read too, into the current types.
 //! - `journals/<sid>/NNNN.log`: optional raw PTY bytes with timestamps,
 //!   rotated at 64 MiB (`JournalWriter`).
 //!
@@ -18,11 +20,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
+use berth_core::snapshot::v1;
 use berth_core::{
-    Paths, SessionId, SessionMeta, SessionSnapshotFile, SessionStatus, Workspace, WorkspaceId,
-    SNAPSHOT_FORMAT_VERSION,
+    LineSnapshot, Paths, ScreenSnapshot, SessionId, SessionMeta, SessionSnapshotFile,
+    SessionStatus, StyleTable, Workspace, WorkspaceId, SNAPSHOT_FORMAT_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
 pub use journal::{read_journal, JournalRecord, JournalWriter, JOURNAL_ROTATE_BYTES};
 
@@ -46,6 +50,48 @@ pub enum StoreError {
     Format { found: u32, want: u32 },
     #[error("database schema {found} is newer than supported {want}")]
     Schema { found: i64, want: i64 },
+}
+
+/// Snapshot format 2 as read: `SessionSnapshotFile` with the session as a
+/// JSON string, so a field added to `SessionMeta` with `#[serde(default)]`
+/// reads from older files as its default (as in SQLite), without a new
+/// format version. The bulky rest stays postcard. Format 1 had the session
+/// as postcard in the same place ([`v1::SessionSnapshotFile`]).
+#[derive(Deserialize)]
+struct FileV2 {
+    format_version: u32,
+    saved_at_ms: i64,
+    session_json: String,
+    styles: StyleTable,
+    history: Vec<LineSnapshot>,
+    screen: Option<ScreenSnapshot>,
+}
+
+/// [`FileV2`] as written: the same bytes, borrowing the (possibly large)
+/// history instead of copying it.
+#[derive(Serialize)]
+struct FileV2Out<'a> {
+    format_version: u32,
+    saved_at_ms: i64,
+    session_json: String,
+    styles: &'a StyleTable,
+    history: &'a [LineSnapshot],
+    screen: &'a Option<ScreenSnapshot>,
+}
+
+// `FileV2` is the current format; a new one needs its own layout (and the
+// reader keeps this one).
+const _: () = assert!(SNAPSHOT_FORMAT_VERSION == 2);
+
+/// A JSON error by category and position only: the text may hold values
+/// from the session (its title, environment).
+fn json_error(what: &str, e: &serde_json::Error) -> StoreError {
+    StoreError::Codec(format!(
+        "{what}: {:?} error at line {} column {}",
+        e.classify(),
+        e.line(),
+        e.column()
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -287,9 +333,19 @@ impl Store {
 
     // -- snapshots ----------------------------------------------------------
 
-    /// postcard → zstd(3) → `<sid>.bin.zst.tmp` (0600) → fsync → rename.
+    /// Format 2 ([`FileV2`], whatever `snap.format_version` says) → zstd(3)
+    /// → `<sid>.bin.zst.tmp` (0600) → fsync → rename.
     pub fn write_snapshot(&self, snap: &SessionSnapshotFile) -> Result<(), StoreError> {
-        let raw = postcard::to_stdvec(snap).map_err(|e| StoreError::Codec(e.to_string()))?;
+        let file = FileV2Out {
+            format_version: SNAPSHOT_FORMAT_VERSION,
+            saved_at_ms: snap.saved_at_ms,
+            session_json: serde_json::to_string(&snap.session)
+                .map_err(|e| json_error("snapshot session", &e))?,
+            styles: &snap.styles,
+            history: &snap.history,
+            screen: &snap.screen,
+        };
+        let raw = postcard::to_stdvec(&file).map_err(|e| StoreError::Codec(e.to_string()))?;
         let compressed = zstd::bulk::compress(&raw, SNAPSHOT_ZSTD_LEVEL)?;
         fsutil::ensure_private_dir(&self.paths.snapshots_dir)?;
         let path = self.paths.snapshot_file(&snap.session.id);
@@ -297,8 +353,10 @@ impl Store {
         Ok(())
     }
 
-    /// `Ok(None)` when no snapshot exists. The format version is checked
-    /// before decoding the rest of the file.
+    /// `Ok(None)` when no snapshot exists. The format version (the first
+    /// field in every format) is read first: format 2 is decoded as is,
+    /// format 1 (M1 / M2) with its own layout into the current types
+    /// (`AgentInfo::last_agent` `None`), any other is a `Format` error.
     pub fn read_snapshot(&self, id: SessionId) -> Result<Option<SessionSnapshotFile>, StoreError> {
         let path = self.paths.snapshot_file(&id);
         let bytes = match std::fs::read(&path) {
@@ -309,14 +367,30 @@ impl Store {
         let raw = zstd::stream::decode_all(&bytes[..])?;
         let (found, _) = postcard::take_from_bytes::<u32>(&raw)
             .map_err(|e| StoreError::Codec(format!("snapshot header: {e}")))?;
-        if found != SNAPSHOT_FORMAT_VERSION {
-            return Err(StoreError::Format {
-                found,
-                want: SNAPSHOT_FORMAT_VERSION,
-            });
-        }
-        let snap: SessionSnapshotFile =
-            postcard::from_bytes(&raw).map_err(|e| StoreError::Codec(e.to_string()))?;
+        let snap = match found {
+            1 => postcard::from_bytes::<v1::SessionSnapshotFile>(&raw)
+                .map(SessionSnapshotFile::from)
+                .map_err(|e| StoreError::Codec(format!("snapshot format 1: {e}")))?,
+            2 => {
+                let file: FileV2 =
+                    postcard::from_bytes(&raw).map_err(|e| StoreError::Codec(e.to_string()))?;
+                SessionSnapshotFile {
+                    format_version: file.format_version,
+                    saved_at_ms: file.saved_at_ms,
+                    session: serde_json::from_str(&file.session_json)
+                        .map_err(|e| json_error("snapshot session", &e))?,
+                    styles: file.styles,
+                    history: file.history,
+                    screen: file.screen,
+                }
+            }
+            found => {
+                return Err(StoreError::Format {
+                    found,
+                    want: SNAPSHOT_FORMAT_VERSION,
+                })
+            }
+        };
         if snap.session.id != id {
             return Err(StoreError::Codec(format!(
                 "snapshot {} contains session {}",

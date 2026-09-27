@@ -39,9 +39,11 @@ use winit::window::{ImePurpose, Window, WindowId};
 use crate::client::{self, Client, ClientEvent};
 use crate::config::Config;
 use crate::controller::{Controller, Effect, Outbound};
+use crate::dock::DockBadge;
 use crate::fixture::{Fixture, COLS, ROWS};
 use crate::ime::{ImeOutcome, ImeState};
 use crate::input::{self, ImeGate, KeyAction, KeyPress, Mods, ScrollKey, Shortcut};
+use crate::mismatch::Mismatch;
 use crate::mouse::{self, Button, MouseEvent, WheelAccum};
 use crate::notify::Notifier;
 use crate::renderer::{CellMetrics, FrameInput, GridLayout, GridRenderer, PrepareStats};
@@ -84,6 +86,13 @@ pub struct GuiOptions {
     /// Inject a synthetic `Ime::Preedit` at startup (screenshot check of the
     /// preedit overlay; real IME events go through the same handler).
     pub demo_preedit: Option<String>,
+    /// Show this session's hover details without a pointer (screenshot
+    /// check; a screenshot waits for its events).
+    pub demo_hover: Option<String>,
+    /// Press 「重启 berthd」 as soon as the version-mismatch banner shows
+    /// (end-to-end check; a screenshot waits for the restarted daemon's
+    /// session list instead of the banner).
+    pub demo_restart: bool,
 }
 
 /// Events from other threads.
@@ -96,7 +105,11 @@ pub enum UserEvent {
     ConnectFailed {
         generation: u64,
         error: String,
+        /// berthd answered `Hello` with another protocol version.
+        refused: Option<client::Incompatible>,
     },
+    /// The stop of 「重启 berthd」 finished (`Ok(None)`: nothing was running).
+    DaemonStopped(std::result::Result<Option<client::Stopped>, String>),
     Daemon {
         generation: u64,
         event: ClientEvent,
@@ -266,7 +279,11 @@ struct App {
     reconnect_at: Option<Instant>,
     attempts: u32,
     last_connect_error: Option<String>,
+    /// A berthd of another protocol version, and its restart.
+    mismatch: Mismatch,
     notifier: Option<Notifier>,
+    /// Dock badge (not in bench runs, which have no daemon).
+    dock: Option<DockBadge>,
     mode: Mode,
     palette_open: bool,
     picking_folder: bool,
@@ -320,7 +337,7 @@ impl App {
         };
         // No desktop notifications from one-shot runs.
         let notifier = match mode {
-            Mode::Interactive => match Notifier::start() {
+            Mode::Interactive => match Notifier::start(config.notify_identity.clone()) {
                 Ok(n) => Some(n),
                 Err(e) => {
                     ctl.error(format!("通知线程无法启动：{e:#}"));
@@ -330,6 +347,7 @@ impl App {
             _ => None,
         };
         let exit_at = opts.exit_after.map(|d| t0 + d);
+        let dock = (!matches!(mode, Mode::Bench { .. })).then(DockBadge::default);
         Self {
             live_stats: opts.stats.then(LiveStats::new),
             pending_scroll: opts.scroll.map(i64::from),
@@ -347,9 +365,11 @@ impl App {
             early: Vec::new(),
             connecting: false,
             reconnect_at: None,
+            mismatch: Mismatch::None,
             attempts: 0,
             last_connect_error: None,
             notifier,
+            dock,
             mode,
             palette_open: false,
             picking_folder: false,
@@ -413,6 +433,7 @@ impl App {
                     Err(e) => UserEvent::ConnectFailed {
                         generation,
                         error: format!("{e:#}"),
+                        refused: client::incompatible(&e),
                     },
                 };
                 let _ = proxy.send_event(event);
@@ -420,6 +441,53 @@ impl App {
         if let Err(e) = spawned {
             self.connecting = false;
             self.ctl.error(format!("无法启动连接线程：{e}"));
+            self.schedule_reconnect();
+        }
+    }
+
+    /// 「重启 berthd」: stop the berthd of another protocol version on a
+    /// thread; [`App::on_daemon_stopped`] connects afterwards, which starts
+    /// this build's berthd through the usual launch path.
+    fn restart_daemon(&mut self) {
+        if !self.mismatch.restart() {
+            return;
+        }
+        // Answers to attempts under way are dropped, and none starts until
+        // the stop is done: it would meet the stopping daemon, or start a
+        // berthd that finds the lock still held.
+        self.generation += 1;
+        self.connecting = false;
+        self.reconnect_at = None;
+        let proxy = self.proxy.clone();
+        let paths = self.paths.clone();
+        let spawned = std::thread::Builder::new()
+            .name("berth-restart".into())
+            .spawn(move || {
+                let result =
+                    client::stop_daemon(&paths, client::STOP_WAIT).map_err(|e| format!("{e:#}"));
+                let _ = proxy.send_event(UserEvent::DaemonStopped(result));
+            });
+        if let Err(e) = spawned {
+            self.on_daemon_stopped(Err(format!("无法启动重启线程：{e}")));
+        }
+    }
+
+    fn on_daemon_stopped(&mut self, result: std::result::Result<Option<client::Stopped>, String>) {
+        match &result {
+            Ok(Some(s)) => tracing::info!(
+                version = %s.version,
+                protocol = s.protocol,
+                pid = ?s.pid,
+                "stopped berthd for the restart"
+            ),
+            Ok(None) => tracing::info!("berthd was gone before the restart stopped it"),
+            Err(e) => tracing::warn!(error = %e, "stopping berthd failed"),
+        }
+        self.mismatch.stopped(result.map(|_| ()));
+        if matches!(self.mismatch, Mismatch::Starting(_)) {
+            self.attempts = 0;
+            self.start_connect();
+        } else {
             self.schedule_reconnect();
         }
     }
@@ -445,8 +513,10 @@ impl App {
                     launched,
                     "connected to berthd"
                 );
-                if launched {
-                    self.ctl.info("已启动 berthd");
+                match self.mismatch.connected() {
+                    Some(restarted) => self.ctl.info(restarted),
+                    None if launched => self.ctl.info("已启动 berthd"),
+                    None => {}
                 }
                 self.client = Some(*client);
                 self.ctl.on_connected(out!(self));
@@ -455,14 +525,24 @@ impl App {
                     self.on_daemon(ev);
                 }
             }
-            UserEvent::ConnectFailed { generation, error } if generation == self.generation => {
+            UserEvent::ConnectFailed {
+                generation,
+                error,
+                refused,
+            } if generation == self.generation => {
                 self.connecting = false;
-                if self.last_connect_error.as_deref() != Some(error.as_str()) {
+                self.mismatch.connect_failed(refused);
+                // A refusal is explained by the mismatch banner instead.
+                if refused.is_none() && self.last_connect_error.as_deref() != Some(error.as_str()) {
                     self.ctl.error(format!("无法连接 berthd：{error}"));
                 }
                 self.last_connect_error = Some(error);
                 self.schedule_reconnect();
+                if self.opts.demo_restart && matches!(self.mismatch, Mismatch::Seen(_)) {
+                    self.restart_daemon();
+                }
             }
+            UserEvent::DaemonStopped(result) => self.on_daemon_stopped(result),
             UserEvent::Daemon { generation, event } if generation == self.generation => {
                 if self.client.is_none() {
                     self.early.push(event);
@@ -501,6 +581,26 @@ impl App {
                 self.schedule_reconnect();
             }
         }
+        self.update_dock();
+    }
+
+    /// Dock badge: sessions needing attention (none while disconnected:
+    /// the list may be out of date).
+    fn update_dock(&mut self) {
+        let count = if self.ctl.is_connected() {
+            self.ctl.attention_count()
+        } else {
+            0
+        };
+        if let Some(dock) = self.dock.as_mut() {
+            dock.update(count);
+        }
+    }
+
+    /// `--demo-hover` resolved against the session list.
+    fn demo_hover(&self) -> Option<berth_core::SessionId> {
+        let want = self.opts.demo_hover.as_deref()?;
+        self.ctl.find_session(want).ok()
     }
 
     // -- keyboard ----------------------------------------------------------
@@ -792,6 +892,9 @@ impl App {
         if self.is_bench() || self.ctl.is_connected() {
             return None;
         }
+        if let Some(status) = self.mismatch.status() {
+            return Some(status.into());
+        }
         Some(match (&self.last_connect_error, self.reconnect_at) {
             (_, Some(at)) => format!(
                 "未连接，{} s 后重试",
@@ -810,7 +913,9 @@ impl App {
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let start = Instant::now();
+        let demo_hover = self.demo_hover();
         let placeholder = self.placeholder();
+        let mismatch = self.mismatch.banner();
         let status = self.status_line();
         let title = self.window_title();
         let Some(gfx) = self.gfx.as_mut() else {
@@ -859,6 +964,8 @@ impl App {
             palette_open: self.palette_open,
             status: status.as_deref(),
             placeholder: placeholder.as_deref(),
+            mismatch: mismatch.as_ref(),
+            demo_hover,
         };
         let fixture = match &self.mode {
             Mode::Bench { fixture, .. } => Some(fixture.as_ref()),
@@ -947,9 +1054,15 @@ impl App {
         let now = Instant::now();
         let mut changed = false;
         for a in actions {
-            changed |= !matches!(a, UiAction::Visible(_));
+            // Reported every frame: no redraw of their own.
+            changed |= !matches!(a, UiAction::Visible(_) | UiAction::Hover(_));
             match a {
                 UiAction::Focus(sid) => self.ctl.focus(out!(self), sid, now),
+                UiAction::Hover(sid) => {
+                    if !self.is_bench() {
+                        self.ctl.hover(out!(self), sid)
+                    }
+                }
                 UiAction::Revive(sid, mode) => self.ctl.revive(out!(self), sid, mode, now),
                 UiAction::NewSession => self.ctl.new_session(out!(self)),
                 UiAction::NewSessionIn(ws) => self.ctl.new_session_in(out!(self), ws),
@@ -957,6 +1070,7 @@ impl App {
                 UiAction::Confirm(yes) => self.ctl.answer_confirm(out!(self), yes),
                 UiAction::DismissNotice(i) => self.ctl.dismiss_notice(i),
                 UiAction::ClosePalette => self.palette_open = false,
+                UiAction::RestartDaemon => self.restart_daemon(),
                 UiAction::Visible(ids) => {
                     if !self.is_bench() {
                         self.ctl.set_visible(out!(self), &ids, now)
@@ -970,6 +1084,13 @@ impl App {
     }
 
     fn screenshot_ready(&self) -> bool {
+        match self.mismatch {
+            // The banner is the picture, unless the restart is demonstrated.
+            Mismatch::Seen(_) => return !self.opts.demo_restart,
+            Mismatch::Failed { .. } => return true,
+            Mismatch::Stopping(_) | Mismatch::Starting(_) => return false,
+            Mismatch::None => {}
+        }
         self.ctl.is_connected()
             && self.ctl.is_loaded()
             && self.pending_scroll.is_none()
@@ -977,6 +1098,17 @@ impl App {
                 None => true,
                 Some(_) => self.ctl.view().is_some_and(|v| v.visible_complete()),
             }
+            && self.demo_hover_ready()
+    }
+
+    /// `--demo-hover`: the session is listed and its events arrived.
+    fn demo_hover_ready(&self) -> bool {
+        if self.opts.demo_hover.is_none() {
+            return true;
+        }
+        self.demo_hover()
+            .and_then(|sid| self.ctl.recent_events(sid))
+            .is_some_and(|r| r.events.is_some() || r.error.is_some())
     }
 }
 
@@ -1183,10 +1315,14 @@ impl ApplicationHandler<UserEvent> for App {
         } = &mut self.mode
         {
             if now > *deadline {
-                let what = if self.ctl.is_connected() {
-                    "the session list or the focused screen did not arrive"
-                } else {
+                let what = if self.mismatch.status().is_some() {
+                    "the berthd restart did not finish"
+                } else if !self.ctl.is_connected() {
                     "berthd could not be reached"
+                } else if self.opts.demo_hover.is_some() && self.ctl.is_loaded() {
+                    "the --demo-hover session (a live one, by id prefix) or its events did not arrive"
+                } else {
+                    "the session list or the focused screen did not arrive"
                 };
                 self.fail(
                     event_loop,

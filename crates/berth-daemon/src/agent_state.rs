@@ -19,8 +19,15 @@
 //!   hooks are recorded as `hook:late`), only a revive (`reset`) does;
 //! - the nine core Claude hook events, `Notification` types with a clear
 //!   meaning and `PermissionRequest` / `PermissionDenied` /
-//!   `PostToolUseFailure` / `StopFailure` move the state; the other hook
-//!   events (`Other`) are recorded but never change it;
+//!   `PostToolUseFailure` / `StopFailure` / `PostCompact` / `Elicitation` /
+//!   `ElicitationResult` move the state; the other hook events (`Other`:
+//!   `SubagentStart`, `CwdChanged` — whose cwd the manager applies —,
+//!   unknown names) are recorded but never change it;
+//! - compaction ends (`PostCompact` or `SessionStart{compact}`, whichever
+//!   comes first — their order is not documented) in `Thinking` when it
+//!   began during a turn (auto-compact, the turn goes on) and in `Idle`
+//!   otherwise (`/compact` at the prompt: no turn follows, and a hook
+//!   `Thinking` would stay until the next prompt);
 //! - every applied signal is reported as `Applied` so the manager can write
 //!   an `EventRecord` (kind + short detail, never prompt text).
 
@@ -88,8 +95,11 @@ pub struct AgentMachine {
     info: AgentInfo,
     last_hook_ms: Option<i64>,
     subagent_stops: u32,
+    subagent_starts: u32,
     /// Previous `ForegroundProcess` name, to recognise an agent leaving.
     last_fg: Option<String>,
+    /// The current compaction began while the agent was busy.
+    compact_from_busy: bool,
 }
 
 impl AgentMachine {
@@ -98,7 +108,9 @@ impl AgentMachine {
             info,
             last_hook_ms: None,
             subagent_stops: 0,
+            subagent_starts: 0,
             last_fg: None,
+            compact_from_busy: false,
         }
     }
 
@@ -111,11 +123,24 @@ impl AgentMachine {
         self.info = info;
         self.last_hook_ms = None;
         self.subagent_stops = 0;
+        self.subagent_starts = 0;
         self.last_fg = None;
+        self.compact_from_busy = false;
     }
 
     pub fn subagent_stops(&self) -> u32 {
         self.subagent_stops
+    }
+
+    /// Where a compaction ends (see the module rules); `None` when none is
+    /// under way (the other end-of-compaction event already ended it).
+    fn after_compaction(&self) -> Option<AgentState> {
+        let end = if self.compact_from_busy {
+            AgentState::Thinking
+        } else {
+            AgentState::Idle
+        };
+        (self.info.state == AgentState::Compacting).then_some(end)
     }
 
     fn hook_recent(&self, now_ms: i64) -> bool {
@@ -143,8 +168,9 @@ impl AgentMachine {
     }
 
     /// The agent process is gone and the shell is back: kind `Shell` and
-    /// `state`; external id and transcript stay (for a later resume).
-    /// Returns whether the state changed.
+    /// `state`; the agent becomes `last_agent`, and external id and
+    /// transcript stay (for a later resume). Returns whether the state
+    /// changed.
     fn agent_left(
         &mut self,
         state: AgentState,
@@ -152,6 +178,9 @@ impl AgentMachine {
         confidence: f32,
         now_ms: i64,
     ) -> bool {
+        if self.info.kind.is_agent() {
+            self.info.last_agent = Some(self.info.kind.clone());
+        }
         self.info.kind = AgentKind::Shell;
         let before = self.info.state.clone();
         self.enter(state, source, confidence, now_ms);
@@ -173,6 +202,13 @@ impl AgentMachine {
     fn set_kind(&mut self, kind: AgentKind) -> bool {
         if self.info.kind == kind {
             return false;
+        }
+        // Ids and transcript belong to the agent that reported them (the one
+        // `resume_kind` names): another agent resuming them would open the
+        // wrong session. It reports its own.
+        if kind.is_agent() && self.info.resume_kind() != Some(&kind) {
+            self.info.external_id = None;
+            self.info.transcript_path = None;
         }
         self.info.kind = kind;
         true
@@ -353,6 +389,10 @@ impl AgentMachine {
             self.info.transcript_path = hook.transcript_path.clone();
         }
         let (name, detail, next): (&str, Option<String>, Option<AgentState>) = match &hook.event {
+            // `compact` is the end of a compaction, not a new session.
+            ClaudeHookEvent::SessionStart { source } if source.as_deref() == Some("compact") => {
+                ("SessionStart", source.clone(), self.after_compaction())
+            }
             ClaudeHookEvent::SessionStart { source } => {
                 ("SessionStart", source.clone(), Some(AgentState::Idle))
             }
@@ -395,6 +435,9 @@ impl AgentMachine {
                 ("SubagentStop", Some(self.subagent_stops.to_string()), None)
             }
             ClaudeHookEvent::PreCompact { trigger } => {
+                if self.info.state != AgentState::Compacting {
+                    self.compact_from_busy = self.info.state.is_busy();
+                }
                 ("PreCompact", trigger.clone(), Some(AgentState::Compacting))
             }
             // DESIGN §9: the agent left and the shell lives on (`Exited` is
@@ -434,8 +477,20 @@ impl AgentMachine {
                             message: "turn failed (StopFailure)".into(),
                         }),
                     ),
-                    // Everything else (PostCompact, CwdChanged, ...) is
-                    // recorded but never moves the state.
+                    "PostCompact" => (name, None, self.after_compaction()),
+                    // An MCP server asks the user for input; answered (by
+                    // the user or a hook), the model carries on.
+                    "Elicitation" => (name, None, Some(AgentState::WaitingInput)),
+                    "ElicitationResult" => (name, None, Some(AgentState::Thinking)),
+                    // Counted like `SubagentStop`; the main agent's state
+                    // stays.
+                    "SubagentStart" => {
+                        self.subagent_starts += 1;
+                        (name, Some(self.subagent_starts.to_string()), None)
+                    }
+                    // Everything else (CwdChanged — the manager moves the
+                    // cwd —, unknown events) is recorded but never moves
+                    // the state.
                     _ => (name, None, None),
                 }
             }
@@ -517,8 +572,7 @@ impl AgentMachine {
     pub fn apply_statusline(&mut self, s: &StatuslineUpdate) -> bool {
         let mut changed = false;
         if self.info.kind == AgentKind::Shell {
-            self.info.kind = AgentKind::Claude;
-            changed = true;
+            changed |= self.set_kind(AgentKind::Claude);
         }
         changed |= self.set_external_id(Some(&s.session_id));
         if s.model.is_some() && self.info.model != s.model {

@@ -8,7 +8,9 @@
 //! notifications follow the same focus and repeat rules.
 //!
 //! [`Notifier`] delivers on its own thread (`mac-notification-sys` may block
-//! briefly); failures are logged.
+//! briefly); failures are logged. The app identity notifications appear under
+//! (`[notify].identity`, default [`DEFAULT_IDENTITY`]) is set once, before
+//! the first one.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -102,15 +104,12 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    pub fn start() -> anyhow::Result<Notifier> {
+    /// `identity`: the bundle id notifications appear under.
+    pub fn start(identity: String) -> anyhow::Result<Notifier> {
         let (tx, rx) = crossbeam_channel::bounded::<(String, String)>(64);
         std::thread::Builder::new()
             .name("berth-notify".into())
-            .spawn(move || {
-                for (title, body) in rx {
-                    deliver(&title, &body);
-                }
-            })?;
+            .spawn(move || run(rx, &identity, set_identity, deliver))?;
         Ok(Notifier { tx })
     }
 
@@ -121,14 +120,65 @@ impl Notifier {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn deliver(title: &str, body: &str) {
-    // Unbundled binaries notify under the library's default identity until
-    // berth ships as an app bundle.
-    if let Err(e) = mac_notification_sys::send_notification(title, None, body, None) {
-        tracing::warn!(title, "desktop notification failed: {e}");
+/// The notifier thread: `identity` is set once, before the first
+/// notification (not at start, so a run that never notifies leaves the
+/// process untouched), then each notification is delivered in order.
+fn run(
+    rx: crossbeam_channel::Receiver<(String, String)>,
+    identity: &str,
+    identify: impl FnOnce(&str),
+    mut deliver: impl FnMut(&str, &str),
+) {
+    let mut identify = Some(identify);
+    for (title, body) in rx {
+        if let Some(identify) = identify.take() {
+            identify(identity);
+        }
+        deliver(&title, &body);
     }
 }
+
+/// Default of `[notify].identity`: the app identity of berth's notifications
+/// while berth runs as bare executables. Once it ships as an .app bundle,
+/// the default becomes that bundle's own id. Unbundled binaries have none;
+/// left unset, mac-notification-sys
+/// looks one up on the first notification with the AppleScript `get id of
+/// application "use_default"`, which on current macOS opens a "Where is
+/// use_default?" dialog and blocks the notifier thread for good. What that
+/// lookup falls back to, Finder, is refused on macOS 26: usernoted logs
+/// "Legacy client com.apple.finder connecting to modern client" and denies
+/// every notification. Terminal is accepted (the library's own default;
+/// macOS asks the user once whether Terminal may notify).
+pub const DEFAULT_IDENTITY: &str = "com.apple.Terminal";
+
+#[cfg(target_os = "macos")]
+fn set_identity(identity: &str) {
+    // Called once: the library allows one attempt, and after it (success or
+    // not) never runs its own lookup.
+    match mac_notification_sys::set_application(identity) {
+        Ok(()) => tracing::info!(identity, "desktop notification identity set"),
+        Err(e) => tracing::warn!(identity, "desktop notification identity not set: {e}"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn deliver(title: &str, body: &str) {
+    let started = Instant::now();
+    match mac_notification_sys::send_notification(title, None, body, None) {
+        // The library waits up to 2 s for macOS to confirm delivery and
+        // returns Ok either way; the time tells the two apart.
+        Ok(_) => tracing::info!(
+            title,
+            body,
+            ms = started.elapsed().as_millis() as u64,
+            "desktop notification handed to macOS"
+        ),
+        Err(e) => tracing::warn!(title, "desktop notification failed: {e}"),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_identity(_identity: &str) {}
 
 #[cfg(not(target_os = "macos"))]
 fn deliver(title: &str, body: &str) {
@@ -210,6 +260,32 @@ mod tests {
         assert!(!p.program_notify(s, false, t0 + Duration::from_secs(10)));
         p.forget(s);
         assert!(p.program_notify(s, false, t0 + Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn the_identity_is_set_once_before_the_first_notification() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(("a".to_string(), "1".to_string())).unwrap();
+        tx.send(("b".to_string(), "2".to_string())).unwrap();
+        drop(tx);
+        run(
+            rx,
+            "com.example.berth",
+            |id| calls.borrow_mut().push(format!("identify {id}")),
+            |t, b| calls.borrow_mut().push(format!("{t}:{b}")),
+        );
+        assert_eq!(
+            calls.into_inner(),
+            ["identify com.example.berth", "a:1", "b:2"]
+        );
+        // Nothing to deliver: the identity is left alone.
+        let (tx, rx) = crossbeam_channel::unbounded::<(String, String)>();
+        drop(tx);
+        let mut identified = false;
+        run(rx, DEFAULT_IDENTITY, |_| identified = true, |_, _| {});
+        assert!(!identified);
     }
 
     #[test]

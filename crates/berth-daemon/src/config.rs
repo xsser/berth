@@ -30,8 +30,9 @@ pub const ID_PLACEHOLDER: &str = "{id}";
 #[serde(default)]
 pub struct TerminalConfig {
     pub scrollback: usize,
-    /// `auto` | `none` (shell integration injection is not implemented yet;
-    /// parsed so configs stay valid).
+    /// `auto` (default) | `zsh`: interactive zsh sessions get the zsh
+    /// integration (`shell_integration.rs`); `none` turns it off. Other
+    /// values turn it off too (with a warning).
     pub shell_integration: String,
     /// Surface OSC 52 clipboard *stores* (DESIGN §11: off unless enabled;
     /// clipboard loads are always refused by berth-vt).
@@ -81,6 +82,15 @@ pub struct AgentConfig {
 impl Config {
     pub fn parse(text: &str) -> Result<Config, toml::de::Error> {
         let mut config: Config = toml::from_str(text)?;
+        if !matches!(
+            config.terminal.shell_integration.as_str(),
+            "auto" | "zsh" | "none"
+        ) {
+            tracing::warn!(
+                value = %config.terminal.shell_integration,
+                "unknown terminal.shell_integration (auto | zsh | none); integration off"
+            );
+        }
         config.resume_templates = config
             .agents
             .iter()
@@ -110,6 +120,11 @@ impl Config {
                 Config::default()
             }
         }
+    }
+
+    /// Whether interactive zsh sessions get the shell integration.
+    pub fn shell_integration(&self) -> bool {
+        matches!(self.terminal.shell_integration.as_str(), "auto" | "zsh")
     }
 
     pub fn scrollback(&self) -> usize {
