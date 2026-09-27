@@ -1,20 +1,32 @@
 //! The GUI's protocol state (integrate.md §1–§4), free of winit and wgpu so
 //! it can be driven by tests: workspaces and sessions (listed once, then
 //! kept current from `WorkspaceUpdated` / `SessionUpdated` /
-//! `SessionRemoved` / `AgentChanged` / `Exited`), the focused session's
-//! [`SessionView`], sidebar preview subscriptions, history prefetch, the
-//! paste pipeline, notification decisions and the list of errors shown to
-//! the user.
+//! `SessionRemoved` / `AgentChanged` / `Exited`), the split panes and one
+//! [`SessionView`] per pane, sidebar preview subscriptions, history
+//! prefetch, the paste pipeline, notification decisions and the list of
+//! errors shown to the user.
+//!
+//! Panes (DESIGN §17.3): a [`PaneTree`] says which sessions the terminal
+//! area shows; every pane has its own view, `Attach` and size (`Resize` is
+//! per pane, from the shared [`Geometry`]). The focused pane is the
+//! sidebar's "current" session and gets the keyboard. A session is shown
+//! by at most one pane: showing one that has a pane focuses that pane;
+//! otherwise it replaces the focused pane's session. The layout and the
+//! focus are reported through [`Controller::take_layout_changed`] for
+//! `gui-state.json`, and a saved layout is applied once the sessions are
+//! listed (panes of sessions that are gone are pruned).
 //!
 //! Subscription rules that follow from the daemon's semantics:
 //! - `Unsubscribe` drops *every* subscription of this connection on that
-//!   session, the `Attach` included, so it is never sent for the focused
-//!   session; focusing a session that has a preview sends `Unsubscribe`
+//!   session, the `Attach` included, so it is never sent for a session a
+//!   pane shows; showing a session that has a preview sends `Unsubscribe`
 //!   first and `Attach` after it (requests are handled in order).
-//! - Leaving a session sends `Detach`; its card re-subscribes a preview if
-//!   it is visible.
+//! - A pane that stops showing a session sends `Detach`; its card
+//!   re-subscribes a preview if it is visible.
 //! - The answer to `Attach` is the first full screen and the new `seq`
 //!   baseline; other screens for the session are ignored until it arrives.
+//!   One connection attaches to every shown session; the daemon keeps the
+//!   attachments per session.
 //!
 //! Card details are fetched on demand and cached: a hovered card's newest
 //! events (`ListEvents`, again after the session's agent changed) and, for
@@ -36,7 +48,9 @@ use berth_core::{
 };
 
 use crate::client::Client;
+use crate::gui_state::GuiState;
 use crate::notify::{self, Policy};
+use crate::panes::{Direction, Geometry, PaneError, PaneTree, Rect, Removal, SplitDir, SplitPath};
 use crate::paste::{self, JobReply, PasteJob};
 use crate::selection;
 use crate::session_view::SessionView;
@@ -146,12 +160,23 @@ pub enum Confirm {
     },
     /// ⌘W on a dormant / restored session: its history is deleted.
     Delete { session: SessionId, title: String },
+    /// 「删除 workspace…」 on a workspace without sessions.
+    DeleteWorkspace { id: WorkspaceId, name: String },
+}
+
+impl Confirm {
+    fn session(&self) -> Option<SessionId> {
+        match self {
+            Confirm::Kill { session, .. } | Confirm::Delete { session, .. } => Some(*session),
+            Confirm::DeleteWorkspace { .. } => None,
+        }
+    }
 }
 
 /// Traffic seen since the last [`Controller::take_counters`] (`--stats`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
-    /// `Screen` updates applied to the focused view.
+    /// `Screen` updates applied to the panes' views.
     pub screens: u64,
     /// Sidebar `Preview` updates, and how many sessions they came from.
     pub previews: u64,
@@ -171,8 +196,12 @@ enum Awaiting {
     CreateWorkspace {
         then_session: bool,
     },
-    CreateSession,
-    Attach,
+    /// `split`: open the new session in a pane beside this session's
+    /// (⌘D / ⌘⇧D) instead of in the focused pane.
+    CreateSession {
+        split: Option<(SessionId, SplitDir)>,
+    },
+    Attach(SessionId),
     Subscribe,
     Fetch(SessionId),
     /// `ListEvents` for a hovered card.
@@ -187,23 +216,76 @@ struct Sub {
     last_seen: Instant,
 }
 
+/// A pane's view of its session and the state of its `Attach`.
+struct Pane {
+    view: SessionView,
+    /// `Attach` was sent on this connection.
+    attached: bool,
+    /// The outstanding `Attach`: its answer is the baseline screen.
+    attach_id: Option<u32>,
+    /// The cells the pane fits.
+    dims: Dims,
+    /// The size last sent (`Attach` / `Resize`).
+    sent_dims: Option<Dims>,
+    resize_due: Option<Instant>,
+}
+
+impl Pane {
+    fn new(view: SessionView, dims: Dims) -> Pane {
+        Pane {
+            view,
+            attached: false,
+            attach_id: None,
+            dims,
+            sent_dims: None,
+            resize_due: None,
+        }
+    }
+
+    /// The connection is new or gone: nothing is attached.
+    fn detached(&mut self) {
+        self.attached = false;
+        self.attach_id = None;
+        self.sent_dims = None;
+        self.resize_due = None;
+    }
+}
+
+/// The cells of a pane at `rect` (the fallback size when it is too small
+/// for a terminal).
+fn fit(g: &Geometry, rect: Rect) -> Dims {
+    let d = g.cells(rect);
+    if d.cols < 2 || d.rows < 1 {
+        FALLBACK_DIMS
+    } else {
+        d
+    }
+}
+
 pub struct Controller {
     connected: bool,
     workspaces: Vec<Workspace>,
     sessions: HashMap<SessionId, SessionMeta>,
     previews: HashMap<SessionId, Preview>,
+    /// Which sessions the terminal area shows (`None`: none).
+    layout: Option<PaneTree>,
+    /// One per leaf of `layout`.
+    panes: HashMap<SessionId, Pane>,
+    /// The focused pane's session: the sidebar's "current" one, and where
+    /// keys go.
     focused: Option<SessionId>,
-    view: Option<SessionView>,
-    /// Session attached on the current connection.
-    attached_to: Option<SessionId>,
-    /// Outstanding `Attach`; its answer is the baseline screen.
-    attach_id: Option<u32>,
+    /// The terminal area in pixels (`None` until the window reports it).
+    geometry: Option<Geometry>,
+    /// The layout and focus last reported by [`Self::take_layout_changed`]
+    /// (or restored).
+    reported: (Option<PaneTree>, Option<SessionId>),
+    /// The first listing placed the panes: the layout is worth saving.
+    layout_ready: bool,
+    /// `gui-state.json` as read at start; applied once sessions are listed.
+    restore: Option<GuiState>,
     subs: HashMap<SessionId, Sub>,
     pending: HashMap<u32, Awaiting>,
     notices: Vec<Notice>,
-    grid: Dims,
-    sent_dims: Option<Dims>,
-    resize_due: Option<Instant>,
     /// The one paste in progress. Known v1 limit: pasting into another
     /// session cancels it (with an error notice naming the bytes not sent).
     paste: Option<(SessionId, PasteJob)>,
@@ -215,6 +297,9 @@ pub struct Controller {
     mark_read_sent: HashSet<SessionId>,
     /// `--session`: focus this id (or unique prefix) once listed.
     want: Option<String>,
+    /// `--split-right` / `--split-down` after `--session`: a layout built
+    /// once listed (`SID` or `SID@TARGET`).
+    want_splits: Vec<(SplitDir, String)>,
     /// Create a session when the daemon has none (first start).
     pub auto_session: bool,
     auto_created: bool,
@@ -232,16 +317,16 @@ impl Controller {
             workspaces: Vec::new(),
             sessions: HashMap::new(),
             previews: HashMap::new(),
+            layout: None,
+            panes: HashMap::new(),
             focused: None,
-            view: None,
-            attached_to: None,
-            attach_id: None,
+            geometry: None,
+            reported: (None, None),
+            layout_ready: false,
+            restore: None,
             subs: HashMap::new(),
             pending: HashMap::new(),
             notices: Vec::new(),
-            grid: Dims::default(),
-            sent_dims: None,
-            resize_due: None,
             paste: None,
             policy: Policy::new(notify_on),
             window_focused: true,
@@ -250,6 +335,7 @@ impl Controller {
             loaded_sessions: false,
             mark_read_sent: HashSet::new(),
             want: None,
+            want_splits: Vec::new(),
             auto_session: true,
             auto_created: false,
             new_session_command: None,
@@ -282,12 +368,71 @@ impl Controller {
         self.sessions.get(&sid)
     }
 
+    /// The focused pane's view.
     pub fn view(&self) -> Option<&SessionView> {
-        self.view.as_ref()
+        self.pane_view(self.focused?)
     }
 
     pub fn view_mut(&mut self) -> Option<&mut SessionView> {
-        self.view.as_mut()
+        self.pane_view_mut(self.focused?)
+    }
+
+    /// The view of `sid`'s pane.
+    pub fn pane_view(&self, sid: SessionId) -> Option<&SessionView> {
+        self.panes.get(&sid).map(|p| &p.view)
+    }
+
+    pub fn pane_view_mut(&mut self, sid: SessionId) -> Option<&mut SessionView> {
+        self.panes.get_mut(&sid).map(|p| &mut p.view)
+    }
+
+    /// Every pane's view, in no particular order.
+    pub fn views_mut(&mut self) -> impl Iterator<Item = &mut SessionView> {
+        self.panes.values_mut().map(|p| &mut p.view)
+    }
+
+    /// Which sessions the terminal area shows (`None`: none).
+    pub fn layout(&self) -> Option<&PaneTree> {
+        self.layout.as_ref()
+    }
+
+    /// Whether `sid` has a pane (it is never shown twice).
+    pub fn is_shown(&self, sid: SessionId) -> bool {
+        self.panes.contains_key(&sid)
+    }
+
+    pub fn pane_count(&self) -> usize {
+        self.layout.as_ref().map_or(0, PaneTree::pane_count)
+    }
+
+    /// The cells `sid`'s pane fits.
+    pub fn pane_dims(&self, sid: SessionId) -> Option<Dims> {
+        self.panes.get(&sid).map(|p| p.dims)
+    }
+
+    /// The layout and the focus, for `gui-state.json`.
+    pub fn gui_state(&self) -> GuiState {
+        GuiState::new(self.layout.clone(), self.focused)
+    }
+
+    /// The first listing placed the panes: before that the layout is not
+    /// known yet and must not overwrite a saved one.
+    pub fn layout_ready(&self) -> bool {
+        self.layout_ready
+    }
+
+    /// The layout or the focus changed since the previous call (or the
+    /// restore): the state to write.
+    pub fn take_layout_changed(&mut self) -> Option<GuiState> {
+        if !self.layout_ready {
+            return None;
+        }
+        let now = (self.layout.clone(), self.focused);
+        if now == self.reported {
+            return None;
+        }
+        self.reported = now;
+        Some(self.gui_state())
     }
 
     pub fn preview(&self, sid: SessionId) -> Option<&Preview> {
@@ -396,7 +541,7 @@ impl Controller {
     }
 
     pub fn copy_text(&self) -> Option<String> {
-        let view = self.view.as_ref()?;
+        let view = self.view()?;
         let span = view.selection_span()?;
         let text = selection::selection_text(&span, |v| view.line(v));
         (!text.is_empty()).then_some(text)
@@ -411,15 +556,11 @@ impl Controller {
             return None;
         }
         let paste = self.paste.as_ref().and_then(|(_, j)| j.deadline());
-        let history = self
-            .view
-            .as_ref()
-            .filter(|_| self.attach_id.is_none())
-            .and_then(SessionView::next_deadline);
-        [self.resize_due, paste, history]
-            .into_iter()
-            .flatten()
-            .min()
+        let panes = self.panes.values().flat_map(|p| {
+            let history = p.view.next_deadline().filter(|_| p.attach_id.is_none());
+            [p.resize_due, history]
+        });
+        panes.chain([paste]).flatten().min()
     }
 
     // -- notices ---------------------------------------------------------
@@ -475,13 +616,28 @@ impl Controller {
         self.want = Some(id_or_prefix);
     }
 
+    /// Set before the first connection, after [`Self::want_session`]: once
+    /// listed, split a pane and show this session in the new one. `spec` is
+    /// `SID` (split the pane added last) or `SID@TARGET` (split TARGET's);
+    /// ids or unique prefixes.
+    pub fn want_split(&mut self, dir: SplitDir, spec: String) {
+        self.want_splits.push((dir, spec));
+    }
+
+    /// Set before the first connection: the saved layout, applied (without
+    /// the sessions that are gone or archived) once listed.
+    pub fn restore(&mut self, state: GuiState) {
+        self.reported = (state.layout.clone(), state.focused);
+        self.restore = Some(state);
+    }
+
     pub fn on_connected(&mut self, out: &mut dyn Outbound) {
         self.connected = true;
         self.pending.clear();
         self.subs.clear();
-        self.attached_to = None;
-        self.attach_id = None;
-        self.sent_dims = None;
+        for p in self.panes.values_mut() {
+            p.detached();
+        }
         self.mark_read_sent.clear();
         self.recent.clear();
         self.resume.clear();
@@ -496,8 +652,9 @@ impl Controller {
         self.connected = false;
         self.pending.clear();
         self.subs.clear();
-        self.attached_to = None;
-        self.attach_id = None;
+        for p in self.panes.values_mut() {
+            p.detached();
+        }
         if let Some((_, job)) = self.paste.take() {
             if !job.is_done() {
                 self.error(format!(
@@ -531,14 +688,6 @@ impl Controller {
         }
     }
 
-    fn grid_dims(&self) -> Dims {
-        if self.grid.cols < 2 || self.grid.rows < 1 {
-            FALLBACK_DIMS
-        } else {
-            self.grid
-        }
-    }
-
     // -- inbound -----------------------------------------------------------
 
     /// Apply one daemon message.
@@ -569,7 +718,12 @@ impl Controller {
                     self.create_session(out, id);
                 }
             }
-            Event::WorkspaceRemoved(id) => self.workspaces.retain(|w| w.id != id),
+            Event::WorkspaceRemoved(id) => {
+                self.workspaces.retain(|w| w.id != id);
+                if matches!(self.confirm, Some(Confirm::DeleteWorkspace { id: c, .. }) if c == id) {
+                    self.confirm = None;
+                }
+            }
             Event::Sessions(list) => {
                 self.sessions = list.into_iter().map(|m| (m.id, m)).collect();
                 for m in self.sessions.values() {
@@ -589,10 +743,8 @@ impl Controller {
                 lines,
                 styles,
             } => {
-                if let (Some(view), Some(id)) = (self.view.as_mut(), reply_to) {
-                    if view.id == session {
-                        view.apply_lines(id, start, lines, &styles);
-                    }
+                if let (Some(p), Some(id)) = (self.panes.get_mut(&session), reply_to) {
+                    p.view.apply_lines(id, start, lines, &styles);
                 }
             }
             Event::Preview {
@@ -742,17 +894,18 @@ impl Controller {
                 }
                 return;
             }
-            Some(Awaiting::Attach) => {
-                self.attach_id = None;
-                self.attached_to = None;
+            Some(Awaiting::Attach(sid)) => {
+                if let Some(p) = self.panes.get_mut(&sid) {
+                    if p.attach_id == reply_to {
+                        p.detached();
+                    }
+                }
                 format!("无法打开 session：{message}")
             }
             Some(Awaiting::Subscribe) => format!("无法订阅侧栏预览：{message}"),
             Some(Awaiting::Fetch(sid)) => {
-                if let (Some(view), Some(id)) = (self.view.as_mut(), reply_to) {
-                    if view.id == sid {
-                        view.fetch_failed(id, now);
-                    }
+                if let (Some(p), Some(id)) = (self.panes.get_mut(&sid), reply_to) {
+                    p.view.fetch_failed(id, now);
                 }
                 format!("读取历史失败：{message}")
             }
@@ -760,7 +913,7 @@ impl Controller {
                 format!("读取 session 列表失败：{message}")
             }
             Some(Awaiting::CreateWorkspace { .. }) => format!("新建 workspace 失败：{message}"),
-            Some(Awaiting::CreateSession) => format!("新建 session 失败：{message}"),
+            Some(Awaiting::CreateSession { .. }) => format!("新建 session 失败：{message}"),
             Some(Awaiting::Command(what)) => format!("{what}失败：{message}"),
             None if message.starts_with("backpressure:") => {
                 format!("输入被拒绝（程序没有读取输入）：{message}")
@@ -768,8 +921,9 @@ impl Controller {
             None => format!("berthd：{message}"),
         };
         self.error(text);
-        // A failed attach leaves the focused session without a screen; keep
-        // the placeholder rather than retrying in a loop.
+        // A failed attach leaves its pane without a screen; keep the
+        // placeholder rather than retrying in a loop (the next layout change
+        // or click on the session attaches again).
         let _ = out;
     }
 
@@ -777,26 +931,78 @@ impl Controller {
         if !self.is_loaded() {
             return;
         }
+        // The saved layout (first listing only: a reconnect keeps the panes).
+        if let Some(state) = self.restore.take() {
+            if self.layout.is_none() {
+                let sessions = &self.sessions;
+                self.layout = state.layout.and_then(|t| {
+                    t.prune(|sid| sessions.get(&sid).is_some_and(|m| !m.is_archived()))
+                });
+                self.focused = state.focused;
+            }
+        }
+        // `--session`, with `--split-*` a whole layout.
         if let Some(want) = self.want.take() {
             match self.find_session(&want) {
-                Ok(sid) => self.focused = Some(sid),
+                Ok(sid) => {
+                    let splits = std::mem::take(&mut self.want_splits);
+                    if splits.is_empty() {
+                        self.show(sid);
+                    } else {
+                        self.build_layout(sid, splits);
+                    }
+                }
                 Err(e) => self.error(e),
             }
         }
-        match self.focused {
-            Some(sid) if self.sessions.contains_key(&sid) => self.focus(out, sid, now),
-            _ => {
-                self.focused = None;
-                self.view = None;
-                if let Some(first) = self.jump_order().first().copied() {
-                    self.focus(out, first, now);
-                }
+        self.want_splits.clear();
+        // Sessions that went away while disconnected.
+        let sessions = &self.sessions;
+        self.layout = self
+            .layout
+            .take()
+            .and_then(|t| t.prune(|sid| sessions.contains_key(&sid)));
+        if self.layout.is_none() {
+            if let Some(first) = self.jump_order().first().copied() {
+                self.show(first);
             }
         }
+        self.layout_ready = true;
+        self.sync_panes(out, now);
         if self.sessions.is_empty() && self.auto_session && !self.auto_created {
             self.auto_created = true;
             self.new_session(out);
         }
+    }
+
+    /// `--session FIRST --split-right B --split-down C@FIRST …`: FIRST is
+    /// focused; a split without `@TARGET` splits the pane added last.
+    fn build_layout(&mut self, first: SessionId, splits: Vec<(SplitDir, String)>) {
+        let mut tree = PaneTree::Leaf(first);
+        let mut last = first;
+        for (dir, spec) in splits {
+            let (want, target) = match spec.split_once('@') {
+                Some((s, t)) => (s, Some(t)),
+                None => (spec.as_str(), None),
+            };
+            let placed = self.find_session(want).and_then(|sid| {
+                let target = match target {
+                    Some(t) => self.find_session(t)?,
+                    None => last,
+                };
+                tree.split(target, sid, dir).map_err(|e| match e {
+                    PaneError::AlreadyShown => format!("{want} 已在分屏中"),
+                    PaneError::NotShown => format!("{} 不在分屏中", target.short()),
+                })?;
+                Ok(sid)
+            });
+            match placed {
+                Ok(sid) => last = sid,
+                Err(e) => self.error(format!("分屏参数 {spec}：{e}")),
+            }
+        }
+        self.layout = Some(tree);
+        self.focused = Some(first);
     }
 
     /// A session id or unique prefix (with or without dashes).
@@ -835,19 +1041,39 @@ impl Controller {
         }
         let live = meta.is_live();
         self.sessions.insert(sid, meta);
-        if matches!(awaiting, Some(Awaiting::CreateSession)) {
-            self.focus(out, sid, now);
+        if let Some(Awaiting::CreateSession { split }) = awaiting {
+            // Beside the pane it was split from; if that pane went away
+            // meanwhile, beside the focused one.
+            let beside = split.and_then(|(target, dir)| {
+                let target = if self.is_shown(target) {
+                    target
+                } else {
+                    self.focused?
+                };
+                Some((target, dir))
+            });
+            let placed = match (beside, self.layout.as_mut()) {
+                (Some((target, dir)), Some(tree)) => tree.split(target, sid, dir).is_ok(),
+                _ => false,
+            };
+            if placed {
+                self.focused = Some(sid);
+                self.sync_panes(out, now);
+            } else {
+                self.focus(out, sid, now);
+            }
             return;
         }
-        if self.focused == Some(sid) {
-            if was_live == Some(false) && live && self.connected {
-                // Revived: the actor may be a new one (after a crash) that
-                // has no subscription of ours — attach again.
-                self.attached_to = None;
-                self.focus(out, sid, now);
-            } else {
-                self.mark_read(out, sid);
-            }
+        let Some(p) = self.panes.get_mut(&sid) else {
+            return;
+        };
+        if was_live == Some(false) && live && self.connected {
+            // Revived: the actor may be a new one (after a crash) that has
+            // no subscription of ours — attach again (the view is kept).
+            p.detached();
+            self.sync_panes(out, now);
+        } else if self.focused == Some(sid) {
+            self.mark_read(out, sid);
         }
     }
 
@@ -862,87 +1088,336 @@ impl Controller {
         if self.paste.as_ref().is_some_and(|(s, _)| *s == sid) {
             self.paste = None;
         }
-        if self.confirm.as_ref().is_some_and(|c| match c {
-            Confirm::Kill { session, .. } | Confirm::Delete { session, .. } => *session == sid,
-        }) {
+        if self.confirm.as_ref().and_then(Confirm::session) == Some(sid) {
             self.confirm = None;
         }
-        if self.focused == Some(sid) {
-            self.focused = None;
-            self.view = None;
-            self.attached_to = None;
-            self.attach_id = None;
-            if let Some(first) = self.jump_order().first().copied() {
-                self.focus(out, first, now);
+        // Its pane closes (no `Detach`: the session is gone); the last one
+        // shows the first session left.
+        self.panes.remove(&sid);
+        if let Some(tree) = self.layout.as_mut() {
+            match tree.remove(sid) {
+                Removal::Removed { focus } => {
+                    if self.focused == Some(sid) {
+                        self.focused = Some(focus);
+                    }
+                }
+                Removal::LastPane => {
+                    self.layout = None;
+                    self.focused = None;
+                    if let Some(first) = self.jump_order().first().copied() {
+                        self.show(first);
+                    }
+                }
+                Removal::NotShown => return,
             }
         }
+        self.sync_panes(out, now);
     }
 
     fn on_screen(&mut self, reply_to: Option<u32>, u: &ScreenUpdate) {
-        let Some(view) = self.view.as_mut() else {
+        let Some(p) = self.panes.get_mut(&u.session) else {
             return;
         };
-        if view.id != u.session {
-            return;
-        }
-        let baseline = reply_to.is_some() && reply_to == self.attach_id;
+        let baseline = reply_to.is_some() && reply_to == p.attach_id;
         if baseline {
-            self.attach_id = None;
-        } else if self.attach_id.is_some() {
+            p.attach_id = None;
+        } else if p.attach_id.is_some() {
             return; // waiting for the Attach answer
         }
-        if view.apply_screen(u, baseline) {
+        if p.view.apply_screen(u, baseline) {
             self.counters.screens += 1;
         }
     }
 
-    // -- focus, visibility, geometry ------------------------------------
+    // -- panes, focus, visibility, geometry -----------------------------
 
-    /// Show `sid` in the main view.
+    /// Show `sid`: focus its pane if it has one, else show it in the
+    /// focused pane (sidebar click, ⌘1..9, a new session).
     pub fn focus(&mut self, out: &mut dyn Outbound, sid: SessionId, now: Instant) {
         if !self.sessions.contains_key(&sid) {
             return;
         }
-        if self.focused == Some(sid) && (self.attached_to == Some(sid) || !self.connected) {
-            self.mark_read(out, sid);
+        self.show(sid);
+        self.sync_panes(out, now);
+    }
+
+    /// The layout part of [`Self::focus`].
+    fn show(&mut self, sid: SessionId) {
+        match self.layout.as_mut() {
+            Some(tree) if tree.contains(sid) => {}
+            Some(tree) => {
+                let target = self
+                    .focused
+                    .filter(|f| tree.contains(*f))
+                    .unwrap_or_else(|| tree.first_leaf());
+                tree.replace(target, sid);
+            }
+            None => self.layout = Some(PaneTree::Leaf(sid)),
+        }
+        self.focused = Some(sid);
+    }
+
+    /// Sidebar menu 「在右侧/下方分屏打开」: `sid` in a new pane beside the
+    /// focused one (a session already shown just gets the focus).
+    pub fn open_in_split(
+        &mut self,
+        out: &mut dyn Outbound,
+        sid: SessionId,
+        dir: SplitDir,
+        now: Instant,
+    ) {
+        if !self.sessions.contains_key(&sid) {
             return;
         }
-        if let Some(prev) = self.focused.filter(|p| *p != sid) {
-            if self.attached_to == Some(prev) && self.connected {
+        let target = self.focused.filter(|f| self.panes_in_layout(*f));
+        let placed = match (self.layout.as_mut(), target) {
+            (Some(tree), Some(target)) => tree.split(target, sid, dir).is_ok(),
+            _ => false,
+        };
+        if !placed {
+            self.show(sid);
+        }
+        self.focused = Some(sid);
+        self.sync_panes(out, now);
+    }
+
+    /// ⌘D / ⌘⇧D: a new session beside the focused pane, in the focused
+    /// session's workspace and cwd, shown once berthd created it. Without a
+    /// pane this is ⌘N.
+    pub fn split(&mut self, out: &mut dyn Outbound, dir: SplitDir) {
+        let Some(meta) = self.focused_meta() else {
+            self.new_session(out);
+            return;
+        };
+        let target = meta.id;
+        let cwd = (!meta.cwd.as_os_str().is_empty()).then(|| meta.cwd.clone());
+        let ws = Some(meta.workspace)
+            .filter(|w| self.workspace(*w).is_some())
+            .or_else(|| self.workspaces.first().map(|w| w.id));
+        let Some(workspace) = ws else {
+            self.new_session(out);
+            return;
+        };
+        let req = Request::CreateSession {
+            workspace,
+            cwd,
+            command: self.new_session_command.clone(),
+            title: None,
+            dims: self.split_dims(target, dir),
+        };
+        self.send(
+            out,
+            req,
+            Some(Awaiting::CreateSession {
+                split: Some((target, dir)),
+            }),
+        );
+    }
+
+    /// 「从分屏移除」: close `sid`'s pane and keep the session running; the
+    /// neighbour takes the space (and the focus, if it was focused). The
+    /// last pane stays. Returns whether a pane was closed.
+    pub fn remove_from_split(
+        &mut self,
+        out: &mut dyn Outbound,
+        sid: SessionId,
+        now: Instant,
+    ) -> bool {
+        let Some(tree) = self.layout.as_mut() else {
+            return false;
+        };
+        match tree.remove(sid) {
+            Removal::Removed { focus } => {
+                if self.focused == Some(sid) {
+                    self.focused = Some(focus);
+                }
+                self.sync_panes(out, now);
+                true
+            }
+            Removal::NotShown | Removal::LastPane => false,
+        }
+    }
+
+    /// ⌥⌘ arrows: focus the pane next to the focused one.
+    pub fn focus_dir(&mut self, out: &mut dyn Outbound, dir: Direction, now: Instant) {
+        let (area, divider) = self.area();
+        let next = match (self.layout.as_ref(), self.focused) {
+            (Some(tree), Some(from)) => tree.neighbor(area, divider, from, dir),
+            _ => None,
+        };
+        if let Some(sid) = next {
+            self.focus(out, sid, now);
+        }
+    }
+
+    /// A divider is dragged: the split's ratio (clamped); the panes are
+    /// resized after the debounce.
+    pub fn set_ratio(&mut self, path: &SplitPath, ratio: f32, now: Instant) {
+        if self
+            .layout
+            .as_mut()
+            .is_some_and(|t| t.set_ratio(path, ratio))
+        {
+            self.resize_panes(now);
+        }
+    }
+
+    /// The terminal area's geometry; every pane whose size in cells
+    /// changed sends `Resize` after [`RESIZE_DEBOUNCE`] without further
+    /// change.
+    pub fn set_geometry(&mut self, g: Geometry, now: Instant) {
+        if self.geometry != Some(g) {
+            self.geometry = Some(g);
+            self.resize_panes(now);
+        }
+    }
+
+    /// Tests: a terminal area of `dims` cells of 10×20 px, no padding.
+    #[cfg(test)]
+    pub fn set_grid(&mut self, dims: Dims, now: Instant) {
+        let (w, h) = (f32::from(dims.cols) * 10.0, f32::from(dims.rows) * 20.0);
+        self.set_geometry(
+            Geometry {
+                area: Rect::new(0.0, 0.0, w, h),
+                cell_w: 10.0,
+                cell_h: 20.0,
+                pad: 0.0,
+                divider: 6.0,
+            },
+            now,
+        );
+    }
+
+    /// The terminal area and the divider width (a nominal area before the
+    /// window reported one: only the panes' relative places matter then).
+    fn area(&self) -> (Rect, f32) {
+        match self.geometry {
+            Some(g) => (g.area, g.divider),
+            None => (Rect::new(0.0, 0.0, 1000.0, 1000.0), 6.0),
+        }
+    }
+
+    /// Every leaf's cells for the current geometry, in tree order.
+    fn leaf_dims(&self) -> Vec<(SessionId, Dims)> {
+        let Some(tree) = self.layout.as_ref() else {
+            return Vec::new();
+        };
+        match self.geometry {
+            Some(g) => tree
+                .layout(g.area, g.divider)
+                .panes
+                .iter()
+                .map(|p| (p.session, fit(&g, p.rect)))
+                .collect(),
+            None => tree
+                .leaves()
+                .into_iter()
+                .map(|s| (s, FALLBACK_DIMS))
+                .collect(),
+        }
+    }
+
+    /// The cells a new pane would get by splitting `target`'s.
+    fn split_dims(&self, target: SessionId, dir: SplitDir) -> Dims {
+        let (Some(g), Some(tree)) = (self.geometry, self.layout.as_ref()) else {
+            return FALLBACK_DIMS;
+        };
+        let probe = SessionId::new();
+        let mut tree = tree.clone();
+        if tree.split(target, probe, dir).is_err() {
+            return FALLBACK_DIMS;
+        }
+        tree.layout(g.area, g.divider)
+            .rect_of(probe)
+            .map_or(FALLBACK_DIMS, |r| fit(&g, r))
+    }
+
+    /// The cells of the pane a new session will be shown in (the focused
+    /// one; the whole area when nothing is shown).
+    fn replace_dims(&self) -> Dims {
+        if let Some(d) = self.focused.and_then(|s| self.pane_dims(s)) {
+            return d;
+        }
+        self.geometry.map_or(FALLBACK_DIMS, |g| fit(&g, g.area))
+    }
+
+    fn resize_panes(&mut self, now: Instant) {
+        for (sid, dims) in self.leaf_dims() {
+            if let Some(p) = self.panes.get_mut(&sid) {
+                if p.dims != dims {
+                    p.dims = dims;
+                    if p.attached {
+                        p.resize_due = Some(now + RESIZE_DEBOUNCE);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Make the panes match the layout: `Detach` the sessions no longer
+    /// shown, a view per new pane, sizes from the geometry, `Attach` every
+    /// pane not attached on this connection (dropping its preview first),
+    /// a focus that is one of the panes, marked read.
+    fn sync_panes(&mut self, out: &mut dyn Outbound, now: Instant) {
+        let dims = self.leaf_dims();
+        let gone: Vec<SessionId> = self
+            .panes
+            .keys()
+            .filter(|sid| !dims.iter().any(|(s, _)| s == *sid))
+            .copied()
+            .collect();
+        for sid in gone {
+            let attached = self.panes.remove(&sid).is_some_and(|p| p.attached);
+            if attached && self.connected && self.sessions.contains_key(&sid) {
                 self.send(
                     out,
-                    Request::Detach { session: prev },
+                    Request::Detach { session: sid },
                     Some(Awaiting::Command("离开 session ")),
                 );
             }
-            self.attached_to = None;
         }
-        if self.focused != Some(sid) || self.view.as_ref().is_none_or(|v| v.id != sid) {
-            self.view = Some(SessionView::new(sid));
+        if !self.focused.is_some_and(|f| self.panes_in_layout(f)) {
+            self.focused = self.layout.as_ref().map(PaneTree::first_leaf);
         }
-        self.focused = Some(sid);
-        self.attach_id = None;
+        for &(sid, d) in &dims {
+            self.panes
+                .entry(sid)
+                .or_insert_with(|| Pane::new(SessionView::new(sid), d));
+        }
+        self.resize_panes(now);
         if self.connected {
-            if self.subs.remove(&sid).is_some() {
-                self.send(
+            for &(sid, _) in &dims {
+                if self.panes.get(&sid).is_none_or(|p| p.attached) {
+                    continue;
+                }
+                if self.subs.remove(&sid).is_some() {
+                    self.send(
+                        out,
+                        Request::Unsubscribe { session: sid },
+                        Some(Awaiting::Command("取消预览")),
+                    );
+                }
+                let dims = self.panes[&sid].dims;
+                let id = self.send(
                     out,
-                    Request::Unsubscribe { session: sid },
-                    Some(Awaiting::Command("取消预览")),
+                    Request::Attach { session: sid, dims },
+                    Some(Awaiting::Attach(sid)),
                 );
+                if let (Some(p), Some(id)) = (self.panes.get_mut(&sid), id) {
+                    p.attached = true;
+                    p.attach_id = Some(id);
+                    p.sent_dims = Some(dims);
+                    p.resize_due = None;
+                }
             }
-            let dims = self.grid_dims();
-            self.attach_id = self.send(
-                out,
-                Request::Attach { session: sid, dims },
-                Some(Awaiting::Attach),
-            );
-            if self.attach_id.is_some() {
-                self.attached_to = Some(sid);
-                self.sent_dims = Some(dims);
-            }
+        }
+        if let Some(sid) = self.focused {
             self.mark_read(out, sid);
         }
-        let _ = now;
+    }
+
+    fn panes_in_layout(&self, sid: SessionId) -> bool {
+        self.layout.as_ref().is_some_and(|t| t.contains(sid))
     }
 
     fn mark_read(&mut self, out: &mut dyn Outbound, sid: SessionId) {
@@ -972,7 +1447,7 @@ impl Controller {
             if self.sessions.get(&sid).is_some_and(resumable) {
                 self.want_resume(out, sid);
             }
-            if Some(sid) == self.focused || !self.sessions.contains_key(&sid) {
+            if self.panes.contains_key(&sid) || !self.sessions.contains_key(&sid) {
                 continue;
             }
             match self.subs.get_mut(&sid) {
@@ -999,7 +1474,7 @@ impl Controller {
             .collect();
         for sid in stale {
             self.subs.remove(&sid);
-            if Some(sid) != self.focused {
+            if !self.panes.contains_key(&sid) {
                 self.send(
                     out,
                     Request::Unsubscribe { session: sid },
@@ -1057,15 +1532,6 @@ impl Controller {
         );
     }
 
-    /// The grid size the window fits; sent as `Resize` after
-    /// [`RESIZE_DEBOUNCE`] without further change.
-    pub fn set_grid(&mut self, dims: Dims, now: Instant) {
-        if dims != self.grid {
-            self.grid = dims;
-            self.resize_due = Some(now + RESIZE_DEBOUNCE);
-        }
-    }
-
     /// Timers: resize debounce, paste retries, history prefetch.
     pub fn tick(&mut self, out: &mut dyn Outbound, now: Instant) {
         self.notices.retain(|n| {
@@ -1074,56 +1540,81 @@ impl Controller {
         if !self.connected {
             return;
         }
-        if self.resize_due.is_some_and(|t| now >= t) {
-            self.resize_due = None;
-            let dims = self.grid_dims();
-            if let Some(sid) = self.attached_to {
-                if self.sent_dims != Some(dims) {
-                    self.send(
-                        out,
-                        Request::Resize { session: sid, dims },
-                        Some(Awaiting::Command("调整尺寸")),
-                    );
-                    self.sent_dims = Some(dims);
-                }
+        let leaves = self
+            .layout
+            .as_ref()
+            .map(PaneTree::leaves)
+            .unwrap_or_default();
+        for sid in leaves {
+            let Some(p) = self.panes.get_mut(&sid) else {
+                continue;
+            };
+            if !p.resize_due.is_some_and(|t| now >= t) {
+                continue;
+            }
+            p.resize_due = None;
+            if p.attached && p.sent_dims != Some(p.dims) {
+                let dims = p.dims;
+                p.sent_dims = Some(dims);
+                self.send(
+                    out,
+                    Request::Resize { session: sid, dims },
+                    Some(Awaiting::Command("调整尺寸")),
+                );
             }
         }
         self.pump_paste(out, now);
         self.fetch_history(out, now);
     }
 
-    /// Scroll the main view (positive: up into the history).
+    /// Scroll the focused pane (positive: up into the history).
     pub fn scroll(&mut self, out: &mut dyn Outbound, lines: i64, now: Instant) {
-        if let Some(view) = self.view.as_mut() {
-            view.scroll_by(lines);
+        if let Some(sid) = self.focused {
+            self.scroll_in(out, sid, lines, now);
+        }
+    }
+
+    /// Scroll `sid`'s pane (the wheel over a pane that is not focused).
+    pub fn scroll_in(&mut self, out: &mut dyn Outbound, sid: SessionId, lines: i64, now: Instant) {
+        if let Some(p) = self.panes.get_mut(&sid) {
+            p.view.scroll_by(lines);
         }
         self.fetch_history(out, now);
     }
 
     fn fetch_history(&mut self, out: &mut dyn Outbound, now: Instant) {
-        if !self.connected || self.attach_id.is_some() {
+        if !self.connected {
             return;
         }
-        let Some(view) = self.view.as_mut() else {
-            return;
-        };
-        let sid = view.id;
+        let leaves = self
+            .layout
+            .as_ref()
+            .map(PaneTree::leaves)
+            .unwrap_or_default();
         let mut failed = None;
-        for f in view.wanted_fetches(now) {
-            let req = Request::FetchLines {
-                session: sid,
-                start: f.start,
-                count: f.count,
+        'panes: for sid in leaves {
+            let Some(p) = self.panes.get_mut(&sid) else {
+                continue;
             };
-            match out.send(req) {
-                Ok(id) => {
-                    view.note_fetch(id, f);
-                    self.pending.insert(id, Awaiting::Fetch(sid));
-                }
-                Err(e) => {
-                    view.fetch_failed(0, now);
-                    failed = Some(e);
-                    break;
+            if p.attach_id.is_some() {
+                continue;
+            }
+            for f in p.view.wanted_fetches(now) {
+                let req = Request::FetchLines {
+                    session: sid,
+                    start: f.start,
+                    count: f.count,
+                };
+                match out.send(req) {
+                    Ok(id) => {
+                        p.view.note_fetch(id, f);
+                        self.pending.insert(id, Awaiting::Fetch(sid));
+                    }
+                    Err(e) => {
+                        p.view.fetch_failed(0, now);
+                        failed = Some(e);
+                        break 'panes;
+                    }
                 }
             }
         }
@@ -1155,7 +1646,7 @@ impl Controller {
         let Some(sid) = self.focused_live() else {
             return;
         };
-        if let Some(view) = self.view.as_mut() {
+        if let Some(view) = self.view_mut() {
             view.scroll_to_bottom();
             view.clear_selection();
         }
@@ -1178,13 +1669,24 @@ impl Controller {
         }
     }
 
-    /// Bytes the terminal protocol generates (mouse reports, focus in/out):
-    /// sent like keys but without scrolling or touching the selection, and
-    /// silently dropped when the session cannot take input.
+    /// Bytes the terminal protocol generates (mouse reports, focus in/out)
+    /// for the focused pane's session.
     pub fn report(&mut self, out: &mut dyn Outbound, bytes: Vec<u8>, now: Instant) {
-        let Some(sid) = self.focused else {
-            return;
-        };
+        if let Some(sid) = self.focused {
+            self.report_to(out, sid, bytes, now);
+        }
+    }
+
+    /// Protocol bytes for `sid` (a pane under the pointer): sent like keys
+    /// but without scrolling or touching the selection, and silently
+    /// dropped when the session cannot take input.
+    pub fn report_to(
+        &mut self,
+        out: &mut dyn Outbound,
+        sid: SessionId,
+        bytes: Vec<u8>,
+        now: Instant,
+    ) {
         if bytes.is_empty()
             || !self.connected
             || !self.sessions.get(&sid).is_some_and(SessionMeta::is_live)
@@ -1214,16 +1716,12 @@ impl Controller {
         let Some(sid) = self.focused_live() else {
             return;
         };
-        let modes = self
-            .view
-            .as_ref()
-            .map(SessionView::modes)
-            .unwrap_or_default();
+        let modes = self.view().map(SessionView::modes).unwrap_or_default();
         let bytes = paste::encode(text, modes);
         if bytes.is_empty() {
             return;
         }
-        if let Some(view) = self.view.as_mut() {
+        if let Some(view) = self.view_mut() {
             view.scroll_to_bottom();
             view.clear_selection();
         }
@@ -1321,9 +1819,9 @@ impl Controller {
             cwd: None,
             command: self.new_session_command.clone(),
             title: None,
-            dims: self.grid_dims(),
+            dims: self.replace_dims(),
         };
-        self.send(out, req, Some(Awaiting::CreateSession));
+        self.send(out, req, Some(Awaiting::CreateSession { split: None }));
     }
 
     /// ⌘1..9 (1-based).
@@ -1383,7 +1881,79 @@ impl Controller {
                     Some(Awaiting::Command("删除 session ")),
                 );
             }
+            Confirm::DeleteWorkspace { id, .. } => {
+                self.send(
+                    out,
+                    Request::DeleteWorkspace { id },
+                    Some(Awaiting::Command("删除 workspace ")),
+                );
+            }
         }
+    }
+
+    /// 「重命名…」 of a session; an empty title restores the automatic one.
+    pub fn rename(&mut self, out: &mut dyn Outbound, sid: SessionId, title: &str) {
+        if !self.sessions.contains_key(&sid) {
+            return;
+        }
+        let title = title.trim();
+        let title = (!title.is_empty()).then(|| title.to_string());
+        self.send(
+            out,
+            Request::Rename {
+                session: sid,
+                title,
+            },
+            Some(Awaiting::Command("重命名 session ")),
+        );
+    }
+
+    /// 「重命名…」 of a workspace (a workspace keeps a name: empty is
+    /// ignored).
+    pub fn rename_workspace(&mut self, out: &mut dyn Outbound, id: WorkspaceId, name: &str) {
+        let name = name.trim();
+        if name.is_empty() || self.workspace(id).is_none() {
+            return;
+        }
+        self.send(
+            out,
+            Request::RenameWorkspace {
+                id,
+                name: name.to_string(),
+            },
+            Some(Awaiting::Command("重命名 workspace ")),
+        );
+    }
+
+    /// Whether a workspace has sessions (dormant ones count: deleting the
+    /// workspace would orphan them).
+    pub fn workspace_has_sessions(&self, id: WorkspaceId) -> bool {
+        self.sessions.values().any(|m| m.workspace == id)
+    }
+
+    /// 「删除 workspace…」: asks first; refused while it has sessions.
+    pub fn request_delete_workspace(&mut self, id: WorkspaceId) {
+        let Some(name) = self.workspace(id).map(|w| w.name.clone()) else {
+            return;
+        };
+        if self.workspace_has_sessions(id) {
+            self.info("先移走或彻底删除其中的 session");
+            return;
+        }
+        self.confirm = Some(Confirm::DeleteWorkspace { id, name });
+    }
+
+    /// 「标记已读」.
+    pub fn mark_read_now(&mut self, out: &mut dyn Outbound, sid: SessionId) {
+        if !self.connected || !self.sessions.contains_key(&sid) {
+            return;
+        }
+        self.mark_read_sent.insert(sid);
+        self.send(
+            out,
+            Request::MarkRead { session: sid },
+            Some(Awaiting::Command("标记已读")),
+        );
     }
 
     fn kill(&mut self, out: &mut dyn Outbound, session: SessionId) {
@@ -2301,6 +2871,421 @@ mod tests {
         assert!(matches!(
             out.take().as_slice(),
             [(_, Request::CreateSession { workspace, command: None, .. })] if *workspace == w.id
+        ));
+    }
+
+    /// `(request, session)` of each request, for compact assertions.
+    fn names(sent: &[(u32, Request)]) -> Vec<(String, Option<SessionId>)> {
+        sent.iter()
+            .map(|(_, r)| {
+                let debug = format!("{r:?}");
+                let name = debug.split([' ', '{', '(']).next().unwrap_or_default();
+                let session = match r {
+                    Request::Attach { session, .. }
+                    | Request::Detach { session }
+                    | Request::Subscribe { session, .. }
+                    | Request::Unsubscribe { session }
+                    | Request::Resize { session, .. }
+                    | Request::Kill { session }
+                    | Request::MarkRead { session }
+                    | Request::Revive { session, .. } => Some(*session),
+                    _ => None,
+                };
+                (name.to_string(), session)
+            })
+            .collect()
+    }
+
+    fn n(name: &str, sid: SessionId) -> (String, Option<SessionId>) {
+        (name.to_string(), Some(sid))
+    }
+
+    const HALF_WIDTH: Dims = Dims { cols: 49, rows: 30 };
+    const QUARTER: Dims = Dims { cols: 49, rows: 14 };
+
+    #[test]
+    fn split_creates_a_session_beside_the_focused_pane_in_its_directory() {
+        let w = ws(0);
+        let mut a = session(&w, 0, true);
+        a.cwd = PathBuf::from("/tmp/proj");
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        let sent = listed(&mut c, &mut out, vec![w.clone()], vec![a.clone()]);
+        assert_eq!(names(&sent), [n("Attach", a.id)]);
+        let t0 = Instant::now();
+        c.split(&mut out, SplitDir::Right);
+        let sent = out.take();
+        let [(
+            id,
+            Request::CreateSession {
+                workspace,
+                cwd,
+                dims,
+                ..
+            },
+        )] = sent.as_slice()
+        else {
+            panic!("{sent:?}")
+        };
+        assert_eq!(*workspace, w.id);
+        assert_eq!(cwd.as_deref(), Some(Path::new("/tmp/proj")));
+        // 100 columns less the 6 px divider, halved.
+        assert_eq!(*dims, HALF_WIDTH);
+        assert_eq!(c.pane_count(), 1, "shown once berthd created it");
+        let b = session(&w, 1, true);
+        c.handle(&mut out, reply(*id, Event::SessionUpdated(b.clone())), t0);
+        assert_eq!(c.layout().unwrap().leaves(), [a.id, b.id]);
+        assert_eq!(c.focused(), Some(b.id));
+        let sent = out.take();
+        assert!(
+            matches!(sent.as_slice(), [(_, Request::Attach { session, dims })] if *session == b.id && *dims == HALF_WIDTH),
+            "{sent:?}"
+        );
+        // The pane that was split shrinks after the debounce.
+        c.tick(&mut out, t0 + RESIZE_DEBOUNCE);
+        assert!(matches!(
+            out.take().as_slice(),
+            [(_, Request::Resize { session, dims })] if *session == a.id && *dims == HALF_WIDTH
+        ));
+        // ⌘⇧D splits the focused (new) pane downwards.
+        c.split(&mut out, SplitDir::Down);
+        let sent = out.take();
+        let [(id, Request::CreateSession { dims, .. })] = sent.as_slice() else {
+            panic!("{sent:?}")
+        };
+        assert_eq!(*dims, QUARTER);
+        let d = session(&w, 2, true);
+        c.handle(&mut out, reply(*id, Event::SessionUpdated(d.clone())), t0);
+        assert_eq!(c.layout().unwrap().leaves(), [a.id, b.id, d.id]);
+        assert_eq!(c.focused(), Some(d.id));
+        assert_eq!(names(&out.take()), [n("Attach", d.id)]);
+        // A session created otherwise (⌘N) replaces the focused pane's.
+        c.new_session(&mut out);
+        let sent = out.take();
+        let [(id, Request::CreateSession { dims, .. })] = sent.as_slice() else {
+            panic!("{sent:?}")
+        };
+        assert_eq!(*dims, QUARTER, "the focused pane's size");
+        let e = session(&w, 3, true);
+        c.handle(&mut out, reply(*id, Event::SessionUpdated(e.clone())), t0);
+        assert_eq!(c.layout().unwrap().leaves(), [a.id, b.id, e.id]);
+        assert_eq!(
+            names(&out.take()),
+            [n("Detach", d.id), n("Attach", e.id)],
+            "the replaced session keeps running"
+        );
+    }
+
+    #[test]
+    fn a_click_focuses_a_shown_pane_or_replaces_the_focused_one() {
+        let w = ws(0);
+        let (a, b, x) = (
+            session(&w, 0, true),
+            session(&w, 1, true),
+            session(&w, 2, true),
+        );
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        listed(
+            &mut c,
+            &mut out,
+            vec![w],
+            vec![a.clone(), b.clone(), x.clone()],
+        );
+        let now = Instant::now();
+        // Previews for the cards not shown in a pane.
+        c.set_visible(&mut out, &[a.id, b.id, x.id], now);
+        assert_eq!(
+            names(&out.take()),
+            [n("Subscribe", b.id), n("Subscribe", x.id)]
+        );
+        c.open_in_split(&mut out, b.id, SplitDir::Right, now);
+        assert_eq!(c.layout().unwrap().leaves(), [a.id, b.id]);
+        assert_eq!(c.focused(), Some(b.id));
+        assert_eq!(
+            names(&out.take()),
+            [n("Unsubscribe", b.id), n("Attach", b.id)]
+        );
+        // A shown session only gets the focus.
+        c.focus(&mut out, a.id, now);
+        assert_eq!(c.focused(), Some(a.id));
+        assert!(out.take().is_empty());
+        c.open_in_split(&mut out, b.id, SplitDir::Down, now);
+        assert_eq!(c.layout().unwrap().leaves(), [a.id, b.id], "never twice");
+        assert_eq!(c.focused(), Some(b.id));
+        assert!(out.take().is_empty());
+        // Another one replaces the focused pane's session.
+        c.focus(&mut out, a.id, now);
+        c.focus(&mut out, x.id, now);
+        assert_eq!(c.layout().unwrap().leaves(), [x.id, b.id]);
+        assert_eq!(
+            names(&out.take()),
+            [n("Detach", a.id), n("Unsubscribe", x.id), n("Attach", x.id)]
+        );
+        c.set_visible(&mut out, &[a.id, b.id, x.id], now);
+        assert_eq!(names(&out.take()), [n("Subscribe", a.id)]);
+        // ⌘W acts on the focused pane's session; once berthd removed it
+        // the neighbour takes the space and the focus (no Detach).
+        c.request_close(&mut out);
+        assert_eq!(names(&out.take()), [n("Kill", x.id)]);
+        c.handle(&mut out, push(Event::SessionRemoved(x.id)), now);
+        assert_eq!(c.layout(), Some(&PaneTree::Leaf(b.id)));
+        assert_eq!(c.focused(), Some(b.id));
+        assert!(out.take().is_empty());
+        assert_eq!(
+            c.pane_dims(b.id),
+            Some(Dims {
+                cols: 100,
+                rows: 30
+            })
+        );
+    }
+
+    #[test]
+    fn removing_a_pane_from_the_split_keeps_its_session() {
+        let w = ws(0);
+        let (a, b) = (session(&w, 0, true), session(&w, 1, true));
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        listed(&mut c, &mut out, vec![w], vec![a.clone(), b.clone()]);
+        let now = Instant::now();
+        c.open_in_split(&mut out, b.id, SplitDir::Down, now);
+        assert_eq!(
+            c.pane_dims(b.id),
+            Some(Dims {
+                cols: 100,
+                rows: 14
+            })
+        );
+        out.take();
+        assert!(c.remove_from_split(&mut out, b.id, now));
+        assert_eq!(names(&out.take()), [n("Detach", b.id)]);
+        assert!(c.session(b.id).is_some());
+        assert_eq!(c.layout(), Some(&PaneTree::Leaf(a.id)));
+        assert_eq!(c.focused(), Some(a.id));
+        // The last pane stays.
+        assert!(!c.remove_from_split(&mut out, a.id, now));
+        assert!(!c.remove_from_split(&mut out, b.id, now));
+        assert!(out.take().is_empty());
+        assert_eq!(c.pane_count(), 1);
+    }
+
+    #[test]
+    fn arrows_move_the_focus_and_a_divider_drag_resizes_both_panes() {
+        let w = ws(0);
+        let (a, b) = (session(&w, 0, true), session(&w, 1, true));
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        listed(&mut c, &mut out, vec![w], vec![a.clone(), b.clone()]);
+        let now = Instant::now();
+        c.open_in_split(&mut out, b.id, SplitDir::Right, now);
+        c.focus_dir(&mut out, Direction::Left, now);
+        assert_eq!(c.focused(), Some(a.id));
+        c.focus_dir(&mut out, Direction::Left, now);
+        c.focus_dir(&mut out, Direction::Up, now);
+        assert_eq!(c.focused(), Some(a.id), "nothing there");
+        c.focus_dir(&mut out, Direction::Right, now);
+        assert_eq!(c.focused(), Some(b.id));
+        out.take();
+        let t0 = Instant::now();
+        c.set_ratio(&SplitPath::default(), 0.25, t0);
+        assert_eq!(c.pane_dims(a.id), Some(Dims { cols: 24, rows: 30 }));
+        c.tick(&mut out, t0 + RESIZE_DEBOUNCE / 2);
+        assert!(out.take().is_empty(), "still debouncing");
+        c.tick(&mut out, t0 + RESIZE_DEBOUNCE);
+        let sent = out.take();
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [
+                    (_, Request::Resize { session: s1, dims: Dims { cols: 24, rows: 30 } }),
+                    (_, Request::Resize { session: s2, dims: Dims { cols: 74, rows: 30 } }),
+                ] if *s1 == a.id && *s2 == b.id
+            ),
+            "{sent:?}"
+        );
+        // Clamped: neither pane disappears.
+        c.set_ratio(&SplitPath::default(), 0.0, t0);
+        assert_eq!(c.pane_dims(a.id), Some(Dims { cols: 19, rows: 30 }));
+    }
+
+    #[test]
+    fn a_reconnect_attaches_every_pane_again() {
+        let w = ws(0);
+        let (a, b) = (session(&w, 0, true), session(&w, 1, true));
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        listed(
+            &mut c,
+            &mut out,
+            vec![w.clone()],
+            vec![a.clone(), b.clone()],
+        );
+        let now = Instant::now();
+        c.open_in_split(&mut out, b.id, SplitDir::Right, now);
+        c.focus(&mut out, a.id, now);
+        out.take();
+        c.on_disconnected("gone");
+        let sent = listed(&mut c, &mut out, vec![w], vec![a.clone(), b.clone()]);
+        // Nothing is unsubscribed (that would drop the attachments too).
+        assert_eq!(names(&sent), [n("Attach", a.id), n("Attach", b.id)]);
+        assert_eq!(c.layout().unwrap().leaves(), [a.id, b.id]);
+        assert_eq!(c.focused(), Some(a.id));
+    }
+
+    #[test]
+    fn the_saved_layout_is_restored_without_sessions_that_are_gone_or_archived() {
+        let w = ws(0);
+        let (a, b, x) = (
+            session(&w, 0, true),
+            session(&w, 1, true),
+            session(&w, 2, true),
+        );
+        let mut archived = session(&w, 3, false);
+        archived.archived_at_ms = Some(1);
+        let gone = SessionId::new();
+        let mut tree = PaneTree::Leaf(a.id);
+        tree.split(a.id, b.id, SplitDir::Right).unwrap();
+        tree.split(b.id, gone, SplitDir::Down).unwrap();
+        tree.split(a.id, archived.id, SplitDir::Down).unwrap();
+        let mut c = Controller::new(vec![]);
+        c.restore(GuiState::new(Some(tree), Some(gone)));
+        assert_eq!(c.take_layout_changed(), None, "not before the listing");
+        let mut out = Fake::default();
+        let sent = listed(
+            &mut c,
+            &mut out,
+            vec![w.clone()],
+            vec![a.clone(), b.clone(), x.clone(), archived.clone()],
+        );
+        assert_eq!(c.layout().unwrap().leaves(), [a.id, b.id]);
+        assert_eq!(c.focused(), Some(a.id), "the focused pane is gone");
+        assert_eq!(names(&sent), [n("Attach", a.id), n("Attach", b.id)]);
+        // The pruned layout is written back, once.
+        let saved = c.take_layout_changed().unwrap();
+        assert_eq!(saved, GuiState::new(c.layout().cloned(), Some(a.id)));
+        assert_eq!(c.take_layout_changed(), None);
+        c.focus(&mut out, b.id, Instant::now());
+        assert_eq!(c.take_layout_changed().unwrap().focused, Some(b.id));
+
+        // Nothing left of it: the first session, as without a saved layout.
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        c.restore(GuiState::new(Some(PaneTree::Leaf(gone)), Some(gone)));
+        listed(&mut c, &mut out, vec![w], vec![a.clone(), b.clone()]);
+        assert_eq!(c.layout(), Some(&PaneTree::Leaf(a.id)));
+        assert_eq!(c.focused(), Some(a.id));
+    }
+
+    #[test]
+    fn command_line_splits_build_the_layout_in_order() {
+        let w = ws(0);
+        let (a, b, x, d) = (
+            session(&w, 0, true),
+            session(&w, 1, true),
+            session(&w, 2, true),
+            session(&w, 3, true),
+        );
+        let mut c = Controller::new(vec![]);
+        let prefix = |s: &SessionMeta| s.id.short();
+        c.want_session(prefix(&a));
+        c.want_split(SplitDir::Right, prefix(&b));
+        c.want_split(SplitDir::Down, format!("{}@{}", prefix(&x), prefix(&a)));
+        c.want_split(SplitDir::Down, format!("{}@{}", prefix(&d), prefix(&b)));
+        c.want_split(SplitDir::Right, prefix(&a));
+        let mut out = Fake::default();
+        let sent = listed(
+            &mut c,
+            &mut out,
+            vec![w],
+            vec![a.clone(), b.clone(), x.clone(), d.clone()],
+        );
+        assert_eq!(c.layout().unwrap().leaves(), [a.id, x.id, b.id, d.id]);
+        assert_eq!(c.focused(), Some(a.id));
+        let attached = requests(&sent, |r| matches!(r, Request::Attach { .. }));
+        assert_eq!(attached.len(), 4, "{sent:?}");
+        for (_, r) in attached {
+            assert!(
+                matches!(r, Request::Attach { dims, .. } if *dims == QUARTER),
+                "{r:?}"
+            );
+        }
+        assert!(
+            c.notices()
+                .iter()
+                .any(|n| n.text.contains("分屏参数") && n.text.contains("已在分屏中")),
+            "{:?}",
+            c.notices()
+        );
+    }
+
+    #[test]
+    fn menu_actions_map_to_controller_calls_or_app_effects() {
+        use crate::menus::{apply, AppEffect, MenuAction, RenameTarget};
+        let w = ws(0);
+        let (a, b) = (session(&w, 0, true), session(&w, 1, false));
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        listed(
+            &mut c,
+            &mut out,
+            vec![w.clone()],
+            vec![a.clone(), b.clone()],
+        );
+        let now = Instant::now();
+        let mut act = |c: &mut Controller, action| apply(c, &mut out, action, now);
+        assert_eq!(act(&mut c, MenuAction::Copy), Some(AppEffect::Copy));
+        assert_eq!(act(&mut c, MenuAction::Paste), Some(AppEffect::Paste));
+        assert_eq!(
+            act(&mut c, MenuAction::RenameSession(a.id)),
+            Some(AppEffect::Rename(RenameTarget::Session(a.id)))
+        );
+        assert_eq!(
+            act(&mut c, MenuAction::RenameWorkspace(w.id)),
+            Some(AppEffect::Rename(RenameTarget::Workspace(w.id)))
+        );
+        assert_eq!(
+            act(&mut c, MenuAction::OpenInSplit(b.id, SplitDir::Down)),
+            None
+        );
+        assert_eq!(c.layout().unwrap().leaves(), [a.id, b.id]);
+        assert_eq!(act(&mut c, MenuAction::RemoveFromSplit(b.id)), None);
+        assert_eq!(c.layout(), Some(&PaneTree::Leaf(a.id)));
+        act(&mut c, MenuAction::MarkRead(a.id));
+        act(&mut c, MenuAction::Revive(b.id));
+        act(&mut c, MenuAction::NewSessionIn(w.id));
+        act(&mut c, MenuAction::Split(SplitDir::Right));
+        // 「关闭 pane」 is ⌘W on that pane.
+        act(&mut c, MenuAction::ClosePane(a.id));
+        // Refused while the workspace has sessions.
+        act(&mut c, MenuAction::DeleteWorkspace(w.id));
+        assert!(c.confirm().is_none());
+        assert!(c
+            .notices()
+            .iter()
+            .any(|n| n.text.contains("先移走或彻底删除")));
+        let sent = out.take();
+        let got: Vec<String> = names(&sent).into_iter().map(|(name, _)| name).collect();
+        assert_eq!(
+            got,
+            [
+                "Attach",   // OpenInSplit
+                "Detach",   // RemoveFromSplit
+                "MarkRead", // MarkRead
+                "Detach",   // Revive focuses b in the (only) pane …
+                "Attach",
+                "Revive",        // … then revives it
+                "CreateSession", // NewSessionIn
+                "CreateSession", // Split
+                "Detach",        // ClosePane focuses a again …
+                "Attach",
+                "Kill", // … and closes it (idle shell)
+            ],
+            "{sent:?}"
+        );
+        assert!(matches!(
+            &sent[5].1,
+            Request::Revive { session, mode: ReviveMode::Shell } if *session == b.id
         ));
     }
 

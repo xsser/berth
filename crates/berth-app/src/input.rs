@@ -17,6 +17,8 @@
 use berth_core::TermModes;
 use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
 
+use crate::panes::{Direction, SplitDir};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Mods {
     pub shift: bool,
@@ -286,6 +288,10 @@ pub enum Shortcut {
     Copy,
     /// ⌘V.
     Paste,
+    /// ⌘D: new session in a pane right of the focused one; ⌘⇧D: below it.
+    Split(SplitDir),
+    /// ⌥⌘ arrows: focus the neighbouring pane.
+    FocusPane(Direction),
     /// Any other ⌘ chord.
     Unbound(String),
 }
@@ -364,6 +370,20 @@ pub fn decide_key(press: &KeyPress, ime: ImeGate, modes: TermModes) -> KeyAction
 }
 
 fn shortcut_for(logical: &WinitKey, mods: ModifiersState) -> Shortcut {
+    let alt_only = mods.alt_key() && !mods.shift_key() && !mods.control_key();
+    if let WinitKey::Named(named) = logical {
+        let dir = match named {
+            NamedKey::ArrowLeft => Some(Direction::Left),
+            NamedKey::ArrowRight => Some(Direction::Right),
+            NamedKey::ArrowUp => Some(Direction::Up),
+            NamedKey::ArrowDown => Some(Direction::Down),
+            _ => None,
+        };
+        return match dir {
+            Some(d) if alt_only => Shortcut::FocusPane(d),
+            _ => Shortcut::Unbound(format!("⌘{logical:?}")),
+        };
+    }
     let WinitKey::Character(c) = logical else {
         return Shortcut::Unbound(format!("⌘{logical:?}"));
     };
@@ -379,6 +399,8 @@ fn shortcut_for(logical: &WinitKey, mods: ModifiersState) -> Shortcut {
         "k" if plain => Shortcut::Palette,
         "c" if plain => Shortcut::Copy,
         "v" if plain => Shortcut::Paste,
+        "d" if plain => Shortcut::Split(SplitDir::Right),
+        "d" if shift_only => Shortcut::Split(SplitDir::Down),
         d if plain && d.len() == 1 && matches!(d.as_bytes()[0], b'1'..=b'9') => {
             Shortcut::Jump(d.as_bytes()[0] - b'0')
         }
@@ -843,6 +865,13 @@ mod tests {
             ("0", cmd, Shortcut::Unbound("⌘0".into())),
             ("W", cmd_shift, Shortcut::Unbound("⌘⇧W".into())),
             ("T", cmd_shift, Shortcut::Unbound("⌘⇧T".into())),
+            ("d", cmd, Shortcut::Split(SplitDir::Right)),
+            ("D", cmd_shift, Shortcut::Split(SplitDir::Down)),
+            (
+                "d",
+                cmd | ModifiersState::ALT,
+                Shortcut::Unbound("⌘D".into()),
+            ),
         ];
         for (key, mods, want) in cases {
             let k = WinitKey::Character(SmolStr::new(key));
@@ -851,6 +880,37 @@ mod tests {
                 KeyAction::Shortcut(want),
                 "{key} {mods:?}"
             );
+        }
+        // ⌥⌘ arrows move between panes, even while the IME composes.
+        let opt_cmd = ModifiersState::SUPER | ModifiersState::ALT;
+        for (named, dir) in [
+            (NamedKey::ArrowLeft, Direction::Left),
+            (NamedKey::ArrowRight, Direction::Right),
+            (NamedKey::ArrowUp, Direction::Up),
+            (NamedKey::ArrowDown, Direction::Down),
+        ] {
+            let k = WinitKey::Named(named);
+            assert_eq!(
+                press_with(&k, None, opt_cmd, IME_IDLE),
+                KeyAction::Shortcut(Shortcut::FocusPane(dir))
+            );
+            let composing = ImeGate {
+                enabled: true,
+                composing: true,
+            };
+            assert_eq!(
+                press_with(&k, None, opt_cmd, composing),
+                KeyAction::Shortcut(Shortcut::FocusPane(dir))
+            );
+            // ⌘ alone (or with ⇧) on an arrow is not a pane move.
+            assert!(matches!(
+                press_with(&k, None, ModifiersState::SUPER, IME_IDLE),
+                KeyAction::Shortcut(Shortcut::Unbound(_))
+            ));
+            assert!(matches!(
+                press_with(&k, None, opt_cmd | ModifiersState::SHIFT, IME_IDLE),
+                KeyAction::Shortcut(Shortcut::Unbound(_))
+            ));
         }
     }
 

@@ -493,10 +493,22 @@ impl SessionView {
 
     /// The visible rows and the style table (what the renderer needs).
     pub fn frame(&mut self) -> (&ScreenSnapshot, &StyleTable) {
+        self.refresh();
+        self.composed()
+    }
+
+    /// Compose the visible rows if anything changed since the last time;
+    /// then [`Self::composed`] is current. Split panes refresh every view
+    /// first and borrow them all at once for the frame.
+    pub fn refresh(&mut self) {
         if self.dirty {
             self.compose();
             self.dirty = false;
         }
+    }
+
+    /// The screen as of the last [`Self::refresh`] / [`Self::frame`].
+    pub fn composed(&self) -> (&ScreenSnapshot, &StyleTable) {
         (&self.composed, &self.styles)
     }
 

@@ -17,10 +17,19 @@
 //! that can resume its agent shows the command berthd would run (display
 //! only; nothing runs until "Resume" is clicked).
 //!
+//! Context menus (DESIGN §17.2, entries from [`crate::menus`]): session
+//! cards and workspace headers open theirs on a secondary click; the
+//! terminal area's is opened by the app at the pointer
+//! ([`Sidebar::open_terminal_menu`]). 「重命名…」 opens a dialog with a text
+//! field.
+//!
 //! IME ownership: the terminal owns the window IME. egui-winit toggles
 //! `Window::set_ime_allowed` from `PlatformOutput::ime`, so the sidebar clears
-//! that field every frame and is never fed keyboard or IME events; modal
-//! dialogs get Enter / Esc from the app.
+//! that field every frame (egui-winit then never touches it). Keyboard and
+//! IME events reach egui only while the rename dialog is open
+//! ([`Sidebar::wants_keyboard`]); the other dialogs get Enter / Esc from the
+//! app. The text field's cursor is kept in [`Sidebar::ime_rect`] for the
+//! candidate window.
 //!
 //! Fonts: egui's bundled fonts have no CJK, so PingFang SC (fallback Hiragino
 //! Sans GB / Heiti SC) is located through cosmic-text's fontdb and handed to
@@ -36,15 +45,19 @@ use berth_core::{
     StateSource, StyleTable, WorkspaceId,
 };
 use cosmic_text::{fontdb, FontSystem};
+use egui::containers::menu::menu_style;
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{
-    Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Id, Margin, Order, Pos2, Rect,
-    Sense, Stroke, Vec2,
+    Align, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Id, LayerId, Margin,
+    Order, Popup, PopupAnchor, PopupCloseBehavior, PopupKind, Pos2, Rect, Sense, SetOpenCommand,
+    Stroke, Vec2,
 };
 use winit::window::Window;
 
 use crate::controller::{self, Confirm, Controller, NoticeKind, ResumePreview, PREVIEW_ROWS};
+use crate::menus::{self, MenuAction, MenuItem, RenameTarget};
 use crate::mismatch::Banner;
+use crate::panes::Axis;
 use crate::setup_hooks::command_line;
 use crate::theme::{mix, Rgb, Theme};
 use crate::timefmt::local_clock;
@@ -277,6 +290,10 @@ pub enum UiAction {
     RestartDaemon,
     /// Session cards on screen this frame.
     Visible(Vec<SessionId>),
+    /// A context menu entry was chosen.
+    Menu(MenuAction),
+    /// The rename dialog was confirmed with this text.
+    Rename(RenameTarget, String),
 }
 
 /// What the app shows besides the controller's data.
@@ -288,6 +305,10 @@ pub struct Chrome<'a> {
     pub status: Option<&'a str>,
     /// Centered in the terminal area when there is no screen to show.
     pub placeholder: Option<&'a str>,
+    /// Panes still waiting for their first screen (points): a note each.
+    pub pane_notes: Vec<(Rect, &'a str)>,
+    /// The pointer is over a split divider (resize cursor).
+    pub divider_hover: Option<Axis>,
     /// A berthd of another protocol version (shown instead of
     /// `placeholder`).
     pub mismatch: Option<&'a Banner>,
@@ -487,6 +508,122 @@ pub struct Sidebar {
     coverage_done: bool,
     /// `Chrome::demo_hover` of the frame being built.
     demo_hover: Option<SessionId>,
+    /// The terminal area's context menu.
+    term_menu: Option<TermMenu>,
+    /// The rename dialog.
+    rename: Option<RenameDialog>,
+    /// The focused text field's cursor (points), for the IME candidate
+    /// window; `None` when no text field has the keyboard.
+    pub ime_rect: Option<Rect>,
+}
+
+struct TermMenu {
+    pos: Pos2,
+    items: Vec<MenuItem>,
+    /// Open it on the next frame.
+    opening: bool,
+}
+
+struct RenameDialog {
+    target: RenameTarget,
+    title: String,
+    hint: &'static str,
+    text: String,
+    /// Give the field the keyboard on the next frame.
+    focus: bool,
+}
+
+/// Draw menu entries; a chosen one becomes a [`UiAction::Menu`].
+fn menu_entries(ui: &mut egui::Ui, items: &[MenuItem], actions: &mut Vec<UiAction>) {
+    for it in items {
+        let mut resp = ui.add_enabled(it.enabled, egui::Button::new(it.label));
+        if let Some(hint) = it.hint {
+            resp = resp.on_disabled_hover_text(hint);
+        }
+        if resp.clicked() {
+            actions.push(UiAction::Menu(it.action));
+            ui.close();
+        }
+    }
+}
+
+/// A click inside a context menu (a disabled entry, a gap) keeps it open;
+/// a chosen entry closes it itself, a click elsewhere or Esc dismisses it.
+const MENU_CLOSE: PopupCloseBehavior = PopupCloseBehavior::CloseOnClickOutside;
+
+/// The context menu of a sidebar row (opened by a secondary click on it).
+fn context_menu(resp: &egui::Response, items: &[MenuItem], actions: &mut Vec<UiAction>) {
+    Popup::context_menu(resp)
+        .close_behavior(MENU_CLOSE)
+        .show(|ui| menu_entries(ui, items, actions));
+}
+
+/// One frame of the terminal area's context menu; false once it closed
+/// (an entry was chosen, or a click outside / Esc dismissed it).
+fn show_terminal_menu(
+    ctx: &egui::Context,
+    menu: &mut TermMenu,
+    actions: &mut Vec<UiAction>,
+) -> bool {
+    let open = std::mem::take(&mut menu.opening).then_some(SetOpenCommand::Bool(true));
+    Popup::new(
+        Id::new("terminal-menu"),
+        ctx.clone(),
+        PopupAnchor::Position(menu.pos),
+        LayerId::background(),
+    )
+    .kind(PopupKind::Menu)
+    .layout(egui::Layout::top_down_justified(Align::Min))
+    .style(menu_style)
+    .gap(0.0)
+    .close_behavior(MENU_CLOSE)
+    .open_memory(open)
+    .show(|ui| menu_entries(ui, &menu.items, actions))
+    .is_some()
+}
+
+/// One frame of 「重命名…」: a text field; Enter / 「确定」 renames (the
+/// action is pushed), Esc / 「取消」 or a click outside cancels. `Some`
+/// once it closed (`true`: renamed).
+fn show_rename(
+    ctx: &egui::Context,
+    pal: Palette,
+    r: &mut RenameDialog,
+    actions: &mut Vec<UiAction>,
+) -> Option<bool> {
+    let mut done: Option<bool> = None;
+    let resp = egui::Modal::new(Id::new("rename")).show(ctx, |ui| {
+        ui.set_width(380.0);
+        ui.label(egui::RichText::new(&r.title).size(15.0).strong());
+        ui.add_space(8.0);
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut r.text)
+                .desired_width(f32::INFINITY)
+                .char_limit(200),
+        );
+        if std::mem::take(&mut r.focus) {
+            edit.request_focus();
+        }
+        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(r.hint).size(11.0).color(pal.dim));
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.button("确定（Enter）").clicked() || enter {
+                done = Some(true);
+            }
+            if ui.button("取消（Esc）").clicked() {
+                done = Some(false);
+            }
+        });
+    });
+    if resp.should_close() && done.is_none() {
+        done = Some(false);
+    }
+    if done == Some(true) {
+        actions.push(UiAction::Rename(r.target, r.text.clone()));
+    }
+    done
 }
 
 /// Strings painted in one pass, with the family used (for the coverage log).
@@ -642,7 +779,58 @@ impl Sidebar {
             repaint_delay: None,
             coverage_done: false,
             demo_hover: None,
+            term_menu: None,
+            rename: None,
+            ime_rect: None,
         }
+    }
+
+    /// Open the terminal area's context menu at `pos` (points).
+    pub fn open_terminal_menu(&mut self, pos: Pos2, items: Vec<MenuItem>) {
+        Popup::close_all(&self.ctx);
+        self.term_menu = Some(TermMenu {
+            pos,
+            items,
+            opening: true,
+        });
+    }
+
+    /// A context menu is open: a click elsewhere only closes it.
+    pub fn menu_open(&self) -> bool {
+        self.term_menu.is_some() || Popup::is_any_open(&self.ctx)
+    }
+
+    /// Esc while a menu is open.
+    pub fn close_menus(&mut self) {
+        self.term_menu = None;
+        Popup::close_all(&self.ctx);
+    }
+
+    /// 「重命名…」: the dialog, prefilled with the current name.
+    pub fn begin_rename(&mut self, target: RenameTarget, current: &str) {
+        let (title, hint) = match target {
+            RenameTarget::Session(_) => (
+                format!("重命名「{current}」"),
+                "留空则恢复自动标题（程序设置的标题或命令名）",
+            ),
+            RenameTarget::Workspace(_) => (
+                format!("重命名 workspace「{current}」"),
+                "只改显示名，目录不变",
+            ),
+        };
+        self.close_menus();
+        self.rename = Some(RenameDialog {
+            target,
+            title,
+            hint,
+            text: current.to_string(),
+            focus: true,
+        });
+    }
+
+    /// The rename dialog is open: keyboard and IME events go to egui.
+    pub fn wants_keyboard(&self) -> bool {
+        self.rename.is_some()
     }
 
     /// Forward a (non-keyboard, non-IME) window event. Returns true when egui
@@ -694,6 +882,7 @@ impl Sidebar {
             );
         });
         let mut platform = full.platform_output;
+        self.ime_rect = platform.ime.as_ref().map(|i| i.cursor_rect);
         platform.ime = None; // the terminal owns the IME
         self.state.handle_platform_output(window, platform);
         self.repaint_delay = full
@@ -836,6 +1025,33 @@ impl Sidebar {
             });
         actions.push(UiAction::Visible(visible));
         self.overlays(&ctx, ctl, chrome, &mut painted, actions);
+        self.terminal_menu(&ctx, actions);
+        self.rename_dialog(&ctx, actions);
+        if let Some(axis) = chrome.divider_hover {
+            ctx.set_cursor_icon(match axis {
+                Axis::Horizontal => egui::CursorIcon::ResizeColumn,
+                Axis::Vertical => egui::CursorIcon::ResizeRow,
+            });
+        }
+    }
+
+    /// The terminal area's context menu, while open.
+    fn terminal_menu(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
+        if let Some(menu) = self.term_menu.as_mut() {
+            if !show_terminal_menu(ctx, menu, actions) {
+                self.term_menu = None;
+            }
+        }
+    }
+
+    /// 「重命名…」, while open.
+    fn rename_dialog(&mut self, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
+        let pal = self.palette;
+        if let Some(r) = self.rename.as_mut() {
+            if show_rename(ctx, pal, r, actions).is_some() {
+                self.rename = None;
+            }
+        }
     }
 
     fn header(
@@ -914,6 +1130,9 @@ impl Sidebar {
             // Workspace header: ▾ ● name  ~/root             [+]
             let (rect, _) =
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+            let head = ui.interact(rect, Id::new(("ws-head", ws.id)), Sense::click());
+            let entries = menus::workspace_header(ws.id, ctl.workspace_has_sessions(ws.id));
+            context_menu(&head, &entries, actions);
             let y = rect.center().y;
             paint_text(
                 ui,
@@ -1089,14 +1308,23 @@ impl Sidebar {
         };
         let preview_h = PREVIEW_ROWS as f32 * LINE_H + 6.0;
         let height = 4.0 + 18.0 + 16.0 + preview_h + buttons_h + 8.0;
-        let (rect, resp) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+        // A stable id: the card's context menu survives the list changing.
+        let resp = ui.interact(rect, Id::new(("card", m.id)), Sense::click());
         if ui.is_rect_visible(rect) {
             visible.push(m.id);
         }
         if resp.clicked() {
             actions.push(UiAction::Focus(m.id));
         }
+        let row = menus::SessionRow {
+            sid: m.id,
+            shown: ctl.is_shown(m.id),
+            unread: m.unread,
+            live: m.is_live(),
+        };
+        context_menu(&resp, &menus::session_row(row), actions);
         let focused = ctl.focused() == Some(m.id);
         if focused || resp.hovered() {
             ui.painter()
@@ -1220,8 +1448,8 @@ impl Sidebar {
             rect.width() - 36.0,
         );
 
-        // Preview: the focused session from its full view, others from
-        // their Preview subscription.
+        // Preview: a session shown in a pane from its full view, others
+        // from their Preview subscription.
         let top = rect.top() + 4.0 + 18.0 + 16.0 + 2.0;
         let preview = Rect::from_min_max(
             Pos2::new(x0 + 16.0, top),
@@ -1243,11 +1471,11 @@ impl Sidebar {
         } else {
             ui.painter().line_segment(bar, Stroke::new(2.0, bar_color));
         }
-        let focused_tail;
-        let (lines, styles): (&[LineSnapshot], Option<&StyleTable>) = match ctl.view() {
-            Some(v) if focused && v.has_screen() => {
-                focused_tail = v.tail(PREVIEW_ROWS);
-                (&focused_tail, Some(v.styles()))
+        let pane_tail;
+        let (lines, styles): (&[LineSnapshot], Option<&StyleTable>) = match ctl.pane_view(m.id) {
+            Some(v) if v.has_screen() => {
+                pane_tail = v.tail(PREVIEW_ROWS);
+                (&pane_tail, Some(v.styles()))
             }
             _ => match ctl.preview(m.id) {
                 Some(p) => (&p.lines, Some(&p.styles)),
@@ -1510,6 +1738,18 @@ impl Sidebar {
             if let Some(p) = painted.as_deref_mut() {
                 p.push((FontFamily::Proportional, text.to_string()));
             }
+        } else {
+            let painter =
+                ctx.layer_painter(egui::LayerId::new(Order::Middle, Id::new("pane-notes")));
+            for (rect, text) in &chrome.pane_notes {
+                painter.text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    *text,
+                    prop(14.0),
+                    pal.dim,
+                );
+            }
         }
         let notices = ctl.notices();
         if !notices.is_empty() {
@@ -1569,6 +1809,11 @@ impl Sidebar {
                     "这会删除这个 session 的全部历史（快照与记录），不可撤销。".to_string(),
                     "删除",
                 ),
+                Confirm::DeleteWorkspace { name, .. } => (
+                    format!("删除 workspace「{name}」？"),
+                    "它已经没有 session；只删除侧栏里的这个分组，目录与文件不受影响。".to_string(),
+                    "删除",
+                ),
             };
             let resp = egui::Modal::new(Id::new("confirm")).show(ctx, |ui| {
                 ui.set_width(360.0);
@@ -1605,6 +1850,9 @@ impl Sidebar {
                     ("⌘⇧N", "新建 workspace（选择目录）"),
                     ("⌘W", "关闭 session（agent 运行时二次确认）"),
                     ("⌘1…⌘9", "跳到第 n 个 session"),
+                    ("⌘D / ⌘⇧D", "向右 / 向下分屏（新 session，同目录）"),
+                    ("⌥⌘←→↑↓", "在分屏之间移动焦点"),
+                    ("右键", "菜单（程序读鼠标时 ⇧+右键交给程序）"),
                     ("⌘C / ⌘V", "复制选区 / 粘贴"),
                     ("⇧PgUp / ⇧PgDn", "翻看历史"),
                 ] {
@@ -1815,5 +2063,156 @@ mod tests {
             assert_eq!(tilde(&p), "~/projects/berth");
         }
         assert_eq!(tilde(Path::new("/tmp/x")), "/tmp/x");
+    }
+
+    /// Where `text` was painted (its first occurrence).
+    fn painted_at(out: &egui::FullOutput, text: &str) -> Option<Rect> {
+        fn walk(shape: &egui::Shape, text: &str) -> Option<Rect> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == text => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                egui::Shape::Vec(v) => v.iter().find_map(|s| walk(s, text)),
+                _ => None,
+            }
+        }
+        out.shapes.iter().find_map(|c| walk(&c.shape, text))
+    }
+
+    /// Pointer over `at`, press, release: one frame each.
+    fn click_at(at: Pos2) -> [Vec<egui::Event>; 3] {
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        [
+            vec![egui::Event::PointerMoved(at)],
+            vec![press(true)],
+            vec![press(false)],
+        ]
+    }
+
+    fn headless_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        mut show: impl FnMut(&egui::Context),
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 600.0))),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| show(ui.ctx()));
+        // No renderer here: the font atlas upload is dropped on purpose.
+        out.textures_delta.clear();
+        out
+    }
+
+    #[test]
+    fn the_terminal_menu_turns_a_click_into_its_action() {
+        use crate::panes::SplitDir;
+        let ctx = egui::Context::default();
+        let sid = SessionId::new();
+        let mut menu = TermMenu {
+            pos: Pos2::new(500.0, 200.0),
+            items: menus::terminal(menus::TerminalArea {
+                sid,
+                has_selection: false,
+                panes: 1,
+            }),
+            opening: true,
+        };
+        let frame = |menu: &mut TermMenu, events| {
+            let (mut open, mut actions) = (false, Vec::new());
+            let out = headless_frame(&ctx, events, |ctx| {
+                open = show_terminal_menu(ctx, menu, &mut actions);
+            });
+            (open, actions, out)
+        };
+        // A new area is measured on its first frame and placed on the next.
+        assert!(frame(&mut menu, Vec::new()).0);
+        let (open, actions, out) = frame(&mut menu, Vec::new());
+        assert!(open && actions.is_empty());
+        let right = painted_at(&out, "向右分屏").expect("向右分屏");
+        let remove = painted_at(&out, "从分屏移除").expect("从分屏移除");
+        assert!(painted_at(&out, "粘贴").is_some());
+        assert!(painted_at(&out, "复制").is_none(), "nothing selected");
+        assert!(right.min.x >= 500.0 && right.min.y >= 200.0, "{right:?}");
+        // The only pane cannot leave the split: nothing happens, the menu
+        // stays.
+        for events in click_at(remove.center()) {
+            let (open, actions, _) = frame(&mut menu, events);
+            assert!(open && actions.is_empty(), "{actions:?}");
+        }
+        let mut got = Vec::new();
+        for events in click_at(right.center()) {
+            got.extend(frame(&mut menu, events).1);
+        }
+        assert_eq!(got, [UiAction::Menu(MenuAction::Split(SplitDir::Right))]);
+        assert!(!frame(&mut menu, Vec::new()).0, "closed by the choice");
+
+        // A click elsewhere only dismisses it.
+        let mut menu = TermMenu {
+            opening: true,
+            ..menu
+        };
+        frame(&mut menu, Vec::new());
+        frame(&mut menu, Vec::new());
+        let mut got = Vec::new();
+        for events in click_at(Pos2::new(100.0, 500.0)) {
+            got.extend(frame(&mut menu, events).1);
+        }
+        assert!(got.is_empty(), "{got:?}");
+        assert!(!frame(&mut menu, Vec::new()).0, "dismissed");
+    }
+
+    #[test]
+    fn the_rename_dialog_confirms_with_enter_and_cancels_with_escape() {
+        let ctx = egui::Context::default();
+        let pal = Palette::from_theme(&Theme::ghostty_default());
+        let sid = SessionId::new();
+        let dialog = || RenameDialog {
+            target: RenameTarget::Session(sid),
+            title: "重命名「build」".into(),
+            hint: "留空则恢复自动标题（程序设置的标题或命令名）",
+            text: "build".into(),
+            focus: true,
+        };
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let frame = |r: &mut RenameDialog, events| {
+            let (mut done, mut actions) = (None, Vec::new());
+            headless_frame(&ctx, events, |ctx| {
+                done = show_rename(ctx, pal, r, &mut actions);
+            });
+            (done, actions)
+        };
+        let mut r = dialog();
+        assert_eq!(frame(&mut r, Vec::new()), (None, vec![]));
+        let typed = vec![egui::Event::Text(" 2".into())];
+        assert_eq!(frame(&mut r, typed), (None, vec![]));
+        let (done, actions) = frame(&mut r, vec![key(egui::Key::Enter)]);
+        assert_eq!(done, Some(true));
+        assert_eq!(
+            actions,
+            [UiAction::Rename(
+                RenameTarget::Session(sid),
+                "build 2".into()
+            )]
+        );
+
+        let mut r = dialog();
+        frame(&mut r, Vec::new());
+        assert_eq!(
+            frame(&mut r, vec![key(egui::Key::Escape)]),
+            (Some(false), vec![])
+        );
     }
 }
