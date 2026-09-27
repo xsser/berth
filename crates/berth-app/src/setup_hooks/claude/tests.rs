@@ -252,6 +252,10 @@ fn a_users_own_berth_hook_command_is_never_berths_entry() {
         "/old/berth-hook claude > /dev/null",
         "/old/berth-hook claude extra",
         "/old/berth-hook claude; true",
+        // Two words whose first is named berth-hook: only the compound
+        // syntax inside it tells these apart from berth's entry.
+        "true&&/old/berth-hook claude",
+        "$(true)/old/berth-hook claude",
     ] {
         assert!(!is_berth_claude(other), "{other}");
     }
