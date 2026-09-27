@@ -183,7 +183,7 @@ fn parse_cells(s: &str) -> std::result::Result<(u16, u16), String> {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// List workspaces and sessions known to the daemon.
-    List,
+    List(cli::ListArgs),
     /// Show / install / undo berth's hook entries for Claude Code
     /// (~/.claude/settings.json) or Codex (~/.codex/config.toml). Only
     /// `--yes` writes, after a backup.
@@ -205,7 +205,7 @@ fn main() -> anyhow::Result<()> {
     let (cli, splits) = parse_cli(std::env::args_os()).unwrap_or_else(|e| e.exit());
     match cli.cmd {
         None => app::run(gui_options(cli.gui, splits)),
-        Some(Cmd::List) => cli::list(&Paths::resolve()),
+        Some(Cmd::List(args)) => cli::list(&Paths::resolve(), &args),
         Some(Cmd::Doctor) => cli::doctor(&Paths::resolve()),
         Some(Cmd::Debug(cmd)) => cli::debug(&Paths::resolve(), cmd),
         Some(Cmd::SetupHooks(args)) => {

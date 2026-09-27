@@ -168,6 +168,108 @@ fn session_crud_roundtrip_and_reopen() {
     assert_eq!(store.list_sessions().unwrap(), vec![s2, s1]);
 }
 
+/// M4 (DESIGN §17.1): the archive mark lives in `meta_json`, no schema
+/// change. It survives upserts and a reopen, clearing it is stored too,
+/// `list_sessions` keeps returning archived sessions (clients filter), and
+/// a row written before the field existed reads as not archived.
+#[test]
+fn archived_at_ms_roundtrips_through_the_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let ws = WorkspaceId::new();
+    let mut archived = session(ws, 0);
+    archived.status = SessionStatus::Restored;
+    archived.archived_at_ms = Some(1_790_000_000_123);
+    let mut restored = session(ws, 1);
+    restored.archived_at_ms = Some(5);
+    {
+        let store = Store::open(&paths).unwrap();
+        store.upsert_session(&archived).unwrap();
+        store.upsert_session(&restored).unwrap();
+        restored.archived_at_ms = None;
+        store.upsert_session(&restored).unwrap();
+        assert_eq!(
+            store.get_session(archived.id).unwrap(),
+            Some(archived.clone())
+        );
+        assert_eq!(
+            store.get_session(restored.id).unwrap(),
+            Some(restored.clone())
+        );
+    }
+    let store = Store::open(&paths).unwrap();
+    assert_eq!(
+        store.list_sessions().unwrap(),
+        vec![archived.clone(), restored.clone()]
+    );
+
+    // As an M3 berthd wrote it: the JSON has no `archived_at_ms`.
+    let old = session(ws, 2);
+    let mut json = serde_json::to_value(&old).unwrap();
+    assert!(json
+        .as_object_mut()
+        .unwrap()
+        .remove("archived_at_ms")
+        .is_some());
+    store
+        .db()
+        .execute(
+            r#"INSERT INTO sessions (id, workspace, status, "order", last_active_ms, meta_json)
+               VALUES (?1, ?2, 'dormant', 2, 9, ?3)"#,
+            params![old.id.to_string(), ws.to_string(), json.to_string()],
+        )
+        .unwrap();
+    let read = store.get_session(old.id).unwrap().unwrap();
+    assert!(!read.is_archived());
+    assert_eq!(read, old);
+    assert_eq!(
+        store.list_sessions().unwrap(),
+        vec![archived, restored, old]
+    );
+}
+
+/// M4: a snapshot keeps the archive mark (format 2 holds the session as
+/// JSON) without a new format version, and a format 2 file an M3 berthd
+/// wrote, without the field, reads as not archived.
+#[test]
+fn archived_at_ms_roundtrips_through_a_snapshot() {
+    let (_dir, store) = setup();
+    let mut meta = session(WorkspaceId::new(), 0);
+    meta.status = SessionStatus::Restored;
+    meta.archived_at_ms = Some(1_790_000_000_456);
+    let snap = snapshot(&meta, 5);
+    store.write_snapshot(&snap).unwrap();
+    assert_eq!(format_on_disk(&store, meta.id), SNAPSHOT_FORMAT_VERSION);
+    let back = store.read_snapshot(meta.id).unwrap().unwrap();
+    assert_eq!(back.session.archived_at_ms, Some(1_790_000_000_456));
+    assert_eq!(back, snap);
+
+    let mut json = serde_json::to_value(&meta).unwrap();
+    assert!(json
+        .as_object_mut()
+        .unwrap()
+        .remove("archived_at_ms")
+        .is_some());
+    let m3 = FileV2Out {
+        format_version: 2,
+        saved_at_ms: snap.saved_at_ms,
+        session_json: json.to_string(),
+        styles: &snap.styles,
+        history: &snap.history,
+        screen: &snap.screen,
+    };
+    put_snapshot_file(&store, meta.id, &postcard::to_stdvec(&m3).unwrap());
+    let back = store.read_snapshot(meta.id).unwrap().unwrap();
+    assert_eq!(back.session.archived_at_ms, None);
+    assert_eq!(
+        back.session,
+        SessionMeta {
+            archived_at_ms: None,
+            ..meta
+        }
+    );
+}
+
 #[test]
 fn snapshot_roundtrip_20k_lines_atomic_and_private() {
     let (_dir, store) = setup();
