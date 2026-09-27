@@ -96,8 +96,10 @@ struct Palette {
     /// fill is only a step off the terminal background (1.21:1 for
     /// `raised` on white), so the outline is what tells the user where the
     /// panel is — a UI boundary in the sense of WCAG 1.4.11, held to
-    /// [`ACCENT_CONTRAST`]. `border` stays the quiet hairline inside the
-    /// sidebar.
+    /// [`ACCENT_CONTRAST`]. The line has two neighbours, the terminal
+    /// outside it and `raised` inside, and 1.4.11 reads against *adjacent*
+    /// colors: both sides are held to that floor, not just the outer one.
+    /// `border` stays the quiet hairline inside the sidebar.
     edge: Color32,
     /// egui's own popups (menus, dialogs), which float over the sidebar.
     popup: Color32,
@@ -160,13 +162,16 @@ const DARK_STEPS: Steps = Steps {
 /// have to stay apart from the fill they sit on (at 0.06 / 0.14 they were
 /// 1.10:1 and 1.31:1), `border` has to clear `select`, and `raised` has
 /// to lift a panel off a white terminal, where a 0.06 step is 1.12:1.
+/// `edge` steps 0.55 rather than 0.50 because it is read from both
+/// sides: at 0.50 it cleared the terminal at 3.37:1 but the `raised`
+/// fill it encloses at only 2.78:1.
 const LIGHT_STEPS: Steps = Steps {
     sidebar: 0.045,
     preview: 0.075,
     select: 0.18,
     hover: 0.10,
     border: 0.26,
-    edge: 0.50,
+    edge: 0.55,
     raised: 0.10,
     danger: 0.16,
     dim: 0.34,
@@ -2369,8 +2374,13 @@ mod tests {
             let r = contrast_ratio(rgb(c), sidebar);
             assert!(r >= floor, "{label} is {r:.2}:1 on the custom sidebar");
         }
-        let outline = contrast_ratio(rgb(p.edge), warm.background);
-        assert!(outline >= ACCENT_CONTRAST, "panel outline {outline:.2}:1");
+        for (side, against) in [("terminal", warm.background), ("raised", rgb(p.raised))] {
+            let outline = contrast_ratio(rgb(p.edge), against);
+            assert!(
+                outline >= ACCENT_CONTRAST,
+                "panel outline {outline:.2}:1 against the {side} beside it"
+            );
+        }
 
         // egui hardcodes a blue caret in its light visuals; a custom
         // theme must not inherit it.
@@ -2526,12 +2536,20 @@ mod tests {
             // says where the panel is: a UI boundary, held to 3:1. Being
             // merely unequal to the terminal is not a check — #f2f2f2 on
             // #ffffff passes that and is 1.12:1.
+            //
+            // The outline has a neighbour on each side and WCAG 1.4.11
+            // reads against adjacent colors, so both are checked: holding
+            // only the outer one let the light `edge` sit at 3.37:1 on the
+            // terminal and 2.78:1 on the fill it encloses.
             let terminal = theme.background;
-            let outline = contrast_ratio(rgb(p.edge), terminal);
-            assert!(
-                outline >= ACCENT_CONTRAST,
-                "{name}: the panel outline is {outline:.2}:1 on the terminal"
-            );
+            for (side, against) in [("terminal", terminal), ("raised", rgb(p.raised))] {
+                let outline = contrast_ratio(rgb(p.edge), against);
+                assert!(
+                    outline >= ACCENT_CONTRAST,
+                    "{name}: the panel outline is {outline:.2}:1 against the \
+                     {side} on that side of it"
+                );
+            }
             for (label, fill, on) in [
                 ("raised", p.raised, p.fg),
                 ("danger", p.danger, p.danger_fg),
