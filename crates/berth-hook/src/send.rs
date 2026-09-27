@@ -125,8 +125,14 @@ mod tests {
             let result = send(envelope, &socket, BUDGET);
             let took = start.elapsed();
             assert!(result.is_err(), "reader {chunk}B/{every:?}: {result:?}");
+            // Loose on purpose: it only has to tell "capped" from "one
+            // timeout per write". Without the cap the trickle reader takes
+            // hours for 4 MiB, so any bound well under a second proves it —
+            // while a loaded CI machine can still schedule the helper
+            // thread tens of milliseconds late (seen: 113 ms for a 50 ms
+            // budget). Tightening this to BUDGET + ε only buys flakes.
             assert!(
-                took < Duration::from_millis(100),
+                took < Duration::from_millis(750),
                 "reader {chunk}B/{every:?}: send took {took:?}"
             );
         }
