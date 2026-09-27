@@ -239,6 +239,94 @@ fn installed_hook_is_found_for_undo() {
     assert!(!statusline_installed(SETTINGS));
 }
 
+/// Review high: only exactly `<berth-hook> claude` is berth's entry. A
+/// command of the user's that also runs berth-hook is not installed, not
+/// rewritten when the path changes, kept by the removal, and the self-check
+/// refuses an edit to it.
+#[test]
+fn a_users_own_berth_hook_command_is_never_berths_entry() {
+    let users = "/old/berth-hook claude && echo user-added-this";
+    for other in [
+        users,
+        "FOO=1 /old/berth-hook claude",
+        "/old/berth-hook claude > /dev/null",
+        "/old/berth-hook claude extra",
+        "/old/berth-hook claude; true",
+    ] {
+        assert!(!is_berth_claude(other), "{other}");
+    }
+    assert!(is_berth_claude("'/p q/berth-hook' claude"));
+    let text = r#"{"hooks": {
+  "Stop": [{"hooks": [
+    {"type": "command", "command": "USERS"},
+    {"type": "command", "command": "/old/berth-hook claude"}
+  ]}],
+  "SessionEnd": [{"hooks": [{"type": "command", "command": "USERS"}]}]
+}}
+"#
+    .replace("USERS", users);
+    let found = installed(&text).unwrap();
+    assert!(found.events.contains(&"Stop"), "{found:?}");
+    assert!(found.missing.contains(&"SessionEnd"), "{found:?}");
+    assert_eq!(found.hooks, ["/old/berth-hook"]);
+
+    let out = install(&text, &hook("/new/berth-hook"), false).unwrap();
+    assert_eq!(out.text.matches(users).count(), 2, "{}", out.text);
+    let cmds = berth_commands(&out.text);
+    assert_eq!(cmds.len(), EVENTS.len());
+    assert!(cmds.iter().all(|(_, c)| c == "/new/berth-hook claude"));
+    let v = value(&out.text);
+    assert_eq!(v["hooks"]["SessionEnd"][0]["hooks"][0]["command"], users);
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n == "Stop：/old/berth-hook claude 改为 /new/berth-hook claude"),
+        "{:?}",
+        out.notes
+    );
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.starts_with("Stop, SessionEnd 里有用户自己写的 berth-hook 命令")),
+        "{:?}",
+        out.notes
+    );
+    let back = uninstall(&out.text, None).unwrap();
+    assert_eq!(back.text.matches(users).count(), 2, "{}", back.text);
+    assert!(berth_commands(&back.text).is_empty());
+    // An edit that took the user's command for berth's is refused.
+    let cmd = "/new/berth-hook claude";
+    let taken = out.text.replacen(users, cmd, 1);
+    assert!(verify_install(&value(&text), &taken, cmd, false).is_err());
+}
+
+/// Review high, status line: only the exact wrapper `wrap_statusline`
+/// makes is berth's. Anything else running berth-hook is the user's: not
+/// installed, never wrapped again or rewritten, kept by the removal.
+#[test]
+fn a_status_line_the_user_runs_through_berth_hook_is_left_alone() {
+    for users in [
+        "/x/berth-hook statusline -- ./s.sh && echo user-added-this",
+        "FOO=1 /x/berth-hook statusline -- ./s.sh",
+    ] {
+        let text = format!(
+            r#"{{"statusLine": {{"type": "command", "command": {}}}}}"#,
+            serde_json::to_string(users).unwrap()
+        );
+        assert_eq!(unwrap_statusline(users), None, "{users}");
+        assert!(!statusline_installed(&text), "{users}");
+        let out = install(&text, &hook("/y/berth-hook"), true).unwrap();
+        assert_eq!(value(&out.text)["statusLine"]["command"], users);
+        assert!(
+            out.notes.iter().any(|n| n.contains("不再包装")),
+            "{:?}",
+            out.notes
+        );
+        let back = uninstall(&out.text, None).unwrap();
+        assert_eq!(value(&back.text)["statusLine"]["command"], users);
+    }
+}
+
 /// The self-check behind every edit refuses results that change anything
 /// but berth's entries.
 #[test]

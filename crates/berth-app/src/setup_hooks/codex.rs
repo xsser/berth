@@ -38,8 +38,27 @@ fn notify(doc: &DocumentMut) -> Result<Option<Vec<String>>, String> {
         .map(Some)
 }
 
+/// berth's own notify: exactly `[<berth-hook>, "codex"]`, or that plus
+/// `"--chain"` and the original program's argv. `Some(original)`, empty
+/// when nothing is chained. `None`: any other argv, the user's own even
+/// when it runs berth-hook: never counted as installed, never rewritten.
+fn berth_notify(argv: &[String]) -> Option<&[String]> {
+    match argv {
+        [hook, word] if shell::is_berth_hook(hook) && word == "codex" => Some(&[]),
+        [hook, word, chain, original @ ..]
+            if shell::is_berth_hook(hook)
+                && word == "codex"
+                && chain == "--chain"
+                && !original.is_empty() =>
+        {
+            Some(original)
+        }
+        _ => None,
+    }
+}
+
 fn is_berth(argv: &[String]) -> bool {
-    argv.len() >= 2 && shell::is_berth_hook(&argv[0]) && argv[1] == "codex"
+    berth_notify(argv).is_some()
 }
 
 /// Replace the `notify` value, keeping its key and surrounding comments.
@@ -74,10 +93,7 @@ pub fn installed(text: &str) -> Result<super::Installed, String> {
     if let Some(argv) = notify(&parse(text)?)?.filter(|a| is_berth(a)) {
         out.events.push("notify");
         out.hooks.push(argv[0].clone());
-        out.chained = matches!(
-            argv.get(2).map(String::as_str),
-            Some("--chain") | Some("--")
-        );
+        out.chained = berth_notify(&argv).is_some_and(|original| !original.is_empty());
     }
     Ok(out)
 }
@@ -95,13 +111,22 @@ pub fn install(text: &str, hook: &str) -> Result<Change, String> {
                     notes,
                 });
             }
-            notes.push("notify 已经过另一个路径的 berth-hook：改为当前路径".into());
+            notes.push(format!(
+                "notify 的 berth-hook 路径 {} 改为 {hook}（其余参数不变）",
+                argv[0]
+            ));
             std::iter::once(hook.to_owned())
                 .chain(argv[1..].iter().cloned())
                 .collect()
         }
         Some(argv) if !argv.is_empty() => {
             notes.push("已有 notify 程序：berth-hook 转发后以 --chain 原样执行它".into());
+            if argv.iter().any(|a| a.contains("berth-hook")) {
+                notes.push(
+                    "它是用户自己写的 berth-hook 调用（不是 berth 的写法）：不算已装，原样串接、不改写；该通知会上报两次"
+                        .into(),
+                );
+            }
             [hook, "codex", "--chain"]
                 .into_iter()
                 .map(str::to_owned)
@@ -126,10 +151,7 @@ pub fn uninstall(text: &str) -> Result<Change, String> {
             notes: Vec::new(),
         });
     };
-    let original: Vec<String> = match argv.get(2).map(String::as_str) {
-        Some("--chain") | Some("--") => argv[3..].to_vec(),
-        _ => Vec::new(),
-    };
+    let original: Vec<String> = berth_notify(&argv).unwrap_or_default().to_vec();
     let note = if original.is_empty() {
         doc.remove("notify");
         "删除 berth 的 notify"
@@ -238,6 +260,53 @@ model = "gpt-5.5-mini"
         let out = install("", "/x/berth-hook").unwrap();
         assert_eq!(out.text, "notify = [\"/x/berth-hook\", \"codex\"]\n");
         assert_eq!(uninstall(&out.text).unwrap().text, "");
+    }
+
+    /// Review high: only `[<berth-hook>, "codex"]`, optionally with
+    /// `"--chain", <original...>`, is berth's notify. Another argv that
+    /// runs berth-hook is the user's: not installed, chained as it is,
+    /// given back by the removal.
+    #[test]
+    fn a_notify_of_the_users_that_runs_berth_hook_is_chained_not_rewritten() {
+        for users in [
+            r#"notify = ["/old/berth-hook", "codex", "extra"]"#,
+            r#"notify = ["/old/berth-hook", "codex", "--", "terminal-notifier"]"#,
+            r#"notify = ["sh", "-c", "/old/berth-hook codex \"$1\" && say done", "sh"]"#,
+        ] {
+            let text = format!("{users}\n");
+            let argv = notify(&parse(&text).unwrap()).unwrap().unwrap();
+            assert!(!is_berth(&argv), "{users}");
+            assert_eq!(
+                installed(&text).unwrap(),
+                crate::setup_hooks::Installed::default()
+            );
+            assert_eq!(installed_hook(&text), None);
+            let out = install(&text, "/new/berth-hook").unwrap();
+            let after = notify(&parse(&out.text).unwrap()).unwrap().unwrap();
+            assert_eq!(after[..3], ["/new/berth-hook", "codex", "--chain"]);
+            assert_eq!(after[3..], argv[..], "chained as it is");
+            assert!(
+                out.notes.iter().any(|n| n.contains("用户自己写的")),
+                "{:?}",
+                out.notes
+            );
+            // Given back as it was (toml_edit may pick another string
+            // quoting; the value is the same).
+            let back: toml::Table = uninstall(&out.text).unwrap().text.parse().unwrap();
+            assert_eq!(back, text.parse::<toml::Table>().unwrap());
+        }
+        // berth's own with another path: the path alone changes, named.
+        let text =
+            "notify = [\"/old/berth-hook\", \"codex\", \"--chain\", \"terminal-notifier\"]\n";
+        let out = install(text, "/new/berth-hook").unwrap();
+        assert_eq!(
+            out.text,
+            "notify = [\"/new/berth-hook\", \"codex\", \"--chain\", \"terminal-notifier\"]\n"
+        );
+        assert_eq!(
+            out.notes,
+            ["notify 的 berth-hook 路径 /old/berth-hook 改为 /new/berth-hook（其余参数不变）"]
+        );
     }
 
     #[test]

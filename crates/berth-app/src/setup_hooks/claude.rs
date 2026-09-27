@@ -63,19 +63,29 @@ pub fn check(text: &str) -> Result<Value, String> {
         .map_err(|e| format!("不是有效的 JSON（第 {} 行第 {} 列）", e.line(), e.column()))
 }
 
-/// Whether `command` runs `berth-hook claude`.
+/// Whether `command` is berth's own hook entry: exactly `<berth-hook>
+/// claude` after `sh` word splitting (any berth-hook path), nothing more.
+/// Anything else that runs berth-hook (`… claude && echo hi`, a variable
+/// set before it, a redirection) is the user's: never counted as
+/// installed, never rewritten or removed.
 pub fn is_berth_claude(command: &str) -> bool {
     shell::split(command).is_some_and(|w| {
-        w.words.len() >= 2 && shell::is_berth_hook(&w.words[0].text) && w.words[1].text == "claude"
+        !w.compound
+            && matches!(w.words.as_slice(), [hook, word]
+                if shell::is_berth_hook(&hook.text) && word.text == "claude")
     })
 }
 
+/// Whether the status line command is berth's own wrapper (exactly what
+/// `wrap_statusline` makes of some command).
 fn is_berth_statusline(command: &str) -> bool {
-    shell::split(command).is_some_and(|w| {
-        w.words.len() >= 2
-            && shell::is_berth_hook(&w.words[0].text)
-            && w.words[1].text == "statusline"
-    })
+    unwrap_statusline(command).is_some()
+}
+
+/// A command of the user's that runs berth-hook in a form of their own:
+/// kept as it is, never wrapped again.
+fn users_berth_hook(command: &str) -> bool {
+    command.contains("berth-hook")
 }
 
 /// `command` run through berth-hook: as is when it is a plain command
@@ -97,27 +107,29 @@ pub fn wrap_statusline(command: &str, hook: &Hook) -> Option<String> {
     })
 }
 
-/// The original of a status line command `wrap_statusline` produced (with
-/// any berth-hook path). `None`: not in that form.
+/// The original of a status line command that is exactly what
+/// `wrap_statusline` makes of it (with any berth-hook path). `None`: any
+/// other form, the user's own even when it runs berth-hook.
 pub fn unwrap_statusline(command: &str) -> Option<String> {
     let words = shell::split(command)?;
     let w = &words.words;
-    if w.len() < 4 || !shell::is_berth_hook(&w[0].text) || w[1].text != "statusline" {
-        return None;
-    }
-    if w[2].text != "--" {
+    if w.len() < 4
+        || !shell::is_berth_hook(&w[0].text)
+        || w[1].text != "statusline"
+        || w[2].text != "--"
+    {
         return None;
     }
     let hook = Hook {
         path: w[0].text.clone(),
     };
-    if w.len() == 6 && w[3].text == "sh" && w[4].text == "-c" {
-        let inner = w[5].text.clone();
-        if wrap_statusline(&inner, &hook).as_deref() == Some(command) {
-            return Some(inner);
-        }
-    }
-    command.get(w[2].span.end + 1..).map(str::to_owned)
+    // Wrapped via `sh -c`, or as is (which may itself be `sh -c …`).
+    let inner = (w.len() == 6 && w[3].text == "sh" && w[4].text == "-c").then(|| w[5].text.clone());
+    let rest = command.get(w[2].span.end + 1..).map(str::to_owned);
+    [inner, rest]
+        .into_iter()
+        .flatten()
+        .find(|original| wrap_statusline(original, &hook).as_deref() == Some(command))
 }
 
 /// The berth-hook path of the first berth hook entry, if any (to redo an
@@ -251,6 +263,7 @@ pub fn install(text: &str, hook: &Hook, statusline: bool) -> Result<Change, Stri
             refuse_duplicates(hooks, "\"hooks\" ", &EVENTS)?;
             let mut missing = Vec::new();
             let mut updated = Vec::new();
+            let mut users = Vec::new();
             for event in EVENTS {
                 let Some(list) = hooks.get(event) else {
                     missing.push((event.to_string(), J::Arr(vec![entry(&command)])));
@@ -259,19 +272,29 @@ pub fn install(text: &str, hook: &Hook, statusline: bool) -> Result<Change, Stri
                 let Some(entries) = list.items() else {
                     return Err(format!("\"hooks\".\"{event}\" 不是数组"));
                 };
-                let berth: Vec<&Node> = entries
+                let commands: Vec<(&Node, &str)> = entries
                     .iter()
                     .flat_map(handlers)
                     .filter_map(|h| h.get("command"))
-                    .filter(|c| c.as_str().is_some_and(is_berth_claude))
+                    .filter_map(|c| Some((c, c.as_str()?)))
                     .collect();
-                if berth.iter().any(|c| c.as_str() == Some(command.as_str())) {
+                if commands
+                    .iter()
+                    .any(|(_, c)| users_berth_hook(c) && !is_berth_claude(c))
+                {
+                    users.push(event);
+                }
+                let berth: Vec<&(&Node, &str)> = commands
+                    .iter()
+                    .filter(|(_, c)| is_berth_claude(c))
+                    .collect();
+                if berth.iter().any(|(_, c)| *c == command) {
                     continue;
                 }
                 match berth.first() {
-                    Some(stale) => {
+                    Some((stale, was)) => {
                         json_span::replace_string(&mut edits, stale, &command);
-                        updated.push(event);
+                        updated.push(format!("{event}：{was} 改为 {command}"));
                     }
                     None => {
                         json_span::append_item(&mut edits, text, &layout, list, &entry(&command))
@@ -280,9 +303,15 @@ pub fn install(text: &str, hook: &Hook, statusline: bool) -> Result<Change, Stri
             }
             if !updated.is_empty() {
                 notes.push(format!(
-                    "{} 个事件已有指向其他路径的 berth-hook，改为指向当前路径：{}",
-                    updated.len(),
-                    updated.join(", ")
+                    "{} 个事件的 berth 条目指向其他路径的 berth-hook，逐条改为当前路径（只改恰好是「<berth-hook> claude」的条目）：",
+                    updated.len()
+                ));
+                notes.extend(updated);
+            }
+            if !users.is_empty() {
+                notes.push(format!(
+                    "{} 里有用户自己写的 berth-hook 命令（不只是「<berth-hook> claude」）：不算 berth 的条目，原样保留、不改写；与 berth 的条目同在时，该事件会上报两次",
+                    users.join(", ")
                 ));
             }
             json_span::append_members(&mut edits, text, &layout, hooks, &missing);
@@ -336,10 +365,13 @@ fn statusline_edit(
         return Err("\"statusLine\".\"command\" 不是字符串".into());
     };
     let wanted = match unwrap_statusline(current) {
-        // Already wrapped: only a different berth-hook path changes.
+        // berth's wrapper: only a different berth-hook path changes.
         Some(original) => wrap_statusline(&original, hook),
-        None if is_berth_statusline(current) => {
-            notes.push("statusLine 已经经过 berth-hook（非 berth 生成的写法）：保持不变".into());
+        None if users_berth_hook(current) => {
+            notes.push(
+                "statusLine 命令里已有 berth-hook，但不是 berth 生成的包装：算作用户自己的命令，不再包装，保持不变"
+                    .into(),
+            );
             return Ok(());
         }
         None => {
@@ -425,7 +457,7 @@ fn verify_install(
     }
     if statusline {
         if let Some(cmd) = after["statusLine"]["command"].as_str() {
-            if !cmd.is_empty() && !is_berth_statusline(cmd) {
+            if !cmd.is_empty() && !is_berth_statusline(cmd) && !users_berth_hook(cmd) {
                 return Err("internal error: status line not wrapped".into());
             }
         }
