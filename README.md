@@ -52,6 +52,14 @@ The GUI is a client that attaches to it. Nothing you close kills anything you ca
 - **Archive instead of delete.** `⌘W` archives a session: the process ends, everything else stays.
   Find it under **归档 / Archive** in the sidebar, restore it, or delete it for good. Sessions idle
   for more than a week archive themselves (configurable, off with `0`).
+- **Light by default, yours to override.** A white terminal with the One Light palette. Upstream's
+  colors are tuned for a gray editor background, so some are darkened for pure white, and by what
+  the slot is for: the normal colors carry body text — `ls`, diffs, compiler output — and are held
+  to 4.5:1 (red, green, yellow, cyan and white moved); the bright ones only mark that text and
+  keep 3:1, where bright magenta alone fell short. One line of config switches to the old
+  dark theme, and any single color — background, foreground, cursor, accent, the sixteen ANSI
+  colors — can be replaced on top of either preset. The sidebar, dividers, notices and menus are
+  all derived from it, so nothing is left behind in the other theme.
 - **GPU rendering.** wgpu + a custom cell grid, egui for the sidebar. Ligature-free monospace
   shaping via cosmic-text, a shared glyph atlas across panes.
 - **Nothing installed behind your back.** `berth setup-hooks claude` prints a JSON diff and writes
@@ -78,6 +86,18 @@ berth setup-hooks claude --yes    # backs up ~/.claude/settings.json, then write
 berth setup-hooks claude --undo   # restores the backup byte for byte
 berth setup-hooks codex --yes     # chains Codex's notify through berth-hook
 ```
+
+Colors live in `~/.config/berth/config.toml` (the same file the daemon reads). Every key is
+optional; a value that is not a color is skipped with a warning and the rest still applies:
+
+```toml
+[theme]
+preset = "dark"           # "light" (default) | "dark"
+accent = "#0a7d55"        # pulse, 「N 需关注」, agent glyph, error copy, focused pane border
+background = "#fffdf6"    # foreground, cursor, cursor_text and ansi = [16 colors] too
+```
+
+The file is read once at startup, so restart `berth` to apply a change.
 
 ### Keys
 
@@ -157,6 +177,11 @@ berth 把这两件事拆开：常驻守护进程 `berthd` 持有所有 PTY、终
   的 pane 在 M 系列 Mac 上帧耗时 p99 约 2 ms。
 - **用归档代替删除。** `⌘W` 归档一个 session：进程结束，其余全部保留。在侧栏「归档」区里找回、恢复，
   或者彻底删除。超过一周没动的会自动归档（可配置，设 `0` 关闭）。
+- **默认浅色，颜色可自定义。** 白底终端配 One Light 配色。上游那套是给灰底编辑器调的，落到纯白上
+  不够用，压暗按槽位的用途分两档：正常色 0-7 要承载 `ls`、diff、编译器输出这类正文，按 4.5:1 压暗了
+  红、绿、黄、青、白；高亮色 8-15 只用来标记正文，保持 3:1，其中只有亮品红不够。一行配置切回原来的
+  深色主题；背景、前景、光标、强调色、16 色 ANSI 也都能在任一预设之上逐键覆盖。侧栏、分隔线、通知条
+  与菜单全部由主题推导，不会有一处还留在另一套配色里。
 - **GPU 渲染。** wgpu 自研单元格网格 + egui 侧栏，cosmic-text 做等宽排版，多个 pane 共享同一份字形图集。
 - **不背着你改任何配置。** `berth setup-hooks claude` 先打印 JSON diff，只有 `--yes` 才写入，并先备份；
   `--undo` 按字节还原。`berth doctor` 全程只读。
@@ -181,6 +206,18 @@ berth setup-hooks claude --yes    # 先备份 ~/.claude/settings.json，再写�
 berth setup-hooks claude --undo   # 按备份逐字节还原
 berth setup-hooks codex --yes     # 把 Codex 的 notify 串到 berth-hook 上
 ```
+
+颜色写在 `~/.config/berth/config.toml`（daemon 读的是同一个文件）。所有键都可选，单个值非法只跳过
+该键并告警，其余照常生效：
+
+```toml
+[theme]
+preset = "dark"           # "light"（默认）| "dark"
+accent = "#0a7d55"        # 脉冲、「N 需关注」、agent 图标、出错文案、聚焦 pane 边框
+background = "#fffdf6"    # foreground、cursor、cursor_text、ansi = [16 色] 同理
+```
+
+配置只在启动时读一次，改完重启 `berth` 生效。
 
 ### 快捷键
 

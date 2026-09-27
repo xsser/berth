@@ -54,7 +54,7 @@ use crate::renderer::{
 use crate::selection::{Point, Selection, SelectionKind, SelectionSpans};
 use crate::sidebar::{Chrome, Sidebar, UiAction};
 use crate::stats::{FrameStats, FrameTiming, PaneSample};
-use crate::theme::{mix, rgba, Theme};
+use crate::theme::{rgba, Theme};
 
 /// Padding around the grid (Ghostty's default `window-padding-x/y = 2`).
 pub const PADDING_PT: f32 = 2.0;
@@ -276,7 +276,7 @@ fn traffic_label(ctl: &mut Controller) -> String {
 /// Dividers and pane borders of a split layout (nothing for one pane). A
 /// pane's border lies on the divider lines around it (inside the pane only
 /// at the edge of the terminal area, `area`), so neighbours are one thin
-/// line apart: dark, or the accent color along the focused pane, whose
+/// line apart: quiet, or the accent color along the focused pane, whose
 /// border is drawn last. `gap` is the divider line's width.
 fn pane_chrome(
     layout: &Layout,
@@ -289,18 +289,14 @@ fn pane_chrome(
     if layout.panes.len() < 2 {
         return Vec::new();
     }
-    let dark = mix(
-        mix(theme.background, [0, 0, 0], 0.22),
-        theme.foreground,
-        0.10,
-    );
-    let accent = theme.palette[4];
+    let accent = theme.accent;
+    let quiet = crate::sidebar::border(theme);
     let t = (BORDER_PT * scale).round().max(1.0);
     let r = |r: PxRect| [r.x, r.y, r.w, r.h];
     let mut quads: Vec<QuadInstance> = layout
         .dividers
         .iter()
-        .map(|d| fill_quad(r(d.rect), rgba(dark, 1.0)))
+        .map(|d| fill_quad(r(d.rect), rgba(quiet, 1.0)))
         .collect();
     let mut panes: Vec<_> = layout.panes.iter().collect();
     panes.sort_by_key(|p| Some(p.session) == focused);
@@ -308,7 +304,7 @@ fn pane_chrome(
         let color = if Some(p.session) == focused {
             accent
         } else {
-            dark
+            quiet
         };
         let (x0, y0) = ((p.rect.x - gap).max(area.x), (p.rect.y - gap).max(area.y));
         let x1 = (p.rect.right() + gap).min(area.right());
@@ -2102,7 +2098,7 @@ impl Gfx {
         };
         surface.configure(&device, &surface_config);
 
-        let theme = Theme::ghostty_default();
+        let theme = config.theme.clone();
         let mut grid = grid;
         let family = grid.text.family().to_string();
         let sidebar = Sidebar::new(

@@ -64,16 +64,18 @@ use crate::menus::{self, MenuAction, MenuItem, RenameTarget};
 use crate::mismatch::Banner;
 use crate::panes::Axis;
 use crate::setup_hooks::command_line;
-use crate::theme::{mix, Rgb, Theme};
+use crate::theme::{contrast_ratio, mix, Rgb, Theme, BODY_TEXT_CONTRAST};
 use crate::timefmt::local_clock;
 
 const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
-const ORANGE: Rgb = [0xde, 0x93, 0x5f];
 
 fn c32(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb[0], rgb[1], rgb[2])
 }
 
+/// Every color the sidebar and the overlays draw with, derived from the
+/// [`Theme`] plus the configured accent — nothing here is hardcoded, so a
+/// custom `[theme]` moves the whole surface with it.
 #[derive(Clone, Copy)]
 struct Palette {
     bg: Color32,
@@ -85,38 +87,271 @@ struct Palette {
     preview_bg: Color32,
     preview_fg: Color32,
     border: Color32,
+    /// Panels floating over the terminal area (notices, the mismatch
+    /// banner), the fill of an error notice, and the text on that fill.
+    raised: Color32,
+    danger: Color32,
+    danger_fg: Color32,
+    /// Outline of those floating panels. Separate from `border`: a panel
+    /// fill is only a step off the terminal background (1.21:1 for
+    /// `raised` on white), so the outline is what tells the user where the
+    /// panel is — a UI boundary in the sense of WCAG 1.4.11, held to
+    /// [`ACCENT_CONTRAST`]. The line has two neighbours, the terminal
+    /// outside it and `raised` inside, and 1.4.11 reads against *adjacent*
+    /// colors: both sides are held to that floor, not just the outer one.
+    /// `border` stays the quiet hairline inside the sidebar.
+    edge: Color32,
+    /// egui's own popups (menus, dialogs), which float over the sidebar.
+    popup: Color32,
     red: Color32,
     green: Color32,
     yellow: Color32,
     blue: Color32,
     magenta: Color32,
     cyan: Color32,
-    orange: Color32,
+    /// `[theme].accent`: the 「等授权」 pulse, the 「N 需关注」 count in
+    /// the status line, the agent glyph, error copy, and the focused
+    /// pane's border (`app::pane_chrome`). Not the unread dot, which is
+    /// `blue`.
+    accent: Color32,
+    /// [`Theme::is_light`], for egui's own light / dark visuals.
+    light: bool,
+}
+
+/// How far each surface steps away from the theme's own colors. Named
+/// per mode so the two sets read side by side and the checks can state
+/// which color a surface is a step from: `sidebar` and `preview` step the
+/// terminal background toward black, `select` / `hover` / `border` step
+/// [`Palette::tint_base`] (resp. the sidebar fill) toward the foreground,
+/// `raised` and `danger` step the terminal background toward the
+/// foreground and toward `ansi[1]`, and `dim` / `faint` / `preview_fg`
+/// fade the foreground back toward the terminal background.
+struct Steps {
+    sidebar: f32,
+    preview: f32,
+    select: f32,
+    hover: f32,
+    border: f32,
+    edge: f32,
+    raised: f32,
+    danger: f32,
+    dim: f32,
+    faint: f32,
+    preview_fg: f32,
+}
+
+/// A dark theme has room to step far toward black.
+const DARK_STEPS: Steps = Steps {
+    sidebar: 0.22,
+    preview: 0.40,
+    select: 0.12,
+    hover: 0.05,
+    border: 0.10,
+    edge: 0.45,
+    raised: 0.06,
+    danger: 0.34,
+    dim: 0.45,
+    faint: 0.62,
+    preview_fg: 0.25,
+};
+
+/// White goes dirty long before 0.22, so a light theme steps about a
+/// twentieth of that toward black. The amounts that run toward the
+/// foreground are not scaled the same way — they have to carry the same
+/// separation on a fill that starts far brighter: `hover` and `select`
+/// have to stay apart from the fill they sit on (at 0.06 / 0.14 they were
+/// 1.10:1 and 1.31:1), `border` has to clear `select`, and `raised` has
+/// to lift a panel off a white terminal, where a 0.06 step is 1.12:1.
+/// `edge` steps 0.55 rather than 0.50 because it is read from both
+/// sides: at 0.50 it cleared the terminal at 3.37:1 but the `raised`
+/// fill it encloses at only 2.78:1.
+const LIGHT_STEPS: Steps = Steps {
+    sidebar: 0.045,
+    preview: 0.075,
+    select: 0.18,
+    hover: 0.10,
+    border: 0.26,
+    edge: 0.55,
+    raised: 0.10,
+    danger: 0.16,
+    dim: 0.34,
+    faint: 0.42,
+    preview_fg: 0.20,
+};
+
+/// The line the sidebar draws along its own edge. The pane dividers take
+/// it from here rather than deriving it a second time
+/// (`app::pane_chrome`): they are the same line to the eye, and a light
+/// theme's amounts are not a scaled copy of a dark theme's, so a copy
+/// would drift the moment either is tuned.
+pub fn border(t: &Theme) -> Rgb {
+    mix(
+        Palette::sidebar_fill(t),
+        t.foreground,
+        Palette::steps(t).border,
+    )
+}
+
+/// Text color for an error notice. `danger` is only a sixth of the way
+/// from the background toward `ansi[1]`, so the background itself tops out
+/// near 3:1 on it (3.14:1 over every possible pair) — a custom foreground
+/// sitting close to that fill leaves *both* of the theme's own ends
+/// unreadable. Prefer the theme's ends, and drop to plain black or white
+/// only when neither clears [`BODY_TEXT_CONTRAST`]; one of those two
+/// always clears 4.58:1 against any fill.
+fn on_danger(text: Rgb, bg: Rgb, danger: Rgb) -> Rgb {
+    let theirs = if contrast_ratio(text, danger) >= contrast_ratio(bg, danger) {
+        text
+    } else {
+        bg
+    };
+    if contrast_ratio(theirs, danger) >= BODY_TEXT_CONTRAST {
+        return theirs;
+    }
+    let (black, white) = ([0, 0, 0], [255, 255, 255]);
+    if contrast_ratio(black, danger) >= contrast_ratio(white, danger) {
+        black
+    } else {
+        white
+    }
 }
 
 impl Palette {
+    fn steps(t: &Theme) -> &'static Steps {
+        if t.is_light() {
+            &LIGHT_STEPS
+        } else {
+            &DARK_STEPS
+        }
+    }
+
+    /// The sidebar sits one step below the terminal background, and the
+    /// preview block one step further.
+    fn sidebar_fill(t: &Theme) -> Rgb {
+        mix(t.background, [0, 0, 0], Self::steps(t).sidebar)
+    }
+
+    /// What the selection, hover and border tints are a step away from. A
+    /// light sidebar is *darker* than its terminal, so tinting the
+    /// terminal background toward the foreground (what a dark theme does)
+    /// lands back on the sidebar fill and disappears: at the hover amount
+    /// it came out 1.01:1 against the fill it was drawn on. A light theme
+    /// tints that fill instead.
+    fn tint_base(t: &Theme) -> Rgb {
+        if t.is_light() {
+            Self::sidebar_fill(t)
+        } else {
+            t.background
+        }
+    }
+
     fn from_theme(t: &Theme) -> Self {
-        let black = [0, 0, 0];
-        let bg = mix(t.background, black, 0.22);
+        let (fg, bg, black) = (t.foreground, t.background, [0, 0, 0]);
+        let light = t.is_light();
+        let s = Self::steps(t);
+        let sidebar = Self::sidebar_fill(t);
+        let base = Self::tint_base(t);
+        let tint = |amount: f32| c32(mix(base, fg, amount));
+        let fade = |amount: f32| c32(mix(fg, bg, amount));
+        let text = mix(fg, bg, 0.08);
+        let danger = mix(bg, t.palette[1], s.danger);
         Self {
-            bg: c32(bg),
-            fg: c32(mix(t.foreground, t.background, 0.08)),
-            dim: c32(mix(t.foreground, t.background, 0.45)),
-            faint: c32(mix(t.foreground, t.background, 0.62)),
-            select: c32(mix(t.background, t.foreground, 0.12)),
-            hover: c32(mix(t.background, t.foreground, 0.05)),
-            preview_bg: c32(mix(t.background, black, 0.40)),
-            preview_fg: c32(mix(t.foreground, t.background, 0.25)),
-            border: c32(mix(bg, t.foreground, 0.10)),
+            bg: c32(sidebar),
+            fg: c32(text),
+            dim: fade(s.dim),
+            faint: fade(s.faint),
+            select: tint(s.select),
+            hover: tint(s.hover),
+            preview_bg: c32(mix(bg, black, s.preview)),
+            preview_fg: fade(s.preview_fg),
+            border: c32(border(t)),
+            edge: c32(mix(sidebar, fg, s.edge)),
+            raised: c32(mix(bg, fg, s.raised)),
+            danger: c32(danger),
+            danger_fg: c32(on_danger(text, bg, danger)),
+            // A raised surface is lighter in both modes: for a light theme
+            // that is the terminal background itself, above the grayer
+            // sidebar.
+            popup: c32(if light { bg } else { mix(bg, fg, 0.10) }),
             red: c32(t.palette[1]),
             green: c32(t.palette[2]),
             yellow: c32(t.palette[3]),
             blue: c32(t.palette[4]),
             magenta: c32(t.palette[5]),
             cyan: c32(t.palette[6]),
-            orange: c32(ORANGE),
+            accent: c32(t.accent),
+            light,
         }
     }
+}
+
+/// How far the 「等授权」 pulse may dim the accent: at the trough it is
+/// drawn at this fraction of full strength over the sidebar fill, which
+/// is a plain `mix(bg, accent, PULSE_FLOOR)`. Below 0.80 the badge drops
+/// under 3:1 in both presets (0.55 gave 2.14:1 on the light sidebar), and
+/// this is the state asking the user to come and confirm something — it
+/// has to stay legible through the whole cycle, not only at the peak.
+const PULSE_FLOOR: f32 = 0.80;
+
+/// Badge color of an agent state. 「等授权」 breathes between
+/// [`PULSE_FLOOR`] and full strength; every other state is a flat palette
+/// entry.
+fn state_color(pal: Palette, state: &AgentState, now_ms: i64) -> Color32 {
+    let wave = (now_ms as f64 / 1000.0 * std::f64::consts::PI).sin().abs() as f32;
+    let pulse = PULSE_FLOOR + (1.0 - PULSE_FLOOR) * wave;
+    match state {
+        AgentState::Idle | AgentState::Exited { .. } => pal.dim,
+        AgentState::Thinking => pal.blue,
+        AgentState::Compacting => pal.magenta,
+        AgentState::ToolRunning { .. } => pal.yellow,
+        AgentState::WaitingPermission { .. } => pal.accent.gamma_multiply(pulse),
+        AgentState::WaitingInput => pal.cyan,
+        AgentState::Done => pal.green,
+        AgentState::Error { .. } => pal.red,
+    }
+}
+
+/// egui's own colors, aligned with [`Palette`]: without this the menus,
+/// the rename dialog and the confirm dialogs keep egui's defaults, which
+/// clash with a custom theme and, in light mode, with our own grays.
+fn visuals(pal: &Palette) -> egui::Visuals {
+    let mut v = if pal.light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    v.override_text_color = Some(pal.fg);
+    v.panel_fill = pal.bg;
+    v.window_fill = pal.popup;
+    v.window_stroke = Stroke::new(1.0, pal.border);
+    v.faint_bg_color = pal.hover;
+    // Backgrounds of text fields and code blocks.
+    v.extreme_bg_color = pal.preview_bg;
+    v.code_bg_color = pal.preview_bg;
+    v.hyperlink_color = pal.accent;
+    v.warn_fg_color = pal.accent;
+    v.error_fg_color = pal.red;
+    v.selection.bg_fill = pal.select;
+    v.selection.stroke = Stroke::new(1.0, pal.fg);
+    // egui hardcodes a blue caret in `Visuals::light()`; the rename field
+    // sits on `preview_bg`, where the foreground reads best.
+    v.text_cursor.stroke = Stroke::new(2.0, pal.fg);
+    v.widgets.noninteractive.bg_fill = pal.bg;
+    v.widgets.noninteractive.weak_bg_fill = pal.bg;
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal.border);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, pal.dim);
+    for (w, fill) in [
+        (&mut v.widgets.inactive, pal.hover),
+        (&mut v.widgets.hovered, pal.select),
+        (&mut v.widgets.active, pal.select),
+        (&mut v.widgets.open, pal.select),
+    ] {
+        w.bg_fill = fill;
+        w.weak_bg_fill = fill;
+        w.bg_stroke = Stroke::new(1.0, pal.border);
+        w.fg_stroke = Stroke::new(1.0, pal.fg);
+    }
+    v
 }
 
 /// Compact elapsed-time label ("12s", "1m35s", "15m", "1h05m", "3d").
@@ -875,7 +1110,8 @@ fn mismatch_panel(
         .fixed_pos(grid.center())
         .show(ctx, |ui| {
             egui::Frame::new()
-                .fill(Color32::from_rgb(0x26, 0x2c, 0x36))
+                .fill(pal.raised)
+                .stroke(Stroke::new(1.0, pal.edge))
                 .corner_radius(8.0)
                 .inner_margin(Margin::same(16))
                 .show(ui, |ui| {
@@ -908,8 +1144,9 @@ impl Sidebar {
         width_pt: f32,
         theme: &Theme,
     ) -> Self {
+        let palette = Palette::from_theme(theme);
         let ctx = egui::Context::default();
-        ctx.set_visuals(egui::Visuals::dark());
+        ctx.set_visuals(visuals(&palette));
         let (fonts, font_setup) = font_definitions(fs, mono_family);
         ctx.set_fonts(fonts.clone());
         let max_texture_side = device.limits().max_texture_dimension_2d as usize;
@@ -937,7 +1174,7 @@ impl Sidebar {
             renderer,
             fonts,
             font_setup,
-            palette: Palette::from_theme(theme),
+            palette,
             theme: theme.clone(),
             width_pt,
             dormant_open: true,
@@ -1123,19 +1360,7 @@ impl Sidebar {
     }
 
     fn state_color(&self, state: &AgentState, now_ms: i64) -> Color32 {
-        let pal = self.palette;
-        let pulse =
-            0.55 + 0.45 * ((now_ms as f64 / 1000.0 * std::f64::consts::PI).sin().abs() as f32);
-        match state {
-            AgentState::Idle | AgentState::Exited { .. } => pal.dim,
-            AgentState::Thinking => pal.blue,
-            AgentState::Compacting => pal.magenta,
-            AgentState::ToolRunning { .. } => pal.yellow,
-            AgentState::WaitingPermission { .. } => pal.orange.gamma_multiply(pulse),
-            AgentState::WaitingInput => pal.cyan,
-            AgentState::Done => pal.green,
-            AgentState::Error { .. } => pal.red,
-        }
+        state_color(self.palette, state, now_ms)
     }
 
     /// Preview line with the session's colors.
@@ -1269,7 +1494,7 @@ impl Sidebar {
             Align2::RIGHT_CENTER,
             &format!("{busy} 运行 · {attention} 需关注"),
             prop(11.0),
-            if attention > 0 { pal.orange } else { pal.dim },
+            if attention > 0 { pal.accent } else { pal.dim },
             170.0,
         );
         if let Some(status) = chrome.status {
@@ -1516,7 +1741,7 @@ impl Sidebar {
             kind_glyph(&agent.kind),
             prop(12.0),
             if agent.kind.is_agent() {
-                pal.orange
+                pal.accent
             } else {
                 pal.dim
             },
@@ -1684,7 +1909,7 @@ impl Sidebar {
                     }) => (format!("$ {}", clean(&command_line(argv))), pal.dim),
                     Some(ResumePreview {
                         command: Err(e), ..
-                    }) => (format!("不能恢复：{}", clean(e)), pal.orange),
+                    }) => (format!("不能恢复：{}", clean(e)), pal.accent),
                     None => ("$ …".to_string(), pal.faint),
                 };
                 paint_text(
@@ -1763,7 +1988,7 @@ impl Sidebar {
         let recent = ctl.recent_events(m.id);
         match recent.map(|r| (&r.events, &r.error)) {
             Some((_, Some(e))) => {
-                ui.label(small(format!("读取事件失败：{}", clean(e)), pal.orange));
+                ui.label(small(format!("读取事件失败：{}", clean(e)), pal.accent));
             }
             Some((Some(events), None)) if events.is_empty() => {
                 ui.label(small("（还没有事件）".into(), pal.dim));
@@ -1905,11 +2130,12 @@ impl Sidebar {
                     ui.set_max_width(width);
                     for (i, n) in notices.iter().enumerate() {
                         let (fill, fg) = match n.kind {
-                            NoticeKind::Error => (Color32::from_rgb(0x5a, 0x1d, 0x1d), pal.fg),
-                            NoticeKind::Info => (Color32::from_rgb(0x26, 0x2c, 0x36), pal.fg),
+                            NoticeKind::Error => (pal.danger, pal.danger_fg),
+                            NoticeKind::Info => (pal.raised, pal.fg),
                         };
                         egui::Frame::new()
                             .fill(fill)
+                            .stroke(Stroke::new(1.0, pal.edge))
                             .corner_radius(6.0)
                             .inner_margin(Margin::symmetric(10, 6))
                             .show(ui, |ui| {
@@ -2022,11 +2248,28 @@ impl Sidebar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ACCENT_CONTRAST;
+
+    /// Floors for surfaces that are meant to read as "this row is under
+    /// the pointer" / "this row is the current one" / "a panel is
+    /// floating here". They sit below WCAG's 3:1 on purpose: these are
+    /// fills behind text, not the text or the boundary itself. The
+    /// numbers are what the dark theme already achieved (1.33 / 1.66 /
+    /// 1.21), rounded down.
+    const HOVER_CONTRAST: f32 = 1.15;
+    const SELECT_CONTRAST: f32 = 1.35;
+    const PANEL_CONTRAST: f32 = 1.15;
+
+    /// A painted color back as the theme's own `[u8; 3]`.
+    fn rgb(c: Color32) -> Rgb {
+        let [r, g, b, _] = c.to_srgba_unmultiplied();
+        [r, g, b]
+    }
 
     #[test]
     fn reverse_video_previews_keep_a_readable_background() {
         use berth_core::{CellFlags, Color, Style};
-        let theme = Theme::ghostty_default();
+        let theme = Theme::dark();
         let plain = preview_format(&theme, &Style::default());
         assert_eq!(plain.background, Color32::TRANSPARENT);
         assert_eq!(plain.color, c32(theme.foreground));
@@ -2088,6 +2331,243 @@ mod tests {
         assert_eq!(badge(&AgentState::Thinking, 1), "◓", "spinner advances");
     }
 
+    /// The presets are not the product — "可以自定义" is. Everything
+    /// else here runs on the two built-in themes, where `on_danger`
+    /// always takes the theme's own foreground, so its fallback and the
+    /// whole derivation on a custom theme had no cover at all.
+    #[test]
+    fn a_custom_theme_still_derives_a_readable_sidebar() {
+        // A soft-gray foreground and a pale red: the notice fill lands on
+        // #fff7f7, where the better of the theme's two ends reads
+        // 2.28:1. Neither can carry text on this theme's own error
+        // notice, so `on_danger` has to leave the theme.
+        let mut t = Theme::light();
+        t.foreground = [0x9a, 0xa0, 0xa6];
+        t.cursor = t.foreground;
+        t.palette[1] = [0xff, 0xd0, 0xcc];
+        let p = Palette::from_theme(&t);
+        let danger = rgb(p.danger);
+        let text = mix(t.foreground, t.background, 0.08);
+        assert!(contrast_ratio(text, danger) < BODY_TEXT_CONTRAST);
+        assert!(contrast_ratio(t.background, danger) < BODY_TEXT_CONTRAST);
+        assert_ne!(rgb(p.danger_fg), text, "the theme's foreground was kept");
+        assert_ne!(rgb(p.danger_fg), t.background, "the background was kept");
+        let r = contrast_ratio(rgb(p.danger_fg), danger);
+        assert!(r >= BODY_TEXT_CONTRAST, "an error notice reads at {r:.2}:1");
+
+        // A plausible custom theme: warm paper and a green accent,
+        // nothing else set. Every surface derived from it has to survive.
+        let mut warm = Theme::light();
+        warm.background = [0xff, 0xfd, 0xf6];
+        warm.cursor_text = warm.background;
+        warm.accent = [0x0a, 0x7d, 0x55];
+        let p = Palette::from_theme(&warm);
+        let sidebar = rgb(p.bg);
+        assert_ne!(sidebar, warm.background, "the sidebar took the tint too");
+        for (label, c, floor) in [
+            ("fg", p.fg, BODY_TEXT_CONTRAST),
+            ("dim", p.dim, ACCENT_CONTRAST),
+            ("accent", p.accent, ACCENT_CONTRAST),
+            ("hover", p.hover, HOVER_CONTRAST),
+            ("select", p.select, SELECT_CONTRAST),
+        ] {
+            let r = contrast_ratio(rgb(c), sidebar);
+            assert!(r >= floor, "{label} is {r:.2}:1 on the custom sidebar");
+        }
+        for (side, against) in [("terminal", warm.background), ("raised", rgb(p.raised))] {
+            let outline = contrast_ratio(rgb(p.edge), against);
+            assert!(
+                outline >= ACCENT_CONTRAST,
+                "panel outline {outline:.2}:1 against the {side} beside it"
+            );
+        }
+
+        // egui hardcodes a blue caret in its light visuals; a custom
+        // theme must not inherit it.
+        let v = visuals(&p);
+        assert_eq!(v.text_cursor.stroke.color, p.fg);
+        assert_ne!(v.text_cursor.stroke.color, Color32::from_rgb(0, 83, 125));
+    }
+
+    /// Two surfaces that land on the same color are invisible against
+    /// each other, and a check that only compares each one to the
+    /// background cannot see it: the light theme's `select` and `border`
+    /// were both `#d6d7d7`, so every widget's stroke disappeared into its
+    /// own fill.
+    #[test]
+    fn no_two_sidebar_surfaces_share_a_color() {
+        for theme in [Theme::light(), Theme::dark()] {
+            let name = if theme.is_light() { "light" } else { "dark" };
+            let p = Palette::from_theme(&theme);
+            let named = [
+                ("bg", p.bg),
+                ("hover", p.hover),
+                ("select", p.select),
+                ("border", p.border),
+                ("edge", p.edge),
+                ("preview_bg", p.preview_bg),
+                ("raised", p.raised),
+                ("popup", p.popup),
+            ];
+            for (i, (a_name, a)) in named.iter().enumerate() {
+                for (b_name, b) in &named[i + 1..] {
+                    assert_ne!(a, b, "{name}: {a_name} and {b_name} are one color");
+                }
+            }
+        }
+    }
+
+    /// The light theme's tints come off its own sidebar fill, the dark
+    /// theme's off the terminal background. Deriving both from the
+    /// terminal background is the bug this guards: a light sidebar is
+    /// darker than its terminal, so those tints land back on the sidebar
+    /// fill and vanish.
+    #[test]
+    fn a_light_theme_tints_its_own_fill_not_the_terminal_background() {
+        let light = Theme::light();
+        let dark = Theme::dark();
+        let sidebar = Palette::sidebar_fill(&light);
+        assert_eq!(Palette::tint_base(&light), sidebar);
+        assert_eq!(Palette::tint_base(&dark), dark.background);
+
+        let fg = light.foreground;
+        let p = Palette::from_theme(&light);
+        assert_eq!(rgb(p.select), mix(sidebar, fg, LIGHT_STEPS.select));
+        assert_eq!(rgb(p.hover), mix(sidebar, fg, LIGHT_STEPS.hover));
+        assert_ne!(rgb(p.select), mix(light.background, fg, LIGHT_STEPS.select));
+        assert_ne!(rgb(p.hover), mix(light.background, fg, LIGHT_STEPS.hover));
+
+        // A floor, not "different from the fill": deriving these from the
+        // terminal background lands on 1.10:1 and 1.31:1, which an
+        // inequality check waves through — that is how the first fix went
+        // in without a guard. A hovered row and a selected row have to be
+        // seen.
+        for (label, c, floor) in [
+            ("hover", p.hover, HOVER_CONTRAST),
+            ("select", p.select, SELECT_CONTRAST),
+        ] {
+            let r = contrast_ratio(rgb(c), sidebar);
+            assert!(
+                r >= floor,
+                "{label} is {r:.2}:1 on the sidebar, want {floor}"
+            );
+        }
+
+        // The dark theme is unchanged: its tints stay on the terminal.
+        let d = Palette::from_theme(&dark);
+        let dfg = dark.foreground;
+        assert_eq!(rgb(d.select), mix(dark.background, dfg, DARK_STEPS.select));
+        assert_eq!(rgb(d.hover), mix(dark.background, dfg, DARK_STEPS.hover));
+    }
+
+    /// 「等授权」 breathes, and the trough is the part nobody looks at
+    /// when picking the colors: at the old floor of 0.55 the badge sank to
+    /// 2.14:1 on the light sidebar. This is the one state that is asking
+    /// the user to come and act on it.
+    #[test]
+    fn the_waiting_permission_pulse_stays_readable_at_its_trough() {
+        let waiting = AgentState::WaitingPermission { tool: None };
+        for theme in [Theme::light(), Theme::dark()] {
+            let name = if theme.is_light() { "light" } else { "dark" };
+            let pal = Palette::from_theme(&theme);
+            // now_ms 0 is sin(0), the trough; 500 is sin(pi/2), the peak.
+            let trough = state_color(pal, &waiting, 0);
+            assert_eq!(trough, pal.accent.gamma_multiply(PULSE_FLOOR));
+            let peak = state_color(pal, &waiting, 500);
+            assert_eq!(peak, pal.accent, "{name}: the peak is the accent");
+
+            let on_sidebar = pal.bg.blend(trough);
+            let low = contrast_ratio(rgb(on_sidebar), rgb(pal.bg));
+            let high = contrast_ratio(rgb(peak), rgb(pal.bg));
+            println!(
+                "{name}: pulse {low:.2}:1 .. {high:.2}:1 on {:02x?} (floor {PULSE_FLOOR})",
+                rgb(pal.bg)
+            );
+            assert!(
+                low >= ACCENT_CONTRAST,
+                "{name}: the pulse bottoms out at {low:.2}:1 on the sidebar"
+            );
+            assert!(high > low, "{name}: the badge no longer breathes");
+        }
+    }
+
+    /// The sidebar's surfaces are one step away from the terminal
+    /// background in both directions, and every color it puts on them
+    /// stays legible. The light preset is the case that used to break: its
+    /// sidebar is *darker* than the terminal, so a hover tint mixed from
+    /// the terminal background would land on the sidebar color and vanish.
+    #[test]
+    fn both_presets_keep_the_sidebar_readable_and_its_surfaces_apart() {
+        for theme in [Theme::light(), Theme::dark()] {
+            let name = if theme.is_light() { "light" } else { "dark" };
+            let p = Palette::from_theme(&theme);
+            let bg = rgb(p.bg);
+            assert_eq!(p.light, theme.is_light());
+            assert_ne!(bg, theme.background, "{name}: sidebar = terminal");
+            for (label, c) in [
+                ("hover", p.hover),
+                ("select", p.select),
+                ("border", p.border),
+                ("preview_bg", p.preview_bg),
+            ] {
+                assert_ne!(rgb(c), bg, "{name}: {label} disappears into the sidebar");
+            }
+            // Ordered: hover is the lightest touch, select the stronger one.
+            let d = |c: Color32| contrast_ratio(rgb(c), bg);
+            assert!(d(p.hover) < d(p.select), "{name}: hover >= select");
+            for (label, c, floor) in [
+                ("fg", p.fg, 4.5),
+                ("preview_fg", p.preview_fg, 4.5),
+                ("dim", p.dim, 3.0),
+                ("faint", p.faint, 2.5),
+                ("accent", p.accent, 3.0),
+                ("red", p.red, 3.0),
+                ("green", p.green, 3.0),
+                ("yellow", p.yellow, 3.0),
+                ("blue", p.blue, 3.0),
+                ("magenta", p.magenta, 3.0),
+                ("cyan", p.cyan, 3.0),
+            ] {
+                let r = contrast_ratio(rgb(c), bg);
+                assert!(r >= floor, "{name}: {label} is {r:.2}:1 on the sidebar");
+            }
+            // Notices and the mismatch banner float over the terminal.
+            // Their fill is only a step off it, so the outline is what
+            // says where the panel is: a UI boundary, held to 3:1. Being
+            // merely unequal to the terminal is not a check — #f2f2f2 on
+            // #ffffff passes that and is 1.12:1.
+            //
+            // The outline has a neighbour on each side and WCAG 1.4.11
+            // reads against adjacent colors, so both are checked: holding
+            // only the outer one let the light `edge` sit at 3.37:1 on the
+            // terminal and 2.78:1 on the fill it encloses.
+            let terminal = theme.background;
+            for (side, against) in [("terminal", terminal), ("raised", rgb(p.raised))] {
+                let outline = contrast_ratio(rgb(p.edge), against);
+                assert!(
+                    outline >= ACCENT_CONTRAST,
+                    "{name}: the panel outline is {outline:.2}:1 against the \
+                     {side} on that side of it"
+                );
+            }
+            for (label, fill, on) in [
+                ("raised", p.raised, p.fg),
+                ("danger", p.danger, p.danger_fg),
+            ] {
+                let seen = contrast_ratio(rgb(fill), terminal);
+                assert!(
+                    seen >= PANEL_CONTRAST,
+                    "{name}: {label} is {seen:.2}:1 on the terminal it floats over"
+                );
+                let r = contrast_ratio(rgb(on), rgb(fill));
+                assert!(
+                    r >= BODY_TEXT_CONTRAST,
+                    "{name}: text on {label} is {r:.2}:1"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_shell_running_a_command_reads_running() {
         let shell = AgentKind::Shell;
@@ -2139,7 +2619,7 @@ mod tests {
         use crate::client::Incompatible;
         use crate::mismatch::Mismatch;
         let ctx = egui::Context::default();
-        let pal = Palette::from_theme(&Theme::ghostty_default());
+        let pal = Palette::from_theme(&Theme::dark());
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 600.0));
         let grid = Rect::from_min_max(Pos2::new(240.0, 0.0), screen.max);
         let frame = |events: Vec<egui::Event>, banner: &Banner| {
@@ -2320,7 +2800,7 @@ mod tests {
             ..Default::default()
         };
         let ctl = listed(vec![ws], vec![live, old.clone()]);
-        let pal = Palette::from_theme(&Theme::ghostty_default());
+        let pal = Palette::from_theme(&Theme::dark());
         let ctx = egui::Context::default();
         // egui's own fonts, with the "bold" family headers use.
         let mut fonts = FontDefinitions::default();
@@ -2438,10 +2918,100 @@ mod tests {
         assert!(!frame(&mut menu, Vec::new()).0, "dismissed");
     }
 
+    /// The dialogs and the context menus are egui's own widgets, so they
+    /// paint from `Visuals`, not from our [`Palette`]. Without
+    /// [`visuals`] they would keep egui's grays, which in light mode are a
+    /// different set from the sidebar's and in any custom theme are simply
+    /// wrong. This runs a real frame of the rename dialog and of the
+    /// terminal menu and checks the theme's colors reach the shapes.
+    #[test]
+    fn egui_dialogs_and_menus_paint_with_the_theme() {
+        // Fill *and* stroke of each rect, as a pair: "the border color is
+        // somewhere in the frame" is not a check, because a TextEdit's own
+        // bg_stroke is that color too — the window can lose its outline
+        // entirely and the color still shows up.
+        fn fills(shape: &egui::Shape, out: &mut Vec<(Color32, Color32)>) {
+            match shape {
+                egui::Shape::Rect(r) => out.push((r.fill, r.stroke.color)),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| fills(s, out)),
+                _ => {}
+            }
+        }
+        let painted = |out: &egui::FullOutput| {
+            let mut v: Vec<(Color32, Color32)> = Vec::new();
+            for c in &out.shapes {
+                fills(&c.shape, &mut v);
+            }
+            v
+        };
+        const FADE_IN_FRAMES: usize = 16;
+        for theme in [Theme::light(), Theme::dark()] {
+            let name = if theme.is_light() { "light" } else { "dark" };
+            let pal = Palette::from_theme(&theme);
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals(&pal));
+            let egui_own = if theme.is_light() {
+                egui::Visuals::light()
+            } else {
+                egui::Visuals::dark()
+            }
+            .window_fill;
+
+            let mut dialog = RenameDialog {
+                target: RenameTarget::Session(SessionId::new()),
+                title: "重命名「build」".into(),
+                hint: "留空则恢复自动标题",
+                text: "build".into(),
+                focus: true,
+            };
+            // Two frames: the first lays the modal out, the second paints
+            // it at its measured size.
+            // egui fades a modal in, so the first frames paint it
+            // translucent; FADE_IN_FRAMES is well past the end of that.
+            let mut shapes = Vec::new();
+            for _ in 0..FADE_IN_FRAMES {
+                let out = headless_frame(&ctx, Vec::new(), |ctx| {
+                    show_rename(ctx, pal, &mut dialog, &mut Vec::new());
+                });
+                shapes = painted(&out);
+            }
+            assert!(
+                shapes.contains(&(pal.popup, pal.border)),
+                "{name}: the dialog's own frame is not the theme's popup fill \
+                 outlined in the theme's border"
+            );
+            assert!(
+                egui_own == pal.popup || !shapes.iter().any(|&(f, _)| f == egui_own),
+                "{name}: egui's own window fill is still painted"
+            );
+
+            let mut menu = TermMenu {
+                pos: Pos2::new(400.0, 300.0),
+                items: menus::terminal(menus::TerminalArea {
+                    sid: SessionId::new(),
+                    has_selection: true,
+                    panes: 2,
+                }),
+                opening: true,
+            };
+            let mut shapes = Vec::new();
+            for _ in 0..FADE_IN_FRAMES {
+                let out = headless_frame(&ctx, Vec::new(), |ctx| {
+                    show_terminal_menu(ctx, &mut menu, &mut Vec::new());
+                });
+                shapes = painted(&out);
+            }
+            assert!(
+                shapes.iter().any(|&(f, _)| f == pal.popup),
+                "{name}: the terminal menu is not on the theme's popup fill"
+            );
+        }
+    }
+
     #[test]
     fn the_rename_dialog_confirms_with_enter_and_cancels_with_escape() {
         let ctx = egui::Context::default();
-        let pal = Palette::from_theme(&Theme::ghostty_default());
+        let pal = Palette::from_theme(&Theme::dark());
         let sid = SessionId::new();
         let dialog = || RenameDialog {
             target: RenameTarget::Session(sid),
