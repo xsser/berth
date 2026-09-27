@@ -1217,6 +1217,10 @@ impl Actor {
         let snap = SessionSnapshotFile {
             format_version: SNAPSHOT_FORMAT_VERSION,
             saved_at_ms: now_ms(),
+            // A copy of the metadata as of this write, not its latest state:
+            // the registry is the authority (the archive mark included), and
+            // restoring does not read it (only history, screen and styles;
+            // the store checks its id).
             session: meta,
             styles,
             history,

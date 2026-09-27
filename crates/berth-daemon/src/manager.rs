@@ -1977,6 +1977,118 @@ mod tests {
         mgr.shutdown().await;
     }
 
+    /// Review: `archive` of a live session whose exit does not come in time
+    /// (the actor is stuck, so the kill waits in its queue) gives up after
+    /// ACTOR_REPLY_TIMEOUT (2 s in tests) with an error, and the session is
+    /// not marked, not persisted or broadcast as archived, and has no
+    /// `archive` event; the kill still applies once the actor is back, and
+    /// the session exits unmarked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archive_gives_up_unmarked_when_the_session_does_not_exit_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        let events = Outbox::new();
+        let _conn = mgr.register_conn(ClientRole::Gui, events.clone());
+        mgr.existing_tx(sid)
+            .unwrap()
+            .unwrap()
+            .send(SessionCmd::Stall(
+                ACTOR_REPLY_TIMEOUT + Duration::from_secs(1),
+            ))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = mgr.archive(sid).await.unwrap_err();
+        let waited = started.elapsed();
+        let want = format!(
+            "session {sid} did not exit within {} s; not archived",
+            ACTOR_REPLY_TIMEOUT.as_secs()
+        );
+        assert_eq!(err, want);
+        assert!(waited >= ACTOR_REPLY_TIMEOUT, "gave up early: {waited:?}");
+        let m = mgr.meta(sid).unwrap();
+        assert!(m.is_live() && m.archived_at_ms.is_none(), "{m:?}");
+        assert_eq!(
+            mgr.store.get_session(sid).unwrap().unwrap().archived_at_ms,
+            None
+        );
+        exited(&mgr, sid).await;
+        assert_eq!(mgr.meta(sid).unwrap().archived_at_ms, None);
+        let log = mgr.list_events(sid, 50).unwrap();
+        assert!(log.iter().all(|e| e.kind != "archive"), "{log:?}");
+        let broadcast = drain(&events).await;
+        assert!(
+            !broadcast
+                .iter()
+                .any(|m| matches!(&m.event, Event::SessionUpdated(u) if u.is_archived())),
+            "{broadcast:?}"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// Review: the other way `archive` ends unmarked — the session is
+    /// revived after the exit it waited for and before the mark. `archive_as`
+    /// reads its clock exactly there (after the wait, outside the lock), so a
+    /// clock that revives the session makes this race deterministic without
+    /// sleeps; the mark and Live exclude each other under the registry lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archive_gives_up_unmarked_when_the_session_is_revived_meanwhile() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        let events = Outbox::new();
+        let _conn = mgr.register_conn(ClientRole::Gui, events.clone());
+        let revived = AtomicBool::new(false);
+        let reviving_clock = || {
+            if !revived.swap(true, Ordering::SeqCst) {
+                assert!(
+                    !mgr.meta(sid).unwrap().is_live(),
+                    "clock read after the exit"
+                );
+                let m = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(mgr.revive(sid, ReviveMode::Shell))
+                })
+                .unwrap();
+                assert!(m.is_live());
+            }
+            now_ms()
+        };
+        let err = mgr
+            .archive_as(sid, "user", &reviving_clock)
+            .await
+            .unwrap_err();
+        assert!(revived.load(Ordering::SeqCst));
+        assert_eq!(
+            err,
+            format!("session {sid} was revived while being archived; not archived")
+        );
+        let m = mgr.meta(sid).unwrap();
+        assert!(m.is_live() && m.archived_at_ms.is_none(), "{m:?}");
+        assert_eq!(
+            mgr.store.get_session(sid).unwrap().unwrap().archived_at_ms,
+            None
+        );
+        let log = mgr.list_events(sid, 50).unwrap();
+        assert!(log.iter().all(|e| e.kind != "archive"), "{log:?}");
+        let broadcast = drain(&events).await;
+        assert!(
+            !broadcast
+                .iter()
+                .any(|m| matches!(&m.event, Event::SessionUpdated(u) if u.is_archived())),
+            "{broadcast:?}"
+        );
+        // The revived shell stays usable.
+        mgr.input(sid, b"true\n".to_vec()).unwrap();
+        mgr.shutdown().await;
+    }
+
     /// DESIGN §17.2: archived sessions keep their workspace like any other
     /// session. It is deleted only once none is left, moved away or purged;
     /// the refusal says how many are left and how many are archived.

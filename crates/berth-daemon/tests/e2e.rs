@@ -12,6 +12,7 @@ use berth_core::{
     LineSnapshot, Paths, Request, ReviveMode, ScreenUpdate, SessionId, SessionMeta, SessionStatus,
     StateSource, SubscribeMode, Workspace, WorkspaceId, PROTOCOL_VERSION,
 };
+use berth_daemon::manager::ARCHIVED_REFUSAL;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::watch;
@@ -1576,10 +1577,8 @@ async fn claude_cwd_events_list_and_resume_preview() {
 
 /// What the daemon answers Attach / Input / Resize / Revive / Subscribe for
 /// an archived session (DESIGN §17.1).
-const ARCHIVED: &str = "已归档，先恢复";
-
 fn is_refusal(e: &Event) -> bool {
-    matches!(e, Event::Error { message } if message == ARCHIVED)
+    matches!(e, Event::Error { message } if message == ARCHIVED_REFUSAL)
 }
 
 /// M4 (DESIGN §17.1 / §17.5): Archive / Unarchive over the protocol.
