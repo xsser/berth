@@ -159,6 +159,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 
 - 徽标：○ Idle / ◐ Thinking（旋转）/ ⚙ ToolRunning(name + 秒)/ ⏳ WaitingPermission（橙色脉冲）/ ✎ WaitingInput / ✓ Done（未读高亮）/ ✗ Error / ⏹ Exited；启发式来源用虚线图标。
 - 交互：单击切换；⌘1..9 跳转；⌘N 当前 workspace 新 session；⌘⇧N 新 workspace（目录选择器）；⌘W 关闭（有 agent 运行时二次确认）；⌘K 命令面板；⌘F 搜索（v1.1）；拖拽排序（v2）。
+- M4 起（§17）：⌘T = ⌘N；右键菜单；⌘D / ⌘⇧D 分屏；⌘W = 关闭 pane，session 没有别的 pane 时归档（可从「归档」区找回）；单击 session 若已在某个 pane 则聚焦该 pane。
 - 通知：未聚焦 session 进入 WaitingPermission / WaitingInput / Done / Error 时 macOS 通知 + Dock 角标（数量 = 需要关注的 session），可按 workspace 关闭。
 
 ### 8.4 配置
@@ -276,3 +277,46 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 - **Agent 集成**：Claude 9 个核心事件足以驱动状态机；Codex 短期只用 `notify`；Codex 会话文件 `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` 可供 v1.1 会话发现。
 - **竞品范式**：Conductor / Superset / Warp 都采用「workspace 侧栏 + 实时预览 + 状态徽标」；Warp 2026-04 起开源（MIT + AGPLv3）；Crystal 已停更。本项目差异化 = 关窗不杀 agent + 重启后仍可看并恢复内容。
 - **现成终端 widget**：iced_term / egui_term 均标注开发中，不作生产依赖。
+
+## 17. M4：归档、右键菜单与分屏（2026-09-27 用户新增需求）
+
+用户原话：「增加归档功能，某个标签想删除就点下删除就没了，或者 1 周以上自动关闭这个标签的记录；归档以后可以找回；可以分屏，把功能增加到右键里。」分屏原定 v2，现按用户要求提前。
+
+### 17.1 归档模型（daemon 为准）
+
+- `SessionMeta.archived_at_ms: Option<i64>`（追加为最后一个字段，`#[serde(default)]`）。归档与 `Live | Dormant | Restored` 正交，但**归档的 session 一定不是 Live**：归档 live session 时 daemon 先 `kill`（等 PTY 收尾，最长沿用现有 30 s 上限）再打标记。
+- 语义：**归档** = 从 workspace 列表移到侧栏「归档」区，历史、快照、事件、agent 信息原样保留；**恢复** = 清标记，回到原 workspace，以 Dormant/Restored 呈现，Enter/Revive 照旧；**彻底删除** = 现有 `Delete`（purge），需二次确认。
+- 归档的 session：不接受 `Attach`/`Input`/`Resize`/`Revive`/`Subscribe`（返回 `Error`「已归档，先恢复」）；不参与 hook 路由的 cwd 兜底；不计入通知、Dock 角标、「需关注」；`MoveSession`/`Rename` 允许。
+- 自动归档（daemon 扫描：启动 60 s 后一次，之后每 10 min）：配置 `[archive] auto_after_days = 7`（0 = 关闭）。条件：`now − last_active_ms > days`，且满足其一：(a) 非 live；(b) live 且 `agent.kind` 不是 agent、`agent.state` 不 busy、且没有前台命令（前台进程就是 shell 本身）。live 的先 kill 再归档。`[archive] purge_after_days = 0`（0 = 永不；>0 时 `now − archived_at_ms > days` 的归档 session 自动 purge）。每次自动归档/清理各写一条 `info!` 日志。
+- 协议 v3（只追加）：`Request::Archive { session }`、`Request::Unarchive { session }` → 成功回 `Event::SessionUpdated(meta)`；daemon 主动归档/清理走现有 `SessionUpdated` / `SessionRemoved` 广播。`PROTOCOL_VERSION = 3`；旧 GUI 对新 daemon 沿用现有 Incompatible/横幅与 `berth debug restart-daemon` 流程。
+- 快照：meta 是 JSON（格式 2），新字段靠 `serde(default)`，格式号不升。registry（SQLite）沿用 `meta_json`，`list_sessions` 保持返回全部（含归档），由客户端过滤。
+- CLI：`berth list` 默认不列归档，末尾计数「N 个已归档」；`berth list --archived` 只列归档（含归档时间）；`berth debug archive <sid>` / `berth debug unarchive <sid>`。
+
+### 17.2 右键菜单（GUI，egui `context_menu` / 指针处 popup）
+
+- 侧栏 session 行：`在右侧分屏打开`、`在下方分屏打开`（已在分屏中时禁用，提示「已在分屏中」）、`重命名…`、`标记已读`、`归档`（live 且 agent 运行/命令忙时二次确认，否则立即）、非 live 时 `恢复运行`（= Revive）。
+- 侧栏「归档」区（折叠标题「归档 (N)」，默认折叠，放在 workspace 列表之后、footer 之前）：每行 = 标题 · workspace 名 · 归档时间（相对）；右键/悬停：`恢复`、`彻底删除…`（确认框沿用现有 Confirm::Delete）。
+- workspace 头：`新建 session`、`重命名…`、`删除 workspace…`（仅当其下无 session 时可用；否则禁用并提示「先归档或移走其中的 session」）。
+- 终端区域右键：`复制`（有选区时）、`粘贴`、`向右分屏`、`向下分屏`、`从分屏移除`（保留 session）、`关闭 pane`（= ⌘W 语义）、`归档 session`、`重命名…`。程序开启鼠标上报时，⇧+右键透传给程序，普通右键仍开菜单。
+
+### 17.3 分屏（仅 GUI 侧，daemon 不改）
+
+- 模型：`PaneTree = Leaf(SessionId) | Split { axis: Horizontal | Vertical, ratio: f32 ∈ [0.2, 0.8], first: Box<PaneTree>, second: Box<PaneTree> }`；一个聚焦 leaf；侧栏「当前」= 聚焦 leaf 的 session；**同一 session 不能同时出现在两个 pane**（菜单禁用；侧栏单击它则聚焦已有 pane）。
+- 快捷键：⌘D 向右分屏、⌘⇧D 向下分屏（新 session：同 workspace，cwd = 当前 session 的 cwd）；⌘W 关闭聚焦 pane（该 session 没有其他 pane 时：live → kill + 归档，agent 运行/命令忙时二次确认；非 live → 归档）；⌥⌘← → ↑ ↓ 在 pane 间移动焦点；单击 pane 聚焦。
+- 每个 pane 独立：`SessionView`、Attach/Resize（自己的 cols×rows）、选区、滚动、IME 候选框位置；分隔条 6 px 可拖动改 ratio；聚焦 pane 有 1 px 高亮边框，非聚焦为暗色。daemon 侧同一连接可对多个 session 各自 Attach（`attached: HashSet<ConnId>` 按 session 独立），不需要协议改动。
+- 渲染：同一帧内对每个 pane 各做一次 prepare + render，共享字形 atlas；性能门槛：release 下 4 个 pane 各 120×40，帧总耗时 p99 < 4 ms（沿用 M0 方法与 `--stats`）。
+- 布局持久化：`<data dir>/gui-state.json`（`{ "version": 1, "layout": <PaneTree，leaf 存 session id>, "focused": <sid> }`），GUI 退出与每次布局变化后写（原子写：临时文件 + rename）。重开 GUI 恢复分屏；引用的 session 不存在或已归档 → 从树中剔除并收拢；树空 → 与今天一样打开一个 session。
+- 侧栏单击：session 已在某 pane → 聚焦该 pane；否则替换聚焦 pane 的 session（今天的行为）。
+
+### 17.4 配置追加（§8.4）
+
+```toml
+[archive]
+auto_after_days = 7    # 0 = 不自动归档
+purge_after_days = 0   # 0 = 归档永不自动删除
+```
+
+### 17.5 验收证据（实现者提供，独立审查者复核）
+
+- daemon：扫描条件的单元测试（注入时钟）；Archive/Unarchive/拒绝 Attach 的协议测试；registry 与快照往返保留 `archived_at_ms`；`berth debug` 端到端：new-session → archive → `list` 不显示且计数 +1 → `list --archived` 显示 → unarchive → revive 正常。
+- GUI：`PaneTree` 的分裂/关闭/焦点导航/序列化/剔除测试；controller 的 ⌘W 语义测试（live 忙 → 确认；否则 kill + archive；非 live → archive）；右键菜单动作映射测试；隐藏调试参数 `berth --screenshot x.png --session A --split-right B [--split-down C]` 产出多 pane 截图；`--stats` 4 pane PASS 行。
