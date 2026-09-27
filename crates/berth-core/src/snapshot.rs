@@ -186,9 +186,193 @@ pub struct SessionSnapshotFile {
     pub screen: Option<ScreenSnapshot>,
 }
 
+/// Snapshot files of format 1, written before `AgentInfo::last_agent`
+/// existed. postcard is positional, so the added field moved everything
+/// after it; these are the old layouts, read into the current types with
+/// `last_agent: None`.
+pub mod v1 {
+    use std::path::PathBuf;
+
+    use serde::Deserialize;
+
+    use super::{LineSnapshot, ScreenSnapshot};
+    use crate::style::StyleTable;
+    use crate::{
+        AgentKind, AgentState, PersistPolicy, SessionId, SessionStatus, StateSource, WorkspaceId,
+    };
+
+    /// Decode a decompressed format 1 file.
+    pub fn decode(raw: &[u8]) -> Result<super::SessionSnapshotFile, postcard::Error> {
+        postcard::from_bytes::<SessionSnapshotFile>(raw).map(Into::into)
+    }
+
+    #[derive(Deserialize)]
+    struct SessionSnapshotFile {
+        format_version: u32,
+        saved_at_ms: i64,
+        session: SessionMeta,
+        styles: StyleTable,
+        history: Vec<LineSnapshot>,
+        screen: Option<ScreenSnapshot>,
+    }
+
+    #[derive(Deserialize)]
+    struct SessionMeta {
+        id: SessionId,
+        workspace: WorkspaceId,
+        title_auto: String,
+        title_user: Option<String>,
+        cwd: PathBuf,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        status: SessionStatus,
+        agent: AgentInfo,
+        created_at_ms: i64,
+        last_active_ms: i64,
+        unread: bool,
+        persist: PersistPolicy,
+        order: u32,
+        cols: u16,
+        rows: u16,
+    }
+
+    #[derive(Deserialize)]
+    struct AgentInfo {
+        kind: AgentKind,
+        external_id: Option<String>,
+        transcript_path: Option<PathBuf>,
+        model: Option<String>,
+        context_pct: Option<f32>,
+        cost_usd: Option<f64>,
+        state: AgentState,
+        since_ms: i64,
+        source: StateSource,
+        confidence: f32,
+    }
+
+    impl From<SessionSnapshotFile> for super::SessionSnapshotFile {
+        fn from(f: SessionSnapshotFile) -> Self {
+            super::SessionSnapshotFile {
+                format_version: f.format_version,
+                saved_at_ms: f.saved_at_ms,
+                session: f.session.into(),
+                styles: f.styles,
+                history: f.history,
+                screen: f.screen,
+            }
+        }
+    }
+
+    impl From<SessionMeta> for crate::SessionMeta {
+        fn from(m: SessionMeta) -> Self {
+            crate::SessionMeta {
+                id: m.id,
+                workspace: m.workspace,
+                title_auto: m.title_auto,
+                title_user: m.title_user,
+                cwd: m.cwd,
+                command: m.command,
+                env: m.env,
+                status: m.status,
+                agent: m.agent.into(),
+                created_at_ms: m.created_at_ms,
+                last_active_ms: m.last_active_ms,
+                unread: m.unread,
+                persist: m.persist,
+                order: m.order,
+                cols: m.cols,
+                rows: m.rows,
+            }
+        }
+    }
+
+    impl From<AgentInfo> for crate::AgentInfo {
+        fn from(a: AgentInfo) -> Self {
+            crate::AgentInfo {
+                kind: a.kind,
+                external_id: a.external_id,
+                transcript_path: a.transcript_path,
+                model: a.model,
+                context_pct: a.context_pct,
+                cost_usd: a.cost_usd,
+                state: a.state,
+                since_ms: a.since_ms,
+                source: a.source,
+                confidence: a.confidence,
+                last_agent: None,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AgentInfo, WorkspaceId};
+    use crate::{AgentKind, AgentState, PersistPolicy, SessionId, SessionStatus, StateSource};
+
+    #[test]
+    fn format_1_files_are_read_into_the_current_types() {
+        let mut line = LineSnapshot::blank();
+        line.push_str("hello from format 1", StyleId(0));
+        // Every field differs from its default, so a layout that is off by
+        // anything shows.
+        let want = SessionSnapshotFile {
+            format_version: 1,
+            saved_at_ms: 33,
+            session: SessionMeta {
+                id: SessionId::new(),
+                workspace: WorkspaceId::new(),
+                title_auto: "claude".into(),
+                title_user: Some("t".into()),
+                cwd: "/w".into(),
+                command: vec!["/bin/zsh".into()],
+                env: vec![("K".into(), "V".into())],
+                status: SessionStatus::Restored,
+                agent: AgentInfo {
+                    kind: AgentKind::Claude,
+                    external_id: Some("0f8c2e1a-1111-2222-3333-444455556666".into()),
+                    transcript_path: Some("/p/-w/0f8c2e1a.jsonl".into()),
+                    model: Some("Opus".into()),
+                    context_pct: Some(12.5),
+                    cost_usd: Some(0.25),
+                    state: AgentState::WaitingPermission {
+                        tool: Some("Write".into()),
+                    },
+                    since_ms: 1_700_000_000_123,
+                    source: StateSource::Hook,
+                    confidence: 1.0,
+                    last_agent: None,
+                },
+                created_at_ms: 11,
+                last_active_ms: 22,
+                unread: true,
+                persist: PersistPolicy {
+                    snapshot: true,
+                    journal: true,
+                },
+                order: 7,
+                cols: 100,
+                rows: 30,
+            },
+            styles: StyleTable::default(),
+            history: vec![line],
+            screen: None,
+        };
+        // Format 1 is this layout without `last_agent`, the last field of
+        // `AgentInfo` (`None`: one zero byte), independent of `v1`'s types.
+        let mut raw = postcard::to_stdvec(&want).unwrap();
+        let agent = postcard::to_stdvec(&want.session.agent).unwrap();
+        assert_eq!(agent.last(), Some(&0));
+        let at = raw.windows(agent.len()).position(|w| w == agent).unwrap();
+        raw.remove(at + agent.len() - 1);
+
+        assert_eq!(v1::decode(&raw).unwrap(), want);
+        // Read as the current format, the same bytes do not come out right:
+        // that is why the format version moved.
+        let as_current = postcard::from_bytes::<SessionSnapshotFile>(&raw).ok();
+        assert_ne!(as_current, Some(want));
+    }
 
     #[test]
     fn push_merges_runs_and_counts_cells() {

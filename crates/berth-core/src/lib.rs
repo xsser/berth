@@ -25,10 +25,14 @@ pub use style::*;
 /// Wire protocol version, checked by `Hello`. Bump on any change to the
 /// protocol messages or the types they carry.
 /// - 1: M1 / M2.
-/// - 2: M3: `ListEvents` / `ResumeCommand` and their answers.
+/// - 2: M3: `ListEvents` / `ResumeCommand` and their answers,
+///   `AgentInfo::last_agent`.
 pub const PROTOCOL_VERSION: u32 = 2;
-/// On-disk snapshot format version (`SessionSnapshotFile`).
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+/// On-disk snapshot format version (`SessionSnapshotFile`). postcard is
+/// positional: a field added to any type in the file changes its layout.
+/// - 1: M1 / M2 (read with [`snapshot::v1`]).
+/// - 2: M3: `AgentInfo::last_agent`.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 /// Milliseconds since the Unix epoch.
 pub fn now_ms() -> i64 {

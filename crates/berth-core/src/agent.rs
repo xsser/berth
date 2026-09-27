@@ -118,6 +118,24 @@ pub struct AgentInfo {
     pub source: StateSource,
     /// 0.0..=1.0; hooks report 1.0, heuristics less.
     pub confidence: f32,
+    /// The agent that ran last, kept when it leaves and `kind` goes back to
+    /// `Shell` (`SessionEnd`, OSC 133, a foreground switch, `Revive {
+    /// Shell }`): the agent `Revive { ResumeAgent }` resumes then. Absent
+    /// from metadata stored before it existed (read as `None`).
+    #[serde(default)]
+    pub last_agent: Option<AgentKind>,
+}
+
+impl AgentInfo {
+    /// The agent `external_id` resumes: `kind` while an agent runs, else
+    /// the one that left last.
+    pub fn resume_kind(&self) -> Option<&AgentKind> {
+        if self.kind.is_agent() {
+            Some(&self.kind)
+        } else {
+            self.last_agent.as_ref()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -203,4 +221,37 @@ pub struct HookEnvelope {
     pub pid: u32,
     pub sent_at_ms: i64,
     pub signal: AgentSignal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_resumed_agent_is_the_running_one_else_the_last_to_leave() {
+        let mut a = AgentInfo {
+            kind: AgentKind::Codex,
+            last_agent: Some(AgentKind::Claude),
+            ..AgentInfo::default()
+        };
+        assert_eq!(a.resume_kind(), Some(&AgentKind::Codex));
+        a.kind = AgentKind::Shell;
+        assert_eq!(a.resume_kind(), Some(&AgentKind::Claude));
+        a.last_agent = None;
+        assert_eq!(a.resume_kind(), None);
+    }
+
+    #[test]
+    fn metadata_stored_before_last_agent_reads_as_none() {
+        let mut stored = serde_json::to_value(AgentInfo {
+            kind: AgentKind::Claude,
+            external_id: Some("abc".into()),
+            ..AgentInfo::default()
+        })
+        .unwrap();
+        stored.as_object_mut().unwrap().remove("last_agent");
+        let read: AgentInfo = serde_json::from_value(stored).unwrap();
+        assert_eq!(read.last_agent, None);
+        assert_eq!(read.external_id.as_deref(), Some("abc"));
+    }
 }
