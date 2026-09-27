@@ -111,6 +111,21 @@ fn parse_color(s: &str) -> Option<Rgb> {
 
 /// One `[theme]` color key: `None` when unset, and `None` plus a warning
 /// naming the key and the value when it does not parse.
+///
+/// Two strategies for a bad value live in this parser, on purpose for
+/// now. `[theme]` degrades per key: the key is skipped with a warning
+/// and everything else in the document still applies, because a typo in
+/// one of seventeen colors should not send the whole theme back to the
+/// preset. The older keys reject the document instead: `font.size`,
+/// `sidebar.width`, `notify.on` and `notify.identity` each return an
+/// `Err` from `from_toml_str`, so one bad bundle id takes `[theme]` and
+/// every other setting down with it.
+///
+/// That asymmetry is a real gap, and the wrong half is the old one: a
+/// config file is read once at startup, so rejecting it wholesale costs
+/// the user every other setting to punish one. Unifying on per-key
+/// degradation is tracked for v1.1; it is left alone here because it
+/// changes behaviour outside this change's subject.
 fn color_key(key: &str, value: Option<String>) -> Option<Rgb> {
     let raw = value?;
     match parse_color(&raw) {
