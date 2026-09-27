@@ -1,5 +1,7 @@
 //! Registry of workspaces and sessions, persistence orchestration, restore
-//! on start, hook routing, fan-out of session-level events to clients.
+//! on start, hook routing, fan-out of session-level events to clients,
+//! archiving (DESIGN §17.1: `archive` / `unarchive`, the refusals for
+//! archived sessions, `scan_archive` applying `archive.rs`).
 //!
 //! Locking: `reg` and `conns` are never held while waiting on an actor or
 //! doing slow I/O; store writes happen after the registry lock is released.
@@ -24,6 +26,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::agent_state::{is_valid_external_id, AgentMachine, Signal, HEURISTIC_CONFIDENCE};
+use crate::archive::{self, ScanAction};
 use crate::config::Config;
 use crate::hooks;
 use crate::outbox::Outbox;
@@ -46,6 +49,11 @@ const ACTOR_REPLY_TIMEOUT: Duration = if cfg!(test) {
 };
 /// Most rows one `ListEvents` returns.
 const MAX_EVENT_LIST: u32 = 200;
+/// Answer to Attach / Input / Resize / Revive / Subscribe for an archived
+/// session (DESIGN §17.1).
+pub const ARCHIVED_REFUSAL: &str = "已归档，先恢复";
+/// Poll interval while `archive` waits for a killed session to exit.
+const EXIT_POLL: Duration = Duration::from_millis(10);
 const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "elvish", "xonsh",
 ];
@@ -78,6 +86,10 @@ struct Entry {
     actor: Option<ActorHandle>,
     /// Connections with a `Full` attach (for the unread rule).
     attached: HashSet<ConnId>,
+    /// While live: whether the actor's last foreground poll found the
+    /// session's own shell in the foreground (no command running there);
+    /// `None` = unknown. For the archive scan (`archive::decide`).
+    shell_in_foreground: Option<bool>,
 }
 
 impl Entry {
@@ -88,6 +100,7 @@ impl Entry {
             machine,
             actor: None,
             attached: HashSet::new(),
+            shell_in_foreground: None,
         }
     }
 }
@@ -325,6 +338,9 @@ impl Manager {
     }
 
     pub(crate) fn session_exited(&self, sid: SessionId, code: Option<i32>) {
+        if let Some(e) = self.reg.lock().sessions.get_mut(&sid) {
+            e.shell_in_foreground = None;
+        }
         let at_ms = now_ms();
         let committed = self.transition(sid, Signal::Exited(code), |m| {
             m.status = SessionStatus::Dormant {
@@ -358,6 +374,13 @@ impl Manager {
         self.broadcast(Event::Error {
             message: format!("session {sid} stopped after an internal error: {what}"),
         });
+    }
+
+    /// What the actor's foreground poll found (see `Entry`).
+    pub(crate) fn set_shell_in_foreground(&self, sid: SessionId, shell: Option<bool>) {
+        if let Some(e) = self.reg.lock().sessions.get_mut(&sid) {
+            e.shell_in_foreground = shell;
+        }
     }
 
     pub(crate) fn touch(&self, sid: SessionId) {
@@ -431,6 +454,16 @@ impl Manager {
         let reg = self.reg.lock();
         let entry = reg.sessions.get(&sid).ok_or_else(|| unknown(sid))?;
         Ok(entry.actor.as_ref().map(|a| a.tx.clone()))
+    }
+
+    /// `ARCHIVED_REFUSAL` for an archived session (DESIGN §17.1).
+    fn refuse_archived(&self, sid: SessionId) -> Result<()> {
+        let reg = self.reg.lock();
+        let entry = reg.sessions.get(&sid).ok_or_else(|| unknown(sid))?;
+        if entry.meta.is_archived() {
+            return Err(ARCHIVED_REFUSAL.into());
+        }
+        Ok(())
     }
 
     fn pty_spawn(&self, meta: &SessionMeta, command: Vec<String>, cwd: PathBuf) -> PtySpawn {
@@ -535,16 +568,28 @@ impl Manager {
         Ok(ws)
     }
 
-    /// Refuses while sessions still belong to the workspace (deleting them
-    /// would purge history; the client must do that explicitly).
+    /// Refuses while sessions still belong to the workspace, archived ones
+    /// included (DESIGN §17.2), saying how many: deleting them would purge
+    /// history, and the client must do that explicitly.
     pub fn delete_workspace(&self, id: WorkspaceId) -> Result<()> {
         {
             let mut reg = self.reg.lock();
             if !reg.workspaces.contains_key(&id) {
                 return Err("unknown workspace".into());
             }
-            if reg.sessions.values().any(|e| e.meta.workspace == id) {
-                return Err("workspace still has sessions".into());
+            // Archived sessions count too (DESIGN §17.2): deleting the
+            // workspace with them would leave orphans nowhere to go.
+            let (left, archived) = reg
+                .sessions
+                .values()
+                .filter(|e| e.meta.workspace == id)
+                .fold((0, 0), |(n, a), e| {
+                    (n + 1, a + usize::from(e.meta.is_archived()))
+                });
+            if left > 0 {
+                return Err(format!(
+                    "workspace 下还有 {left} 个 session（含 {archived} 个已归档），先移走或彻底删除"
+                ));
             }
             reg.workspaces.remove(&id);
         }
@@ -652,6 +697,7 @@ impl Manager {
         dims: Dims,
         reply_to: u32,
     ) -> Result<()> {
+        self.refuse_archived(sid)?;
         let tx = self.actor_tx(sid)?;
         if let Some(e) = self.reg.lock().sessions.get_mut(&sid) {
             e.attached.insert(conn);
@@ -677,6 +723,7 @@ impl Manager {
     }
 
     pub fn resize(&self, conn: ConnId, sid: SessionId, dims: Dims) -> Result<()> {
+        self.refuse_archived(sid)?;
         if let Some(tx) = self.existing_tx(sid)? {
             tx.send(SessionCmd::Resize { conn, dims })
                 .map_err(|_| stopped())?;
@@ -692,6 +739,9 @@ impl Manager {
         let (tx, budget) = {
             let reg = self.reg.lock();
             let e = reg.sessions.get(&sid).ok_or_else(|| unknown(sid))?;
+            if e.meta.is_archived() {
+                return Err(ARCHIVED_REFUSAL.into());
+            }
             if !e.meta.is_live() {
                 return Err("session is not live".into());
             }
@@ -739,6 +789,7 @@ impl Manager {
         mode: SubscribeMode,
         reply_to: u32,
     ) -> Result<()> {
+        self.refuse_archived(sid)?;
         let tx = self.actor_tx(sid)?;
         tx.send(SessionCmd::Subscribe {
             conn,
@@ -782,6 +833,9 @@ impl Manager {
     /// Dormant; `Revive { Shell }` then continues in a shell.
     pub async fn revive(self: &Arc<Self>, sid: SessionId, mode: ReviveMode) -> Result<SessionMeta> {
         let meta = self.meta(sid).ok_or_else(|| unknown(sid))?;
+        if meta.is_archived() {
+            return Err(ARCHIVED_REFUSAL.into());
+        }
         if meta.is_live() {
             return Err("session is live".into());
         }
@@ -797,12 +851,18 @@ impl Manager {
         let revived = {
             let mut reg = self.reg.lock();
             let e = reg.sessions.get_mut(&sid).ok_or_else(|| unknown(sid))?;
+            // Checked with the status under one lock, like `archive` does:
+            // an archived session is never live.
+            if e.meta.is_archived() {
+                return Err(ARCHIVED_REFUSAL.into());
+            }
             if e.meta.is_live() {
                 return Err("session is live".into());
             }
             e.meta.status = SessionStatus::Live;
             e.meta.cwd = cwd;
             e.meta.last_active_ms = now;
+            e.shell_in_foreground = None;
             // Review #17: whatever the agent was doing is over. `Shell` does
             // not bring it back (kind `Shell` and `last_agent`, as when an
             // agent leaves); `ResumeAgent` does, also after it left. Ids and
@@ -859,6 +919,166 @@ impl Manager {
             agent: meta.agent.clone(),
         });
         Ok(meta)
+    }
+
+    /// Archive the session (DESIGN §17.1): a live one is killed first
+    /// through the kill path of `Request::Kill` and its exit awaited (at
+    /// most `ACTOR_REPLY_TIMEOUT`, like every wait on an actor), then the
+    /// mark is set, persisted and broadcast. History, snapshot, events and
+    /// agent info stay. Already archived: nothing changes.
+    pub async fn archive(&self, sid: SessionId) -> Result<SessionMeta> {
+        self.archive_as(sid, "user", &now_ms).await
+    }
+
+    /// `archive` noted as `by` (`user` / `auto`) in the session's events,
+    /// with the mark set to `clock()` read once the session is no longer
+    /// live (after its exit).
+    async fn archive_as(
+        &self,
+        sid: SessionId,
+        by: &str,
+        clock: &(impl Fn() -> i64 + Sync),
+    ) -> Result<SessionMeta> {
+        let meta = self.meta(sid).ok_or_else(|| unknown(sid))?;
+        if meta.is_archived() {
+            return Ok(meta);
+        }
+        if meta.is_live() {
+            if let Err(e) = self.kill(sid) {
+                // Unless it exited on its own in the meantime.
+                if self.meta(sid).is_some_and(|m| m.is_live()) {
+                    return Err(e);
+                }
+            }
+            self.wait_until_not_live(sid, ACTOR_REPLY_TIMEOUT).await?;
+        }
+        let at_ms = clock();
+        let meta = {
+            let mut reg = self.reg.lock();
+            let e = reg.sessions.get_mut(&sid).ok_or_else(|| unknown(sid))?;
+            if e.meta.is_archived() {
+                return Ok(e.meta.clone());
+            }
+            // Checked with the mark under one lock, like `revive` does: an
+            // archived session is never live.
+            if e.meta.is_live() {
+                return Err(format!(
+                    "session {sid} was revived while being archived; not archived"
+                ));
+            }
+            e.meta.archived_at_ms = Some(at_ms);
+            e.meta.clone()
+        };
+        self.record(
+            sid,
+            at_ms,
+            "archive".into(),
+            &meta.agent.state,
+            Some(by.into()),
+        );
+        Ok(self.commit(meta))
+    }
+
+    /// Poll (`EXIT_POLL`) until a killed session has left `Live`: its actor
+    /// reports the exit (`session_exited`) once the PTY is gone.
+    async fn wait_until_not_live(&self, sid: SessionId, max: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + max;
+        loop {
+            let live = self.reg.lock().sessions.get(&sid).map(|e| e.meta.is_live());
+            match live {
+                None => return Err(unknown(sid)),
+                Some(false) => return Ok(()),
+                Some(true) if tokio::time::Instant::now() >= deadline => {
+                    tracing::warn!(session = %sid, "session did not exit in time after kill; not archived");
+                    return Err(format!(
+                        "session {sid} did not exit within {} s; not archived",
+                        max.as_secs()
+                    ));
+                }
+                Some(true) => tokio::time::sleep(EXIT_POLL).await,
+            }
+        }
+    }
+
+    /// Clear the archive mark: the session is back in its workspace, still
+    /// dormant / restored (Revive as before). `last_active_ms` becomes now
+    /// (DESIGN §17.1): otherwise the next scan would archive a session that
+    /// was archived for being idle right away again. Not archived: nothing
+    /// changes.
+    pub fn unarchive(&self, sid: SessionId) -> Result<SessionMeta> {
+        let now = now_ms();
+        let meta = {
+            let mut reg = self.reg.lock();
+            let e = reg.sessions.get_mut(&sid).ok_or_else(|| unknown(sid))?;
+            if !e.meta.is_archived() {
+                return Ok(e.meta.clone());
+            }
+            e.meta.archived_at_ms = None;
+            // Otherwise the next scan archives it again at once: it was
+            // archived for being idle (DESIGN §17.1).
+            e.meta.last_active_ms = now;
+            e.meta.clone()
+        };
+        self.record(sid, now, "unarchive".into(), &meta.agent.state, None);
+        Ok(self.commit(meta))
+    }
+
+    /// One pass of the automatic archive (DESIGN §17.1, `archive::decide`
+    /// with `[archive]`): sessions idle for more than `auto_after_days` are
+    /// archived — a live one only when a plain shell idles at its prompt,
+    /// and it is killed first — and sessions archived for more than
+    /// `purge_after_days` are purged. `clock` is "now" (injected by tests).
+    /// Each action is logged with its reason; one that fails is logged and
+    /// the pass goes on. Returns what was done.
+    pub async fn scan_archive(
+        &self,
+        clock: &(impl Fn() -> i64 + Sync),
+    ) -> Vec<(SessionId, ScanAction)> {
+        let config = self.config.archive;
+        if config.auto_after_ms().is_none() && config.purge_after_ms().is_none() {
+            return Vec::new();
+        }
+        let decide = |sid: SessionId, now: i64| {
+            let reg = self.reg.lock();
+            let e = reg.sessions.get(&sid)?;
+            archive::decide(&e.meta, e.shell_in_foreground, now, &config)
+        };
+        let now = clock();
+        let planned: Vec<SessionId> = {
+            let reg = self.reg.lock();
+            reg.sessions
+                .values()
+                .filter(|e| archive::decide(&e.meta, e.shell_in_foreground, now, &config).is_some())
+                .map(|e| e.meta.id)
+                .collect()
+        };
+        let mut done = Vec::new();
+        for sid in planned {
+            // Decided again right before acting: the session may have been
+            // used, restored or deleted while earlier ones were handled (a
+            // kill waits for the exit).
+            let Some(action) = decide(sid, clock()) else {
+                continue;
+            };
+            let result = match action {
+                ScanAction::Archive { .. } => self.archive_as(sid, "auto", clock).await.map(drop),
+                ScanAction::Purge { .. } => self.delete_session(sid).await,
+            };
+            match (result, action) {
+                (Ok(()), ScanAction::Archive { .. }) => {
+                    tracing::info!(session = %sid, reason = %action, "archived automatically");
+                    done.push((sid, action));
+                }
+                (Ok(()), ScanAction::Purge { .. }) => {
+                    tracing::info!(session = %sid, reason = %action, "purged automatically");
+                    done.push((sid, action));
+                }
+                (Err(e), _) => {
+                    tracing::warn!(session = %sid, reason = %action, error = %e, "automatic archive step failed");
+                }
+            }
+        }
+        done
     }
 
     /// Stop the actor (no snapshot), purge metadata/events/snapshot/journal.
@@ -1051,6 +1271,8 @@ impl Manager {
         })
     }
 
+    /// Archived sessions are not counted (DESIGN §17.1); never live, they
+    /// are not in `sessions_live` either.
     pub fn status(&self) -> DaemonStatus {
         let reg = self.reg.lock();
         DaemonStatus {
@@ -1058,6 +1280,8 @@ impl Manager {
             pid: std::process::id(),
             uptime_ms: now_ms() - self.started_ms,
             sessions_live: reg.sessions.values().filter(|e| e.meta.is_live()).count() as u32,
+            // Every session the daemon knows, archived ones included
+            // (DESIGN §17.1); archived sessions are never live.
             sessions_total: reg.sessions.len() as u32,
         }
     }
@@ -1135,17 +1359,20 @@ impl Manager {
     }
 }
 
+/// Whether `program` (a path or a process name; a login shell's `-zsh`
+/// too) is one of the known shells.
+pub(crate) fn is_shell_program(program: &str) -> bool {
+    let base = Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+    SHELLS.contains(&base.trim_start_matches('-'))
+}
+
 /// Reuse the session's original command when it is a plain shell (e.g.
 /// `/bin/sh`); anything else revives into the login shell.
 fn revive_command(original: &[String]) -> Vec<String> {
-    let is_shell = original.first().is_some_and(|prog| {
-        let base = Path::new(prog)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(prog);
-        SHELLS.contains(&base.trim_start_matches('-'))
-    });
-    if is_shell {
+    if original.first().is_some_and(|prog| is_shell_program(prog)) {
         original.to_vec()
     } else {
         Vec::new()
@@ -1233,6 +1460,7 @@ fn usable_cwd(cwd: &Path, workspace_root: Option<&Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DAY_MS;
 
     #[test]
     fn revive_reuses_plain_shells_only() {
@@ -1603,6 +1831,567 @@ mod tests {
             .await;
         mgr.delete_session(sid).await.unwrap();
         assert!(mgr.meta(sid).is_none());
+        mgr.shutdown().await;
+    }
+
+    fn test_manager(dir: &Path, config: Config) -> Arc<Manager> {
+        let paths = Paths::in_dir(dir);
+        paths.ensure_dirs().unwrap();
+        let store = Store::open(&paths).unwrap();
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        Manager::start(paths, config, store, stop_tx).unwrap()
+    }
+
+    const DIMS: Dims = Dims { cols: 80, rows: 24 };
+
+    async fn shell(mgr: &Arc<Manager>, ws: WorkspaceId) -> SessionId {
+        mgr.create_session(ws, None, Some(vec!["/bin/sh".into()]), None, DIMS)
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// Every message queued on `outbox` so far (waits briefly for the first).
+    async fn drain(outbox: &Arc<Outbox>) -> Vec<DaemonMsg> {
+        let mut out = Vec::new();
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(200), outbox.next_batch()).await
+        {
+            out.extend(batch);
+        }
+        out
+    }
+
+    /// M4 (DESIGN §17.1): archiving a live session kills it through the
+    /// kill path and waits for the exit before marking it; the mark is
+    /// persisted and broadcast; archiving again changes nothing. Archived,
+    /// the session refuses Attach / Input / Resize / Subscribe (both modes)
+    /// / Revive (both modes) but serves history, events and metadata
+    /// requests; `DaemonStatus` still counts it in `sessions_total`.
+    /// Unarchive clears the mark, sets `last_active_ms` to now, and Revive
+    /// works again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archive_kills_marks_refuses_and_unarchive_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        let events = Outbox::new();
+        let conn = mgr.register_conn(ClientRole::Gui, events.clone());
+
+        let t0 = now_ms();
+        let archived = mgr.archive(sid).await.unwrap();
+        let at = archived.archived_at_ms.expect("marked");
+        assert!(at >= t0);
+        assert!(
+            matches!(archived.status, SessionStatus::Dormant { .. }),
+            "killed and exited before being marked: {:?}",
+            archived.status
+        );
+        assert!(matches!(archived.agent.state, AgentState::Exited { .. }));
+        let stored = mgr.store.get_session(sid).unwrap().unwrap();
+        assert_eq!(stored.archived_at_ms, Some(at), "persisted");
+        let broadcast = drain(&events).await;
+        assert!(
+            broadcast.iter().any(|m| m.reply_to.is_none()
+                && matches!(&m.event, Event::SessionUpdated(u) if u.id == sid && u.archived_at_ms == Some(at))),
+            "SessionUpdated broadcast"
+        );
+        assert_eq!(mgr.archive(sid).await.unwrap(), archived, "idempotent");
+
+        let refused = |r: Result<()>, what: &str| {
+            assert_eq!(r.unwrap_err(), ARCHIVED_REFUSAL, "{what}");
+        };
+        refused(mgr.attach(conn, Outbox::new(), sid, DIMS, 1), "attach");
+        refused(mgr.input(sid, b"echo\n".to_vec()), "input");
+        refused(mgr.resize(conn, sid, DIMS), "resize");
+        refused(
+            mgr.subscribe(conn, Outbox::new(), sid, SubscribeMode::Full, 2),
+            "subscribe full",
+        );
+        let preview = SubscribeMode::Preview { rows: 3, max_hz: 4 };
+        refused(
+            mgr.subscribe(conn, Outbox::new(), sid, preview, 3),
+            "subscribe preview",
+        );
+        for mode in [ReviveMode::Shell, ReviveMode::ResumeAgent] {
+            let err = mgr.revive(sid, mode).await.unwrap_err();
+            assert_eq!(err, ARCHIVED_REFUSAL, "{mode:?}");
+        }
+        assert!(!mgr.meta(sid).unwrap().is_live(), "nothing revived");
+        assert!(!mgr.reg.lock().sessions[&sid].attached.contains(&conn));
+
+        assert!(matches!(
+            mgr.fetch_lines(sid, 0, 10).await.unwrap(),
+            Event::Lines { .. }
+        ));
+        let log = mgr.list_events(sid, 10).unwrap();
+        assert_eq!(
+            (log[0].kind.as_str(), log[0].detail.as_deref()),
+            ("archive", Some("user"))
+        );
+        assert!(log.iter().any(|e| e.kind == "pty:exit"), "{log:?}");
+        let renamed = mgr.rename_session(sid, Some("old".into())).unwrap();
+        assert_eq!(renamed.archived_at_ms, Some(at));
+        assert!(mgr.mark_read(sid).unwrap().is_archived());
+        let other = mgr
+            .create_workspace("other".into(), dir.path().to_path_buf())
+            .unwrap();
+        assert_eq!(
+            mgr.move_session(sid, other.id, 3).unwrap().workspace,
+            other.id
+        );
+        // sessions_total still counts it (DESIGN §17.1).
+        let status = mgr.status();
+        assert_eq!((status.sessions_live, status.sessions_total), (0, 1));
+
+        // Idle for long, as the scan would have found it.
+        mgr.reg
+            .lock()
+            .sessions
+            .get_mut(&sid)
+            .unwrap()
+            .meta
+            .last_active_ms = 1;
+        let t1 = now_ms();
+        let restored = mgr.unarchive(sid).unwrap();
+        assert_eq!(restored.archived_at_ms, None);
+        assert!(
+            (t1..=now_ms()).contains(&restored.last_active_ms),
+            "last_active_ms becomes now"
+        );
+        assert!(matches!(restored.status, SessionStatus::Dormant { .. }));
+        assert_eq!(restored.workspace, other.id);
+        assert_eq!(
+            mgr.store.get_session(sid).unwrap().unwrap().archived_at_ms,
+            None
+        );
+        assert_eq!(mgr.unarchive(sid).unwrap(), restored, "idempotent");
+        assert_eq!(mgr.list_events(sid, 1).unwrap()[0].kind, "unarchive");
+        assert_eq!(mgr.status().sessions_total, 1);
+        assert!(mgr.revive(sid, ReviveMode::Shell).await.unwrap().is_live());
+        mgr.attach(conn, Outbox::new(), sid, DIMS, 4).unwrap();
+        mgr.input(sid, b"true\n".to_vec()).unwrap();
+        mgr.shutdown().await;
+    }
+
+    /// Review: `archive` of a live session whose exit does not come in time
+    /// (the actor is stuck, so the kill waits in its queue) gives up after
+    /// ACTOR_REPLY_TIMEOUT (2 s in tests) with an error, and the session is
+    /// not marked, not persisted or broadcast as archived, and has no
+    /// `archive` event; the kill still applies once the actor is back, and
+    /// the session exits unmarked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archive_gives_up_unmarked_when_the_session_does_not_exit_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        let events = Outbox::new();
+        let _conn = mgr.register_conn(ClientRole::Gui, events.clone());
+        mgr.existing_tx(sid)
+            .unwrap()
+            .unwrap()
+            .send(SessionCmd::Stall(
+                ACTOR_REPLY_TIMEOUT + Duration::from_secs(1),
+            ))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = mgr.archive(sid).await.unwrap_err();
+        let waited = started.elapsed();
+        let want = format!(
+            "session {sid} did not exit within {} s; not archived",
+            ACTOR_REPLY_TIMEOUT.as_secs()
+        );
+        assert_eq!(err, want);
+        assert!(waited >= ACTOR_REPLY_TIMEOUT, "gave up early: {waited:?}");
+        let m = mgr.meta(sid).unwrap();
+        assert!(m.is_live() && m.archived_at_ms.is_none(), "{m:?}");
+        assert_eq!(
+            mgr.store.get_session(sid).unwrap().unwrap().archived_at_ms,
+            None
+        );
+        exited(&mgr, sid).await;
+        assert_eq!(mgr.meta(sid).unwrap().archived_at_ms, None);
+        let log = mgr.list_events(sid, 50).unwrap();
+        assert!(log.iter().all(|e| e.kind != "archive"), "{log:?}");
+        let broadcast = drain(&events).await;
+        assert!(
+            !broadcast
+                .iter()
+                .any(|m| matches!(&m.event, Event::SessionUpdated(u) if u.is_archived())),
+            "{broadcast:?}"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// Review: the other way `archive` ends unmarked — the session is
+    /// revived after the exit it waited for and before the mark. `archive_as`
+    /// reads its clock exactly there (after the wait, outside the lock), so a
+    /// clock that revives the session makes this race deterministic without
+    /// sleeps; the mark and Live exclude each other under the registry lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archive_gives_up_unmarked_when_the_session_is_revived_meanwhile() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        let events = Outbox::new();
+        let _conn = mgr.register_conn(ClientRole::Gui, events.clone());
+        let revived = AtomicBool::new(false);
+        let reviving_clock = || {
+            if !revived.swap(true, Ordering::SeqCst) {
+                assert!(
+                    !mgr.meta(sid).unwrap().is_live(),
+                    "clock read after the exit"
+                );
+                let m = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(mgr.revive(sid, ReviveMode::Shell))
+                })
+                .unwrap();
+                assert!(m.is_live());
+            }
+            now_ms()
+        };
+        let err = mgr
+            .archive_as(sid, "user", &reviving_clock)
+            .await
+            .unwrap_err();
+        assert!(revived.load(Ordering::SeqCst));
+        assert_eq!(
+            err,
+            format!("session {sid} was revived while being archived; not archived")
+        );
+        let m = mgr.meta(sid).unwrap();
+        assert!(m.is_live() && m.archived_at_ms.is_none(), "{m:?}");
+        assert_eq!(
+            mgr.store.get_session(sid).unwrap().unwrap().archived_at_ms,
+            None
+        );
+        let log = mgr.list_events(sid, 50).unwrap();
+        assert!(log.iter().all(|e| e.kind != "archive"), "{log:?}");
+        let broadcast = drain(&events).await;
+        assert!(
+            !broadcast
+                .iter()
+                .any(|m| matches!(&m.event, Event::SessionUpdated(u) if u.is_archived())),
+            "{broadcast:?}"
+        );
+        // The revived shell stays usable.
+        mgr.input(sid, b"true\n".to_vec()).unwrap();
+        mgr.shutdown().await;
+    }
+
+    /// DESIGN §17.2: archived sessions keep their workspace like any other
+    /// session. It is deleted only once none is left, moved away or purged;
+    /// the refusal says how many are left and how many are archived.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archived_sessions_keep_their_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let other = mgr
+            .create_workspace("other".into(), dir.path().to_path_buf())
+            .unwrap();
+        let kept = shell(&mgr, ws.id).await;
+        let moved = shell(&mgr, ws.id).await;
+        let purged = shell(&mgr, ws.id).await;
+        mgr.archive(moved).await.unwrap();
+        mgr.archive(purged).await.unwrap();
+        let refusal = |n: usize, m: usize| {
+            format!("workspace 下还有 {n} 个 session（含 {m} 个已归档），先移走或彻底删除")
+        };
+        assert_eq!(mgr.delete_workspace(ws.id).unwrap_err(), refusal(3, 2));
+        mgr.move_session(kept, other.id, 0).unwrap();
+        mgr.move_session(moved, other.id, 1).unwrap();
+        assert_eq!(mgr.delete_workspace(ws.id).unwrap_err(), refusal(1, 1));
+        mgr.delete_session(purged).await.unwrap();
+        mgr.delete_workspace(ws.id).unwrap();
+        let left: Vec<_> = mgr.list_workspaces().iter().map(|w| w.id).collect();
+        assert_eq!(left, vec![other.id]);
+        let m = mgr.meta(moved).unwrap();
+        assert!(m.is_archived() && m.workspace == other.id, "{m:?}");
+        mgr.shutdown().await;
+    }
+
+    /// Unarchive sets `last_active_ms` to now: with a threshold of seconds
+    /// (`auto_after_days = 0.0001`, 8.64 s), a session archived by the scan
+    /// for being idle is not archived again by the scan right after it is
+    /// restored; the threshold still applies, counted from the restore.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_right_after_unarchive_does_not_archive_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::parse("[archive]\nauto_after_days = 0.0001\n").unwrap();
+        assert_eq!(config.archive.auto_after_ms(), Some(8_640));
+        let mgr = test_manager(dir.path(), config);
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        mgr.kill(sid).unwrap();
+        exited(&mgr, sid).await;
+        // Idle for long: the scan archives it.
+        mgr.reg
+            .lock()
+            .sessions
+            .get_mut(&sid)
+            .unwrap()
+            .meta
+            .last_active_ms = 1;
+        let done = mgr.scan_archive(&now_ms).await;
+        assert!(
+            matches!(done.as_slice(), [(s, ScanAction::Archive { live: false, .. })] if *s == sid),
+            "{done:?}"
+        );
+        mgr.unarchive(sid).unwrap();
+        assert!(
+            mgr.scan_archive(&now_ms).await.is_empty(),
+            "not archived again right away"
+        );
+        assert!(!mgr.meta(sid).unwrap().is_archived());
+        let later = || now_ms() + 10_000;
+        assert_eq!(mgr.scan_archive(&later).await.len(), 1);
+        assert!(mgr.meta(sid).unwrap().is_archived());
+        mgr.shutdown().await;
+    }
+
+    /// Poll until the actor's foreground poll (one a second) reported `want`.
+    async fn foreground_is(mgr: &Arc<Manager>, sid: SessionId, want: Option<bool>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = mgr.reg.lock().sessions[&sid].shell_in_foreground;
+            if got == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "foreground of {sid}: {got:?}, want {want:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn exited(mgr: &Arc<Manager>, sid: SessionId) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while mgr.meta(sid).unwrap().is_live() {
+            assert!(std::time::Instant::now() < deadline, "{sid} did not exit");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn archived_within(mgr: &Arc<Manager>, sid: SessionId, max: Duration) {
+        let deadline = std::time::Instant::now() + max;
+        while !mgr.meta(sid).unwrap().is_archived() {
+            assert!(std::time::Instant::now() < deadline, "{sid} not archived");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The foreground poll tells a shell at its prompt from a foreground
+    /// command, and forgets it when the session exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_foreground_poll_tells_a_prompt_from_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        foreground_is(&mgr, sid, Some(true)).await;
+        mgr.input(sid, b"sleep 30\n".to_vec()).unwrap();
+        foreground_is(&mgr, sid, Some(false)).await;
+        mgr.input(sid, b"\x03".to_vec()).unwrap();
+        foreground_is(&mgr, sid, Some(true)).await;
+        mgr.kill(sid).unwrap();
+        exited(&mgr, sid).await;
+        assert_eq!(mgr.reg.lock().sessions[&sid].shell_in_foreground, None);
+        mgr.shutdown().await;
+    }
+
+    /// M4 (DESIGN §17.1 / §17.5): the scan with an injected clock. Eight
+    /// days on it archives a shell idling at its prompt (killed first) and
+    /// a session that is not live, and keeps a live session with a
+    /// foreground command, a live agent and a live busy shell. Once
+    /// archived, a session is not archived again; a month later, with
+    /// `purge_after_days = 30`, the two are purged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_archives_idle_sessions_and_purges_expired_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::parse("[archive]\npurge_after_days = 30\n").unwrap();
+        let mgr = test_manager(dir.path(), config);
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let idle = shell(&mgr, ws.id).await;
+        let running = shell(&mgr, ws.id).await;
+        let agent = shell(&mgr, ws.id).await;
+        let busy = shell(&mgr, ws.id).await;
+        let dormant = shell(&mgr, ws.id).await;
+        mgr.input(running, b"sleep 30\n".to_vec()).unwrap();
+        mgr.handle_hook(HookEnvelope {
+            berth_session: Some(agent),
+            pid: 1,
+            sent_at_ms: 0,
+            signal: AgentSignal::Claude(berth_core::ClaudeHook {
+                session_id: "agent-1".into(),
+                cwd: None,
+                transcript_path: None,
+                permission_mode: None,
+                event: ClaudeHookEvent::SessionStart { source: None },
+            }),
+        });
+        mgr.kill(dormant).unwrap();
+        exited(&mgr, dormant).await;
+        foreground_is(&mgr, idle, Some(true)).await;
+        foreground_is(&mgr, running, Some(false)).await;
+        foreground_is(&mgr, agent, Some(true)).await;
+        foreground_is(&mgr, busy, Some(true)).await;
+        // A plain shell running a command, as the OSC 133 marks report it.
+        {
+            let mut reg = mgr.reg.lock();
+            let e = reg.sessions.get_mut(&busy).unwrap();
+            let mut info = e.meta.agent.clone();
+            info.state = AgentState::Thinking;
+            e.machine.reset(info.clone());
+            e.meta.agent = info;
+        }
+        assert_eq!(mgr.meta(agent).unwrap().agent.kind, AgentKind::Claude);
+        let events = Outbox::new();
+        let _conn = mgr.register_conn(ClientRole::Gui, events.clone());
+
+        assert!(
+            mgr.scan_archive(&now_ms).await.is_empty(),
+            "nothing is a week old today"
+        );
+
+        let week_on = || now_ms() + 8 * DAY_MS;
+        let done: HashMap<SessionId, ScanAction> =
+            mgr.scan_archive(&week_on).await.into_iter().collect();
+        assert_eq!(done.len(), 2, "{done:?}");
+        assert!(matches!(
+            done[&idle],
+            ScanAction::Archive { live: true, .. }
+        ));
+        assert!(matches!(
+            done[&dormant],
+            ScanAction::Archive { live: false, .. }
+        ));
+        for sid in [idle, dormant] {
+            let m = mgr.meta(sid).unwrap();
+            assert!(m.is_archived() && !m.is_live(), "{m:?}");
+            assert!(
+                m.archived_at_ms.unwrap() > now_ms() + 7 * DAY_MS,
+                "stamped with the scan's clock"
+            );
+            let log = mgr.list_events(sid, 1).unwrap();
+            assert_eq!(
+                (log[0].kind.as_str(), log[0].detail.as_deref()),
+                ("archive", Some("auto"))
+            );
+        }
+        assert!(
+            matches!(
+                mgr.meta(idle).unwrap().status,
+                SessionStatus::Dormant { .. }
+            ),
+            "killed first"
+        );
+        for sid in [running, agent, busy] {
+            let m = mgr.meta(sid).unwrap();
+            assert!(m.is_live() && !m.is_archived(), "{m:?}");
+        }
+        let broadcast = drain(&events).await;
+        for sid in [idle, dormant] {
+            assert!(broadcast.iter().any(|m| m.reply_to.is_none()
+                && matches!(&m.event, Event::SessionUpdated(u) if u.id == sid && u.is_archived())));
+        }
+        assert!(
+            mgr.scan_archive(&week_on).await.is_empty(),
+            "archived sessions are not archived again"
+        );
+
+        let month_later = || now_ms() + 39 * DAY_MS;
+        let purged: HashMap<SessionId, ScanAction> =
+            mgr.scan_archive(&month_later).await.into_iter().collect();
+        assert_eq!(purged.len(), 2, "{purged:?}");
+        for sid in [idle, dormant] {
+            assert!(matches!(purged[&sid], ScanAction::Purge { .. }));
+            assert!(mgr.meta(sid).is_none());
+            assert_eq!(mgr.store.get_session(sid).unwrap(), None);
+        }
+        let broadcast = drain(&events).await;
+        for sid in [idle, dormant] {
+            assert!(broadcast
+                .iter()
+                .any(|m| m.event == Event::SessionRemoved(sid)));
+        }
+        for sid in [running, agent, busy] {
+            assert!(mgr.meta(sid).unwrap().is_live());
+        }
+        mgr.shutdown().await;
+    }
+
+    /// `[archive] auto_after_days = 0` and `purge_after_days = 0`: the scan
+    /// does nothing, however old the sessions look.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_does_nothing_when_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::parse("[archive]\nauto_after_days = 0\n").unwrap();
+        let mgr = test_manager(dir.path(), config);
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        mgr.kill(sid).unwrap();
+        exited(&mgr, sid).await;
+        let later = || now_ms() + 3650 * DAY_MS;
+        assert!(mgr.scan_archive(&later).await.is_empty());
+        assert!(!mgr.meta(sid).unwrap().is_archived());
+        mgr.shutdown().await;
+    }
+
+    /// The scanner: the first scan after `first`, then one every `every`,
+    /// with the injected clock; it stops with `stop`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_scanner_scans_after_its_first_delay_then_periodically() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        mgr.kill(sid).unwrap();
+        exited(&mgr, sid).await;
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let first = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let scanner = tokio::spawn(archive::run_scanner(
+            mgr.clone(),
+            stop_rx,
+            first,
+            Duration::from_millis(100),
+            || now_ms() + 8 * DAY_MS,
+        ));
+        archived_within(&mgr, sid, Duration::from_secs(10)).await;
+        assert!(started.elapsed() >= first, "not before the first delay");
+        // Restored, it is idle for 8 days on that clock again: a later
+        // scan archives it again.
+        mgr.unarchive(sid).unwrap();
+        archived_within(&mgr, sid, Duration::from_secs(10)).await;
+        stop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), scanner)
+            .await
+            .expect("the scanner stops")
+            .unwrap();
         mgr.shutdown().await;
     }
 

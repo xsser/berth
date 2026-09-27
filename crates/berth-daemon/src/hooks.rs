@@ -6,6 +6,10 @@
 //! session whose agent `external_id` equals the payload's Claude session id /
 //! Codex thread id; else the unique live session whose cwd equals the payload
 //! cwd. Anything else is dropped (`debug!`), never guessed.
+//!
+//! Archived sessions (DESIGN §17.1) take no part in the two fallbacks, and
+//! an external id that only an archived session has is that session's
+//! agent: dropped, not routed by cwd to another session.
 
 use std::path::{Path, PathBuf};
 
@@ -81,7 +85,9 @@ pub fn resolve_target<'a>(
             }
         }
     }
-    let live = sessions.filter(|m| m.is_live());
+    // Archived sessions are never live; they are left out explicitly all
+    // the same.
+    let live = sessions.clone().filter(|m| m.is_live() && !m.is_archived());
     if let Some(ext) = external_id(&envelope.signal) {
         let hit = unique(
             live.clone()
@@ -90,6 +96,13 @@ pub fn resolve_target<'a>(
         );
         if let Some(id) = hit {
             return Target::Live(id);
+        }
+        let archived = sessions
+            .clone()
+            .find(|m| m.is_archived() && m.agent.external_id.as_deref() == Some(ext));
+        if let Some(m) = archived {
+            tracing::debug!(session = %m.id, "hook names the agent of an archived session; dropped");
+            return Target::Unmatched;
         }
     }
     for cwd in cwds(&envelope.signal) {
@@ -210,6 +223,60 @@ mod tests {
         assert_eq!(
             resolve_target(&claude(None, "ext", Some("/w")), only_dead.iter()),
             Target::Unmatched
+        );
+    }
+
+    fn archived(mut m: SessionMeta) -> SessionMeta {
+        m.archived_at_ms = Some(1);
+        m
+    }
+
+    /// M4 (DESIGN §17.1): archived sessions take no part in the fallbacks.
+    /// The cwd fallback skips them (even one that claimed to be live), an
+    /// external id that only an archived session has drops the hook instead
+    /// of routing it by cwd to another session, and a live session with the
+    /// same id wins over the archived one.
+    #[test]
+    fn archived_sessions_take_no_part_in_the_fallbacks() {
+        // The invariant says archived sessions are never live; the cwd
+        // tier checks the mark itself too.
+        let odd = archived(meta("/w", true, None));
+        assert_eq!(
+            resolve_target(&claude(None, "x", Some("/w")), [odd.clone()].iter()),
+            Target::Unmatched
+        );
+        let live = meta("/w", true, None);
+        assert_eq!(
+            resolve_target(&claude(None, "x", Some("/w")), [odd, live.clone()].iter()),
+            Target::Live(live.id),
+            "the live session is the unique cwd match"
+        );
+
+        let gone = archived(meta("/w", false, Some("ext-a")));
+        let all = [gone.clone(), live.clone()];
+        assert_eq!(
+            resolve_target(&claude(None, "ext-a", Some("/w")), all.iter()),
+            Target::Unmatched,
+            "not guessed by cwd"
+        );
+        // Without that id the cwd fallback still routes to the live one.
+        assert_eq!(
+            resolve_target(&claude(None, "other", Some("/w")), all.iter()),
+            Target::Live(live.id)
+        );
+        let resumed = meta("/elsewhere", true, Some("ext-a"));
+        assert_eq!(
+            resolve_target(
+                &claude(None, "ext-a", Some("/w")),
+                [gone.clone(), resumed.clone()].iter()
+            ),
+            Target::Live(resumed.id)
+        );
+        // `berth_session` naming the archived session: late, as for any
+        // session that is no longer live.
+        assert_eq!(
+            resolve_target(&claude(Some(gone.id), "ext-a", Some("/w")), all.iter()),
+            Target::Late(gone.id)
         );
     }
 

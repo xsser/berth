@@ -1,5 +1,7 @@
 //! CLI subcommands (integrate.md §5): `berth list`, `berth doctor`, and the
 //! hidden `berth debug …` helpers used for scripted end-to-end checks.
+//! `berth list` leaves archived sessions out and counts them; `berth list
+//! --archived` lists only them (DESIGN §17.5).
 //!
 //! None of them launches `berthd`, except `berth debug restart-daemon`
 //! (stop the running one, start this build's). `doctor` only reads: metadata of the
@@ -31,10 +33,22 @@ use crate::sidebar::format_elapsed;
 use crate::timefmt::local_time;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// `Archive` of a live session: berthd kills it and waits up to 30 s for
+/// its exit before it answers.
+const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(35);
 /// Largest `Input` the debug sender puts in one request.
 const SEND_CHUNK: usize = 60 * 1024;
 /// `FetchLines` page for `debug dump --history` (daemon limit: 5000).
 const DUMP_PAGE: u32 = 5000;
+
+/// `berth list` options.
+#[derive(clap::Args, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ListArgs {
+    /// List only the archived sessions, with how long ago each was
+    /// archived.
+    #[arg(long)]
+    pub archived: bool,
+}
 
 /// Hidden helpers for scripted checks (`berth debug …`).
 #[derive(clap::Subcommand, Debug)]
@@ -89,6 +103,12 @@ pub enum DebugCmd {
     },
     /// Kill a live session's process (it becomes dormant).
     Kill { session: String },
+    /// Archive a session: a live one is killed first; its history, events
+    /// and agent information stay (DESIGN §17.1).
+    Archive { session: String },
+    /// Restore an archived session: back in its workspace, dormant /
+    /// restored, revived as before.
+    Unarchive { session: String },
     /// The session's agent events (state changes, hooks, OSC 133 marks),
     /// oldest first, in local time.
     Events {
@@ -261,30 +281,39 @@ fn table(rows: &[Vec<String>]) -> String {
     out
 }
 
-/// `berth list` output.
-pub fn render_list(
+/// The session table: one row per session, grouped by workspace (in
+/// workspace order; sessions of unknown workspaces last, under `?`), with
+/// an ARCHIVED column (how long ago) when `archived`.
+fn session_table(
     workspaces: &[Workspace],
-    sessions: &[SessionMeta],
+    sessions: &[&SessionMeta],
     now_ms: i64,
     home: Option<&Path>,
+    archived: bool,
 ) -> String {
     let mut ws: Vec<&Workspace> = workspaces.iter().collect();
     ws.sort_by_key(|w| (w.order, w.created_at_ms));
-    let mut ss: Vec<&SessionMeta> = sessions.iter().collect();
+    let mut ss: Vec<&SessionMeta> = sessions.to_vec();
     ss.sort_by_key(|s| (s.order, s.created_at_ms));
     let known: HashSet<_> = ws.iter().map(|w| w.id).collect();
     let row = |ws_name: String, s: &SessionMeta| {
-        vec![
-            ws_name,
-            format!("{} {}", s.id.short(), clean(s.title())),
+        let mut r = vec![ws_name, format!("{} {}", s.id.short(), clean(s.title()))];
+        if archived {
+            r.push(archived_text(s, now_ms));
+        }
+        r.extend([
             status_text(s),
             agent_text(&s.agent, now_ms),
             tilde(&s.cwd, home),
-        ]
+        ]);
+        r
     };
-    let mut rows = vec![["WORKSPACE", "SESSION", "STATUS", "AGENT", "CWD"]
-        .map(String::from)
-        .to_vec()];
+    let mut header = vec!["WORKSPACE", "SESSION"];
+    if archived {
+        header.push("ARCHIVED");
+    }
+    header.extend(["STATUS", "AGENT", "CWD"]);
+    let mut rows = vec![header.into_iter().map(String::from).collect()];
     for w in &ws {
         for s in ss.iter().filter(|s| s.workspace == w.id) {
             rows.push(row(clean(&w.name), s));
@@ -293,25 +322,63 @@ pub fn render_list(
     for s in ss.iter().filter(|s| !known.contains(&s.workspace)) {
         rows.push(row("?".into(), s));
     }
-    let live = sessions.iter().filter(|s| s.is_live()).count();
-    let mut out = table(&rows);
+    table(&rows)
+}
+
+/// How long ago the session was archived, e.g. `3d前`.
+fn archived_text(s: &SessionMeta, now_ms: i64) -> String {
+    match s.archived_at_ms {
+        Some(at) => format!("{}前", format_elapsed(now_ms.saturating_sub(at))),
+        None => "-".into(),
+    }
+}
+
+/// `berth list` output: the sessions that are not archived; the last line
+/// ends with how many are (`berth list --archived` lists them).
+pub fn render_list(
+    workspaces: &[Workspace],
+    sessions: &[SessionMeta],
+    now_ms: i64,
+    home: Option<&Path>,
+) -> String {
+    let shown: Vec<&SessionMeta> = sessions.iter().filter(|s| !s.is_archived()).collect();
+    let archived = sessions.len() - shown.len();
+    let live = shown.iter().filter(|s| s.is_live()).count();
+    let mut out = session_table(workspaces, &shown, now_ms, home, false);
     let _ = writeln!(
         out,
-        "{} 个 workspace，{} 个 session（{live} 个 live）",
+        "{} 个 workspace，{} 个 session（{live} 个 live），{archived} 个已归档",
         workspaces.len(),
-        sessions.len()
+        shown.len()
     );
     out
 }
 
-pub fn list(paths: &Paths) -> Result<()> {
+/// `berth list --archived` output: only the archived sessions, with how
+/// long ago each was archived.
+pub fn render_archived(
+    workspaces: &[Workspace],
+    sessions: &[SessionMeta],
+    now_ms: i64,
+    home: Option<&Path>,
+) -> String {
+    let shown: Vec<&SessionMeta> = sessions.iter().filter(|s| s.is_archived()).collect();
+    let mut out = session_table(workspaces, &shown, now_ms, home, true);
+    let _ = writeln!(out, "{} 个已归档", shown.len());
+    out
+}
+
+pub fn list(paths: &Paths, args: &ListArgs) -> Result<()> {
     let mut c = connect(paths)?;
     let (ws, ss) = list_all(&mut c)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    print!(
-        "{}",
-        render_list(&ws, &ss, berth_core::now_ms(), home.as_deref())
-    );
+    let (now, home) = (berth_core::now_ms(), home.as_deref());
+    let out = if args.archived {
+        render_archived(&ws, &ss, now, home)
+    } else {
+        render_list(&ws, &ss, now, home)
+    };
+    print!("{out}");
     Ok(())
 }
 
@@ -726,29 +793,38 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<Check> {
     let mut sessions = None;
     match SyncClient::connect(paths, ClientRole::Cli) {
         Ok(mut c) => {
-            match c.request(Request::DaemonStatus, TIMEOUT) {
-                Ok(Event::Status(s)) => checks.push(Check::new(
-                    Level::Ok,
-                    "berthd",
-                    format!(
-                        "可达：版本 {}，协议 v{PROTOCOL_VERSION}（与客户端一致），pid {}，\
-                         已运行 {}，session {} live / {} 共",
-                        s.version,
-                        s.pid,
-                        format_elapsed(s.uptime_ms),
-                        s.sessions_live,
-                        s.sessions_total
-                    ),
-                )),
+            let status = c.request(Request::DaemonStatus, TIMEOUT);
+            if let Ok((_, ss)) = list_all(&mut c) {
+                sessions = Some(ss);
+            }
+            match status {
+                Ok(Event::Status(s)) => {
+                    // The total counts archived sessions too (DESIGN §17.1);
+                    // how many, ListSessions tells.
+                    let archived = sessions.as_ref().map_or_else(String::new, |ss| {
+                        let n = ss.iter().filter(|m| m.is_archived()).count();
+                        format!("（含 {n} 已归档）")
+                    });
+                    checks.push(Check::new(
+                        Level::Ok,
+                        "berthd",
+                        format!(
+                            "可达：版本 {}，协议 v{PROTOCOL_VERSION}（与客户端一致），pid {}，\
+                             已运行 {}，session {} live / {} 共{archived}",
+                            s.version,
+                            s.pid,
+                            format_elapsed(s.uptime_ms),
+                            s.sessions_live,
+                            s.sessions_total
+                        ),
+                    ));
+                }
                 Ok(other) => checks.push(Check::new(
                     Level::Fail,
                     "berthd",
                     unexpected("DaemonStatus", other).to_string(),
                 )),
                 Err(e) => checks.push(Check::new(Level::Fail, "berthd", format!("{e:#}"))),
-            }
-            if let Ok((_, ss)) = list_all(&mut c) {
-                sessions = Some(ss);
             }
         }
         Err(e) => {
@@ -1195,6 +1271,20 @@ pub fn debug(paths: &Paths, cmd: DebugCmd) -> Result<()> {
                 other => return Err(unexpected("Kill", other)),
             }
         }
+        DebugCmd::Archive { session } => {
+            let meta = session_arg(&mut c, &session)?;
+            match c.request(Request::Archive { session: meta.id }, ARCHIVE_TIMEOUT)? {
+                Event::SessionUpdated(m) => println!("archived {}", m.id),
+                other => return Err(unexpected("Archive", other)),
+            }
+        }
+        DebugCmd::Unarchive { session } => {
+            let meta = session_arg(&mut c, &session)?;
+            match c.request(Request::Unarchive { session: meta.id }, TIMEOUT)? {
+                Event::SessionUpdated(m) => println!("unarchived {} {}", m.id, status_text(&m)),
+                other => return Err(unexpected("Unarchive", other)),
+            }
+        }
         DebugCmd::Events { session, limit } => {
             let meta = session_arg(&mut c, &session)?;
             let request = Request::ListEvents {
@@ -1325,9 +1415,11 @@ mod tests {
                 at_ms: 0,
             },
         );
+        let mut archived = meta("archived", w.id, SessionStatus::Restored);
+        archived.archived_at_ms = Some(1);
         let out = render_list(
             &[w],
-            &[b.clone(), a.clone(), orphan],
+            &[b.clone(), archived, a.clone(), orphan],
             61_000,
             Some(Path::new("/home/u")),
         );
@@ -1352,7 +1444,115 @@ mod tests {
         };
         assert_eq!(col(lines[0]), col(lines[1]));
         assert_eq!(col(lines[0]), col(lines[2]));
-        assert_eq!(lines[4], "1 个 workspace，3 个 session（1 个 live）");
+        assert!(!out.contains("archived"), "left out: {out}");
+        assert_eq!(
+            lines[4],
+            "1 个 workspace，3 个 session（1 个 live），1 个已归档"
+        );
+        assert_eq!(lines.len(), 5);
+    }
+
+    /// `berth list --archived`: only archived sessions, grouped like `berth
+    /// list`, with how long ago each was archived; `berth list` leaves them
+    /// out and counts them.
+    #[test]
+    fn archived_sessions_are_listed_only_with_archived() {
+        const DAY: i64 = 86_400_000;
+        let w = Workspace {
+            id: berth_core::WorkspaceId::new(),
+            name: "proj".into(),
+            root: PathBuf::from("/home/u/proj"),
+            color: None,
+            order: 0,
+            created_at_ms: 0,
+        };
+        let now = 10 * DAY;
+        let kept = meta("kept", w.id, SessionStatus::Live);
+        let mut old = meta("旧会话", w.id, SessionStatus::Restored);
+        old.archived_at_ms = Some(now - 3 * DAY - 5_000);
+        let mut orphan = meta(
+            "orphan",
+            berth_core::WorkspaceId::new(),
+            SessionStatus::Dormant {
+                exit_code: None,
+                at_ms: 0,
+            },
+        );
+        orphan.archived_at_ms = Some(now - 90_000);
+        let sessions = [orphan.clone(), kept, old];
+        let out = render_archived(
+            std::slice::from_ref(&w),
+            &sessions,
+            now,
+            Some(Path::new("/home/u")),
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("WORKSPACE") && lines[0].contains("ARCHIVED"));
+        assert!(
+            lines[1].starts_with("proj") && lines[1].contains("旧会话"),
+            "{out}"
+        );
+        assert!(
+            lines[1].contains("3d前") && lines[1].contains("restored"),
+            "{out}"
+        );
+        assert!(
+            lines[2].starts_with('?') && lines[2].contains("orphan"),
+            "{out}"
+        );
+        assert!(
+            lines[2].contains("1m30s前") && lines[2].contains("dormant"),
+            "{out}"
+        );
+        assert_eq!(lines[3], "2 个已归档");
+        assert_eq!(lines.len(), 4, "{out}");
+        assert!(!out.contains("kept"), "{out}");
+        // ARCHIVED sits between SESSION and STATUS, aligned on every row.
+        let col = |l: &str, word: &str| l[..l.find(word).expect(word)].width();
+        assert_eq!(col(lines[0], "ARCHIVED"), col(lines[1], "3d前"));
+        assert_eq!(col(lines[0], "ARCHIVED"), col(lines[2], "1m30s前"));
+        assert_eq!(col(lines[0], "STATUS"), col(lines[1], "restored"));
+        assert_eq!(col(lines[0], "STATUS"), col(lines[2], "dormant"));
+
+        let out = render_list(&[w], &sessions, now, None);
+        assert!(out.contains("kept") && !out.contains("ARCHIVED"), "{out}");
+        assert!(!out.contains("旧会话") && !out.contains("orphan"), "{out}");
+        assert_eq!(
+            out.lines().last(),
+            Some("1 个 workspace，1 个 session（1 个 live），2 个已归档")
+        );
+    }
+
+    #[test]
+    fn list_and_debug_archive_arguments_parse() {
+        use clap::Parser as _;
+        #[derive(clap::Parser, Debug)]
+        struct ListCli {
+            #[command(flatten)]
+            args: ListArgs,
+        }
+        #[derive(clap::Parser, Debug)]
+        struct DebugCli {
+            #[command(subcommand)]
+            cmd: DebugCmd,
+        }
+        let list = |argv: &[&str]| ListCli::try_parse_from(argv).map(|c| c.args);
+        assert_eq!(list(&["list"]).unwrap(), ListArgs { archived: false });
+        assert_eq!(
+            list(&["list", "--archived"]).unwrap(),
+            ListArgs { archived: true }
+        );
+        assert!(list(&["list", "--archive"]).is_err());
+        let debug = |argv: &[&str]| DebugCli::try_parse_from(argv).map(|c| c.cmd);
+        assert!(matches!(
+            debug(&["debug", "archive", "ab12"]).unwrap(),
+            DebugCmd::Archive { session } if session == "ab12"
+        ));
+        assert!(matches!(
+            debug(&["debug", "unarchive", "ab12"]).unwrap(),
+            DebugCmd::Unarchive { session } if session == "ab12"
+        ));
+        assert!(debug(&["debug", "archive"]).is_err());
     }
 
     #[test]
@@ -1672,6 +1872,58 @@ mod tests {
         assert!(text.contains("shell 集成"));
     }
 
+    /// The berthd line: archived sessions are in the total (DESIGN §17.1),
+    /// and how many of them, ListSessions tells.
+    #[test]
+    fn doctor_counts_archived_sessions_in_the_berthd_line() {
+        let d = TestDaemon::start();
+        let work = tempfile::tempdir().unwrap();
+        for _ in 0..2 {
+            debug(
+                &d.paths,
+                DebugCmd::NewSession {
+                    dir: Some(work.path().to_path_buf()),
+                    title: None,
+                    size: (40, 6),
+                    command: vec!["/bin/sh".into()],
+                },
+            )
+            .unwrap();
+        }
+        let (_, ss) = list_all(&mut connect(&d.paths).unwrap()).unwrap();
+        debug(
+            &d.paths,
+            DebugCmd::Archive {
+                session: ss[0].id.to_string(),
+            },
+        )
+        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let login = LoginEnv {
+            shell: PathBuf::from("/bin/zsh"),
+            path: Some("/usr/bin:/bin".into()),
+            claude: None,
+            codex: None,
+            error: None,
+        };
+        let checks = doctor_checks(&DoctorInput {
+            paths: &d.paths,
+            home: Some(home.path()),
+            uid: current_uid(),
+            login: &login,
+            berthd: None,
+        });
+        let berthd = checks.iter().find(|c| c.label == "berthd").unwrap();
+        assert_eq!(berthd.level, Level::Ok, "{}", berthd.detail);
+        assert!(
+            berthd
+                .detail
+                .ends_with("session 1 live / 2 共（含 1 已归档）"),
+            "{}",
+            berthd.detail
+        );
+    }
+
     #[test]
     fn a_daemon_of_another_protocol_is_named_with_both_versions_and_the_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1685,7 +1937,10 @@ mod tests {
         assert!(err.contains(&want), "{err}");
         assert!(err.contains("berth debug restart-daemon"), "{err}");
         assert!(err.contains(client::RESTART_EFFECT), "{err}");
-        assert_eq!(format!("{:#}", list(&paths).unwrap_err()), err);
+        assert_eq!(
+            format!("{:#}", list(&paths, &ListArgs::default()).unwrap_err()),
+            err
+        );
 
         let login = LoginEnv {
             shell: PathBuf::from("/bin/zsh"),
@@ -1857,5 +2112,106 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("不能恢复 agent"), "{err:#}");
+    }
+
+    /// M4 (DESIGN §17.5) against a real daemon: `debug new-session`, `debug
+    /// archive` (the live shell is killed first), `berth list` leaves the
+    /// session out and counts it, `berth list --archived` shows it, revive
+    /// is refused, `debug unarchive` brings it back, and it revives.
+    #[test]
+    fn debug_archive_and_unarchive_drive_what_list_shows() {
+        let d = TestDaemon::start();
+        let work = tempfile::tempdir().unwrap();
+        debug(
+            &d.paths,
+            DebugCmd::NewSession {
+                dir: Some(work.path().to_path_buf()),
+                title: Some("to-archive".into()),
+                size: (40, 6),
+                command: vec!["/bin/sh".into()],
+            },
+        )
+        .unwrap();
+        let mut c = connect(&d.paths).unwrap();
+        let (ws, ss) = list_all(&mut c).unwrap();
+        let [s] = ss.as_slice() else { panic!("{ss:?}") };
+        assert!(s.is_live());
+        let sid = s.id;
+        let prefix = sid.to_string()[..8].to_string();
+        let now = berth_core::now_ms;
+        let listed = render_list(&ws, &ss, now(), None);
+        assert!(listed.contains(&sid.short()), "{listed}");
+        assert!(listed.ends_with("（1 个 live），0 个已归档\n"), "{listed}");
+
+        debug(
+            &d.paths,
+            DebugCmd::Archive {
+                session: prefix.clone(),
+            },
+        )
+        .unwrap();
+        let (ws, ss) = list_all(&mut c).unwrap();
+        assert!(ss[0].is_archived() && !ss[0].is_live(), "{:?}", ss[0]);
+        let listed = render_list(&ws, &ss, now(), None);
+        assert!(!listed.contains(&sid.short()), "{listed}");
+        assert!(
+            listed.ends_with("1 个 workspace，0 个 session（0 个 live），1 个已归档\n"),
+            "{listed}"
+        );
+        let archived = render_archived(&ws, &ss, now(), None);
+        assert!(
+            archived.contains(&sid.short()) && archived.contains("to-archive"),
+            "{archived}"
+        );
+        assert!(archived.ends_with("1 个已归档\n"), "{archived}");
+        let err = debug(
+            &d.paths,
+            DebugCmd::Revive {
+                session: prefix.clone(),
+                agent: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("已归档，先恢复"), "{err:#}");
+
+        debug(
+            &d.paths,
+            DebugCmd::Unarchive {
+                session: prefix.clone(),
+            },
+        )
+        .unwrap();
+        let (ws, ss) = list_all(&mut c).unwrap();
+        assert!(!ss[0].is_archived());
+        let listed = render_list(&ws, &ss, now(), None);
+        assert!(listed.contains(&sid.short()), "{listed}");
+        assert!(listed.ends_with("（0 个 live），0 个已归档\n"), "{listed}");
+        debug(
+            &d.paths,
+            DebugCmd::Revive {
+                session: prefix.clone(),
+                agent: false,
+            },
+        )
+        .unwrap();
+        debug(
+            &d.paths,
+            DebugCmd::Send {
+                session: prefix.clone(),
+                text: "echo back-$((20+22))\\n".into(),
+            },
+        )
+        .unwrap();
+        debug(
+            &d.paths,
+            DebugCmd::Wait {
+                session: prefix,
+                text: "back-42".into(),
+                timeout: 10.0,
+            },
+        )
+        .unwrap();
+        let (_, ss) = list_all(&mut c).unwrap();
+        assert!(ss[0].is_live());
     }
 }

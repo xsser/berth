@@ -12,6 +12,7 @@ use berth_core::{
     LineSnapshot, Paths, Request, ReviveMode, ScreenUpdate, SessionId, SessionMeta, SessionStatus,
     StateSource, SubscribeMode, Workspace, WorkspaceId, PROTOCOL_VERSION,
 };
+use berth_daemon::manager::ARCHIVED_REFUSAL;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::watch;
@@ -1570,6 +1571,293 @@ async fn claude_cwd_events_list_and_resume_preview() {
     ] {
         assert!(matches!(c.request(req).await, Event::Error { .. }));
     }
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
+
+/// What the daemon answers Attach / Input / Resize / Revive / Subscribe for
+/// an archived session (DESIGN §17.1).
+fn is_refusal(e: &Event) -> bool {
+    matches!(e, Event::Error { message } if message == ARCHIVED_REFUSAL)
+}
+
+/// M4 (DESIGN §17.1 / §17.5): Archive / Unarchive over the protocol.
+/// Archiving a live session kills it before the reply, which carries the
+/// mark; other clients get it as `SessionUpdated`. Archived, the session
+/// refuses Attach / Input / Resize / Subscribe / Revive, serves history,
+/// events and metadata requests, and still counts in `sessions_total`.
+/// The mark survives a restart (registry); Unarchive clears it and Revive,
+/// Attach and Input work again below the old history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn archive_and_unarchive_over_the_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    let mut other = Client::connect(&paths.socket).await;
+    let (_ws, meta) = workspace_and_shell(&mut c, root.path()).await;
+    let sid = meta.id;
+    let mut screen = attach(&mut c, sid).await;
+    c.send(Request::Input {
+        session: sid,
+        data: b"echo before-$$\n".to_vec(),
+    })
+    .await;
+    c.screen_until(sid, &mut screen, "before-<pid>", |s| s.has("before-"))
+        .await;
+
+    let t0 = now_ms();
+    let archived = match c.request(Request::Archive { session: sid }).await {
+        Event::SessionUpdated(m) => m,
+        other => panic!("Archive answered {other:?}"),
+    };
+    let at = archived.archived_at_ms.expect("the reply carries the mark");
+    assert!(at >= t0);
+    assert!(
+        matches!(archived.status, SessionStatus::Dormant { .. }),
+        "killed before the mark: {:?}",
+        archived.status
+    );
+    other
+        .wait_for("archived broadcast", |m| {
+            m.reply_to.is_none()
+                && matches!(&m.event, Event::SessionUpdated(u) if u.id == sid && u.archived_at_ms == Some(at))
+        })
+        .await;
+
+    for req in [
+        Request::Attach {
+            session: sid,
+            dims: DIMS,
+        },
+        Request::Resize {
+            session: sid,
+            dims: DIMS,
+        },
+        Request::Subscribe {
+            session: sid,
+            mode: SubscribeMode::Full,
+        },
+        Request::Subscribe {
+            session: sid,
+            mode: SubscribeMode::Preview { rows: 3, max_hz: 4 },
+        },
+        Request::Revive {
+            session: sid,
+            mode: ReviveMode::Shell,
+        },
+        Request::Revive {
+            session: sid,
+            mode: ReviveMode::ResumeAgent,
+        },
+    ] {
+        let what = format!("{req:?}");
+        let answer = c.request(req).await;
+        assert!(is_refusal(&answer), "{what} answered {answer:?}");
+    }
+    // Input is fire-and-forget: only a refusal is answered.
+    let input = c
+        .send(Request::Input {
+            session: sid,
+            data: b"echo x\n".to_vec(),
+        })
+        .await;
+    let answer = c
+        .wait_for("input refusal", |m| m.reply_to == Some(input))
+        .await
+        .event;
+    assert!(is_refusal(&answer), "Input answered {answer:?}");
+
+    let history = all_text(&mut c, sid).await;
+    assert!(
+        history.iter().any(|l| has_marker(l, "before-")),
+        "history stays readable: {history:?}"
+    );
+    match c
+        .request(Request::ListEvents {
+            session: sid,
+            limit: 5,
+        })
+        .await
+    {
+        Event::Events { events, .. } => assert_eq!(
+            (events[0].kind.as_str(), events[0].detail.as_deref()),
+            ("archive", Some("user"))
+        ),
+        other => panic!("ListEvents answered {other:?}"),
+    }
+    match c
+        .request(Request::Rename {
+            session: sid,
+            title: Some("old work".into()),
+        })
+        .await
+    {
+        Event::SessionUpdated(m) => assert_eq!(m.archived_at_ms, Some(at)),
+        other => panic!("Rename answered {other:?}"),
+    }
+    assert!(matches!(
+        c.request(Request::MarkRead { session: sid }).await,
+        Event::SessionUpdated(m) if m.archived_at_ms == Some(at)
+    ));
+    match c.request(Request::Archive { session: sid }).await {
+        Event::SessionUpdated(m) => assert_eq!(m.archived_at_ms, Some(at), "idempotent"),
+        other => panic!("Archive answered {other:?}"),
+    }
+    // sessions_total counts archived sessions too (DESIGN §17.1).
+    match c.request(Request::DaemonStatus).await {
+        Event::Status(s) => assert_eq!((s.sessions_live, s.sessions_total), (0, 1)),
+        other => panic!("{other:?}"),
+    }
+
+    // Restart on the same directory: the registry keeps the mark.
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+    {
+        let store = berth_store::Store::open(&paths).unwrap();
+        let stored = store.get_session(sid).unwrap().unwrap();
+        assert_eq!(stored.archived_at_ms, Some(at));
+    }
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    let restored = session_meta(&mut c, sid).await;
+    assert_eq!(restored.archived_at_ms, Some(at));
+    assert_eq!(restored.status, SessionStatus::Restored);
+    assert_eq!(restored.title_user.as_deref(), Some("old work"));
+    let answer = c
+        .request(Request::Attach {
+            session: sid,
+            dims: DIMS,
+        })
+        .await;
+    assert!(is_refusal(&answer), "still archived: {answer:?}");
+
+    match c.request(Request::Unarchive { session: sid }).await {
+        Event::SessionUpdated(m) => {
+            assert_eq!(m.archived_at_ms, None);
+            assert_eq!(m.status, SessionStatus::Restored);
+        }
+        other => panic!("Unarchive answered {other:?}"),
+    }
+    match c
+        .request(Request::Revive {
+            session: sid,
+            mode: ReviveMode::Shell,
+        })
+        .await
+    {
+        Event::SessionUpdated(m) => assert_eq!(m.status, SessionStatus::Live),
+        other => panic!("Revive answered {other:?}"),
+    }
+    let mut screen = attach(&mut c, sid).await;
+    c.send(Request::Input {
+        session: sid,
+        data: b"echo after-$$\n".to_vec(),
+    })
+    .await;
+    c.screen_until(sid, &mut screen, "after-<pid>", |s| s.has("after-"))
+        .await;
+    let all = all_text(&mut c, sid).await;
+    let before = all.iter().position(|l| has_marker(l, "before-"));
+    let after = all.iter().position(|l| has_marker(l, "after-"));
+    assert!(
+        before.is_some() && before < after,
+        "old history precedes the revived shell: {all:?}"
+    );
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
+
+/// A Claude hook event from outside berth (no `BERTH_SESSION_ID`): only the
+/// agent's session id and its cwd can route it.
+fn claude_outside(session_id: &str, cwd: &Path, event: ClaudeHookEvent) -> Request {
+    Request::Hook(HookEnvelope {
+        berth_session: None,
+        pid: std::process::id(),
+        sent_at_ms: now_ms(),
+        signal: AgentSignal::Claude(ClaudeHook {
+            session_id: session_id.into(),
+            cwd: Some(cwd.to_path_buf()),
+            transcript_path: None,
+            permission_mode: Some("default".into()),
+            event,
+        }),
+    })
+}
+
+/// M4 (DESIGN §17.1 / task §3): after archiving, hooks do not reach the
+/// session through the fallbacks. With A (archived, its Claude id `ext-a`)
+/// and B (live) in the same cwd, a hook carrying `ext-a` is dropped rather
+/// than routed to B by cwd, while a hook of another agent in that cwd goes
+/// to B, the only live session there. A stays as archived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hooks_do_not_reach_an_archived_session_by_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    let mut hook = Client::connect_as(&paths.socket, ClientRole::Hook).await;
+    let (ws, a) = workspace_and_shell(&mut c, root.path()).await;
+    let b = match c
+        .request(Request::CreateSession {
+            workspace: ws,
+            cwd: None,
+            command: Some(vec!["/bin/sh".into()]),
+            title: None,
+            dims: DIMS,
+        })
+        .await
+    {
+        Event::SessionUpdated(m) => m,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(b.cwd, root.path());
+
+    let start = claude_as(
+        a.id,
+        "ext-a",
+        ClaudeHookEvent::SessionStart { source: None },
+    );
+    assert_eq!(hook.request(start).await, Event::Ok);
+    let before = session_meta(&mut c, a.id).await;
+    assert_eq!(before.agent.external_id.as_deref(), Some("ext-a"));
+    match c.request(Request::Archive { session: a.id }).await {
+        Event::SessionUpdated(m) => assert!(m.is_archived()),
+        other => panic!("Archive answered {other:?}"),
+    }
+    let archived = session_meta(&mut c, a.id).await;
+
+    let tool = || ClaudeHookEvent::PreToolUse {
+        tool_name: "Bash".into(),
+    };
+    // The hook is handled before it is answered: the metadata below
+    // already shows where it went.
+    let late = claude_outside("ext-a", root.path(), tool());
+    assert_eq!(hook.request(late).await, Event::Ok);
+    let b_now = session_meta(&mut c, b.id).await;
+    assert_eq!(
+        (b_now.agent.kind, b_now.agent.state),
+        (AgentKind::Shell, b.agent.state.clone()),
+        "not routed to B by cwd"
+    );
+    assert_eq!(session_meta(&mut c, a.id).await, archived);
+
+    let other_agent = claude_outside("ext-b", root.path(), tool());
+    assert_eq!(hook.request(other_agent).await, Event::Ok);
+    let b_now = session_meta(&mut c, b.id).await;
+    assert_eq!(
+        (b_now.agent.kind, b_now.agent.state),
+        (
+            AgentKind::Claude,
+            AgentState::ToolRunning {
+                tool: "Bash".into()
+            }
+        ),
+        "B is the only live session in that cwd"
+    );
+    assert_eq!(session_meta(&mut c, a.id).await, archived);
     assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
     daemon.join().await;
 }

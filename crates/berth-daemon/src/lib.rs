@@ -3,13 +3,15 @@
 //!
 //! Modules: `lock` (single instance), `config`, `server` (socket + framing),
 //! `outbox` (per-connection coalescing queue), `manager` (registry,
-//! persistence, restore, hook routing), `session` (per-session actor thread:
-//! PTY → Terminal → deltas / previews / snapshots), `view` (virtual line
-//! space helpers), `agent_state` (DESIGN §9 state machine), `hooks`
-//! (`HookEnvelope` → session).
+//! persistence, restore, hook routing, archiving), `session` (per-session
+//! actor thread: PTY → Terminal → deltas / previews / snapshots), `view`
+//! (virtual line space helpers), `agent_state` (DESIGN §9 state machine),
+//! `hooks` (`HookEnvelope` → session), `archive` (DESIGN §17.1: the
+//! automatic archive scan).
 #![deny(unsafe_code)]
 
 pub mod agent_state;
+pub mod archive;
 pub mod config;
 pub mod hooks;
 pub mod lock;
@@ -72,7 +74,15 @@ pub async fn run(
         wait_true(&mut shutdown).await;
         stop_tx.send_replace(true);
     });
+    let scanner = tokio::spawn(archive::run_scanner(
+        mgr.clone(),
+        stop_rx.clone(),
+        archive::FIRST_SCAN,
+        archive::SCAN_EVERY,
+        berth_core::now_ms,
+    ));
     server::serve(listener, mgr, stop_rx).await;
+    scanner.abort();
     forward.abort();
     if let Err(e) = std::fs::remove_file(&paths.socket) {
         tracing::debug!(error = %e, "socket already gone");

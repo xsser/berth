@@ -38,7 +38,7 @@ use parking_lot::RwLock;
 use tokio::sync::oneshot;
 
 use crate::agent_state::{Signal, SILENCE_IDLE_SECS};
-use crate::manager::Manager;
+use crate::manager::{is_shell_program, Manager};
 use crate::outbox::Outbox;
 use crate::view::{
     cap_front, prefix_from_snapshot, referenced_styles, trim_trailing_blank, ConnId, SubKind,
@@ -230,6 +230,9 @@ pub(crate) struct Actor {
     last_activity_signal: Option<Instant>,
     silence_reported: bool,
     fg_name: Option<String>,
+    /// Whether the last foreground poll found the session's own shell in
+    /// the foreground, as last reported to the manager (archive scan).
+    shell_in_foreground: Option<bool>,
     next_fg_poll: Instant,
     /// `Kill` sent SIGHUP at this instant; `try_wait` is polled every
     /// `KILL_POLL` until the child is gone.
@@ -336,6 +339,7 @@ impl Actor {
             last_activity_signal: None,
             silence_reported: true,
             fg_name: None,
+            shell_in_foreground: None,
             next_fg_poll: now,
             kill_since: None,
             kill_forced: false,
@@ -409,6 +413,7 @@ impl Actor {
         self.child_exit_code = None;
         self.clear_exit_tracking();
         self.fg_name = None;
+        self.shell_in_foreground = None;
         self.next_fg_poll = Instant::now() + FOREGROUND_POLL;
         self.snap_dirty = true;
         if self.persist.journal {
@@ -1212,6 +1217,10 @@ impl Actor {
         let snap = SessionSnapshotFile {
             format_version: SNAPSHOT_FORMAT_VERSION,
             saved_at_ms: now_ms(),
+            // A copy of the metadata as of this write, not its latest state:
+            // the registry is the authority (the archive mark included), and
+            // restoring does not read it (only history, screen and styles;
+            // the store checks its id).
             session: meta,
             styles,
             history,
@@ -1269,7 +1278,18 @@ impl Actor {
             if now >= self.next_fg_poll {
                 self.next_fg_poll = now + FOREGROUND_POLL;
                 poll_child = true;
-                let name = live.pty.read().foreground_process().map(|p| p.name);
+                let fg = live.pty.read().foreground_process();
+                // The child is the session's shell and its pid its process
+                // group: in the foreground, it is at its prompt (a job
+                // control shell gives every command a group of its own).
+                let shell = fg
+                    .as_ref()
+                    .map(|p| p.pid == live.pid && is_shell_program(&p.name));
+                if shell != self.shell_in_foreground {
+                    self.shell_in_foreground = shell;
+                    self.mgr.set_shell_in_foreground(self.id, shell);
+                }
+                let name = fg.map(|p| p.name);
                 if name != self.fg_name {
                     self.fg_name = name.clone();
                     if let Some(name) = name {
