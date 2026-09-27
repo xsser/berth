@@ -611,6 +611,7 @@ impl Manager {
                 order,
                 cols: dims.cols,
                 rows: dims.rows,
+                archived_at_ms: None,
             }
         };
         let spawn = self.pty_spawn(&meta, meta.command.clone(), meta.cwd.clone());
@@ -1266,6 +1267,7 @@ mod tests {
             order: 0,
             cols: 80,
             rows: 24,
+            archived_at_ms: None,
         };
         let config = Config::default();
         meta.agent.kind = AgentKind::Claude;
@@ -1656,6 +1658,7 @@ mod tests {
             order: 0,
             cols: 80,
             rows: 24,
+            archived_at_ms: None,
         };
         meta.agent.kind = AgentKind::Claude;
         meta.agent.transcript_path = Some(transcript.clone());

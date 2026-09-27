@@ -283,5 +283,9 @@ async fn handle_request(mgr: &Arc<Manager>, conn: ConnId, outbox: &Arc<Outbox>, 
                 .map(|events| Event::Events { session, events }),
         ),
         Request::ResumeCommand { session } => done(mgr.resume_command(session)),
+        // M4 step 2a
+        Request::Archive { .. } | Request::Unarchive { .. } => send(Event::Error {
+            message: "not implemented yet".into(),
+        }),
     }
 }

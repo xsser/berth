@@ -62,6 +62,10 @@ pub struct SessionMeta {
     pub order: u32,
     pub cols: u16,
     pub rows: u16,
+    /// Archived sessions leave the workspace list but keep all data (DESIGN §17.1).
+    /// Never set while the session is `Live`.
+    #[serde(default)]
+    pub archived_at_ms: Option<i64>,
 }
 
 impl SessionMeta {
@@ -79,5 +83,38 @@ impl SessionMeta {
 
     pub fn is_live(&self) -> bool {
         matches!(self.status, SessionStatus::Live)
+    }
+
+    pub fn is_archived(&self) -> bool {
+        self.archived_at_ms.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SQLite rows and format 2 snapshots hold the session as JSON: metadata
+    /// stored before `archived_at_ms` existed reads as not archived.
+    #[test]
+    fn metadata_stored_before_archived_at_ms_reads_as_not_archived() {
+        let archived = SessionMeta {
+            title_auto: "claude".into(),
+            status: SessionStatus::Restored,
+            archived_at_ms: Some(1_700_000_000_123),
+            ..SessionMeta::default()
+        };
+        assert!(archived.is_archived());
+        let mut stored = serde_json::to_value(&archived).unwrap();
+        assert!(stored
+            .as_object_mut()
+            .unwrap()
+            .remove("archived_at_ms")
+            .is_some());
+        let read: SessionMeta = serde_json::from_value(stored).unwrap();
+        assert_eq!(read.archived_at_ms, None);
+        assert!(!read.is_archived());
+        assert_eq!(read.title_auto, "claude");
+        assert_eq!(read.status, SessionStatus::Restored);
     }
 }
