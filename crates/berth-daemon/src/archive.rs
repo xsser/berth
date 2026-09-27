@@ -38,24 +38,39 @@ pub enum ScanAction {
 
 impl fmt::Display for ScanAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let days = |ms: i64| ms as f64 / DAY_MS as f64;
         match *self {
             ScanAction::Archive {
                 idle_ms,
                 live: false,
-            } => write!(f, "idle for {:.1} days, not live", days(idle_ms)),
+            } => write!(f, "idle for {}, not live", span(idle_ms)),
             ScanAction::Archive {
                 idle_ms,
                 live: true,
             } => write!(
                 f,
-                "idle for {:.1} days, a shell at its prompt (killed first)",
-                days(idle_ms)
+                "idle for {}, a shell at its prompt (killed first)",
+                span(idle_ms)
             ),
             ScanAction::Purge { archived_ms } => {
-                write!(f, "archived {:.1} days ago", days(archived_ms))
+                write!(f, "archived {} ago", span(archived_ms))
             }
         }
+    }
+}
+
+/// A span for the log: in days from one day on, else in hours, minutes or
+/// seconds (thresholds can be fractions of a day).
+fn span(ms: i64) -> String {
+    const HOUR_MS: f64 = 3_600_000.0;
+    let ms = ms as f64;
+    if ms >= DAY_MS as f64 {
+        format!("{:.1} days", ms / DAY_MS as f64)
+    } else if ms >= HOUR_MS {
+        format!("{:.1} h", ms / HOUR_MS)
+    } else if ms >= 60_000.0 {
+        format!("{:.1} min", ms / 60_000.0)
+    } else {
+        format!("{:.1} s", ms / 1000.0)
     }
 }
 
@@ -137,6 +152,7 @@ mod tests {
     use berth_core::{AgentKind, AgentState, SessionStatus};
 
     use super::*;
+    use crate::config::Days;
 
     const NOW: i64 = 1_800_000_000_000;
     const WEEK: i64 = 7 * DAY_MS;
@@ -166,8 +182,8 @@ mod tests {
 
     fn days(auto: u32, purge: u32) -> ArchiveConfig {
         ArchiveConfig {
-            auto_after_days: auto,
-            purge_after_days: purge,
+            auto_after_days: Days::whole(auto),
+            purge_after_days: Days::whole(purge),
         }
     }
 
@@ -314,5 +330,12 @@ mod tests {
             archived_ms: 31 * DAY_MS + DAY_MS / 2,
         };
         assert_eq!(purge.to_string(), "archived 31.5 days ago");
+        let short = |idle_ms| ScanAction::Archive {
+            idle_ms,
+            live: false,
+        };
+        assert_eq!(short(90_000).to_string(), "idle for 1.5 min, not live");
+        assert_eq!(short(9_000).to_string(), "idle for 9.0 s, not live");
+        assert_eq!(short(DAY_MS / 2).to_string(), "idle for 12.0 h, not live");
     }
 }

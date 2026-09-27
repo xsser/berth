@@ -80,17 +80,17 @@ pub struct ArchiveConfig {
     /// Archive sessions idle for more than this many days: any session that
     /// is not live, and a live one only when a plain shell sits idle at its
     /// prompt (it is killed first). 0 = never (DESIGN §17.1).
-    pub auto_after_days: u32,
+    pub auto_after_days: Days,
     /// Purge sessions archived for more than this many days, like
     /// `Request::Delete`. 0 = never.
-    pub purge_after_days: u32,
+    pub purge_after_days: Days,
 }
 
 impl Default for ArchiveConfig {
     fn default() -> Self {
         Self {
-            auto_after_days: 7,
-            purge_after_days: 0,
+            auto_after_days: Days::whole(7),
+            purge_after_days: Days::OFF,
         }
     }
 }
@@ -98,19 +98,58 @@ impl Default for ArchiveConfig {
 impl ArchiveConfig {
     /// Idle time (ms) beyond which a session is archived; `None` = never.
     pub fn auto_after_ms(&self) -> Option<i64> {
-        days_ms(self.auto_after_days)
+        self.auto_after_days.ms()
     }
 
     /// Time archived (ms) beyond which a session is purged; `None` = never.
     pub fn purge_after_ms(&self) -> Option<i64> {
-        days_ms(self.purge_after_days)
+        self.purge_after_days.ms()
     }
 }
 
-/// `days` in ms, `None` for 0 (the "never" of `[archive]`). Cannot
-/// overflow: `u32::MAX` days are about 3.7e17 ms.
-fn days_ms(days: u32) -> Option<i64> {
-    (days > 0).then(|| i64::from(days) * DAY_MS)
+/// A number of days in `[archive]`: whole or fractional (`0.5` = 12 h,
+/// `0.0001` = 8.64 s), never negative; 0 turns the rule off. Held in ms
+/// (rounded, at least 1 ms when positive) so `Config` stays `Eq`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Days {
+    ms: i64,
+}
+
+impl Days {
+    /// 0: the rule is off.
+    pub const OFF: Days = Days { ms: 0 };
+
+    /// `days` whole days (cannot overflow: `u32::MAX` days are about
+    /// 3.7e17 ms).
+    pub const fn whole(days: u32) -> Days {
+        Days {
+            ms: days as i64 * DAY_MS,
+        }
+    }
+
+    /// `days` days: finite and not negative. Beyond `i64::MAX` ms it
+    /// saturates (never reached).
+    pub fn new(days: f64) -> Result<Days, String> {
+        if !days.is_finite() || days < 0.0 {
+            return Err(format!("{days} is not a number of days (0 or more)"));
+        }
+        let ms = (days * DAY_MS as f64).round() as i64;
+        Ok(Days {
+            ms: if days > 0.0 { ms.max(1) } else { 0 },
+        })
+    }
+
+    /// The span in ms; `None` when off.
+    pub fn ms(self) -> Option<i64> {
+        (self.ms > 0).then_some(self.ms)
+    }
+}
+
+impl<'de> Deserialize<'de> for Days {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Days, D::Error> {
+        // Integers are accepted too (`auto_after_days = 7`).
+        Days::new(f64::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -344,9 +383,9 @@ mod tests {
         assert!(!c.persist.journal);
         assert_eq!(c.max_restored_lines(), 50_000);
         // DESIGN §17.4: archive after a week, never purge.
-        assert_eq!(c.archive.auto_after_days, 7);
+        assert_eq!(c.archive.auto_after_days, Days::whole(7));
         assert_eq!(c.archive.auto_after_ms(), Some(7 * DAY_MS));
-        assert_eq!(c.archive.purge_after_days, 0);
+        assert_eq!(c.archive.purge_after_days, Days::OFF);
         assert_eq!(c.archive.purge_after_ms(), None);
         assert_eq!(
             c.resume_argv(&AgentKind::Claude, "abc-1").unwrap(),
@@ -398,8 +437,8 @@ action = "command_palette"
         assert_eq!(
             c.archive,
             ArchiveConfig {
-                auto_after_days: 3,
-                purge_after_days: 30
+                auto_after_days: Days::whole(3),
+                purge_after_days: Days::whole(30)
             }
         );
         assert_eq!(c.archive.purge_after_ms(), Some(30 * DAY_MS));
@@ -485,21 +524,36 @@ resume_command = "aider --restore {id}; rm -rf ~"
     fn archive_section_defaults_zero_and_bad_values() {
         let c = Config::parse("[archive]\npurge_after_days = 14\n").unwrap();
         assert_eq!(
-            c.archive.auto_after_days, 7,
+            c.archive.auto_after_days,
+            Days::whole(7),
             "missing key keeps its default"
         );
         assert_eq!(c.archive.purge_after_ms(), Some(14 * DAY_MS));
         let off = Config::parse("[archive]\nauto_after_days = 0\n").unwrap();
         assert_eq!(off.archive.auto_after_ms(), None);
         assert_eq!(off.archive.purge_after_ms(), None);
-        let max = Config::parse("[archive]\nauto_after_days = 4294967295\n").unwrap();
         assert_eq!(
-            max.archive.auto_after_ms(),
-            Some(i64::from(u32::MAX) * DAY_MS)
+            Config::parse("[archive]\nauto_after_days = 0.0\n").unwrap(),
+            off
         );
+        // Fractions of a day (e.g. a threshold of seconds for a check).
+        let short =
+            Config::parse("[archive]\nauto_after_days = 0.0001\npurge_after_days = 1.5\n").unwrap();
+        assert_eq!(short.archive.auto_after_ms(), Some(8_640));
+        assert_eq!(short.archive.purge_after_ms(), Some(36 * 60 * 60 * 1000));
+        let tiny = Config::parse("[archive]\nauto_after_days = 1e-12\n").unwrap();
+        assert_eq!(
+            tiny.archive.auto_after_ms(),
+            Some(1),
+            "positive is never off"
+        );
+        let huge = Config::parse("[archive]\nauto_after_days = 1e300\n").unwrap();
+        assert_eq!(huge.archive.auto_after_ms(), Some(i64::MAX));
         for bad in [
             "[archive]\nauto_after_days = -1\n",
-            "[archive]\npurge_after_days = 1.5\n",
+            "[archive]\npurge_after_days = -0.5\n",
+            "[archive]\nauto_after_days = inf\n",
+            "[archive]\nauto_after_days = nan\n",
             "[archive]\nauto_after_days = \"7\"\n",
         ] {
             assert!(Config::parse(bad).is_err(), "{bad}");
