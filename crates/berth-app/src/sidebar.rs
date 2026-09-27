@@ -2580,6 +2580,98 @@ mod tests {
         assert!(!frame(&mut menu, Vec::new()).0, "dismissed");
     }
 
+    /// The dialogs and the context menus are egui's own widgets, so they
+    /// paint from `Visuals`, not from our [`Palette`]. Without
+    /// [`visuals`] they would keep egui's grays, which in light mode are a
+    /// different set from the sidebar's and in any custom theme are simply
+    /// wrong. This runs a real frame of the rename dialog and of the
+    /// terminal menu and checks the theme's colors reach the shapes.
+    #[test]
+    fn egui_dialogs_and_menus_paint_with_the_theme() {
+        fn fills(shape: &egui::Shape, out: &mut Vec<Color32>) {
+            match shape {
+                egui::Shape::Rect(r) => {
+                    out.push(r.fill);
+                    out.push(r.stroke.color);
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| fills(s, out)),
+                _ => {}
+            }
+        }
+        let painted = |out: &egui::FullOutput| {
+            let mut v = Vec::new();
+            for c in &out.shapes {
+                fills(&c.shape, &mut v);
+            }
+            v
+        };
+        const FADE_IN_FRAMES: usize = 16;
+        for theme in [Theme::light(), Theme::dark()] {
+            let name = if theme.is_light() { "light" } else { "dark" };
+            let pal = Palette::from_theme(&theme);
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals(&pal));
+            let egui_own = if theme.is_light() {
+                egui::Visuals::light()
+            } else {
+                egui::Visuals::dark()
+            }
+            .window_fill;
+
+            let mut dialog = RenameDialog {
+                target: RenameTarget::Session(SessionId::new()),
+                title: "重命名「build」".into(),
+                hint: "留空则恢复自动标题",
+                text: "build".into(),
+                focus: true,
+            };
+            // Two frames: the first lays the modal out, the second paints
+            // it at its measured size.
+            // egui fades a modal in, so the first frames paint it
+            // translucent; FADE_IN_FRAMES is well past the end of that.
+            let mut shapes = Vec::new();
+            for _ in 0..FADE_IN_FRAMES {
+                let out = headless_frame(&ctx, Vec::new(), |ctx| {
+                    show_rename(ctx, pal, &mut dialog, &mut Vec::new());
+                });
+                shapes = painted(&out);
+            }
+            assert!(
+                shapes.contains(&pal.popup),
+                "{name}: the rename dialog is not on the theme's popup fill"
+            );
+            assert!(
+                shapes.contains(&pal.border),
+                "{name}: the rename dialog has no theme border"
+            );
+            assert!(
+                egui_own == pal.popup || !shapes.contains(&egui_own),
+                "{name}: egui's own window fill is still painted"
+            );
+
+            let mut menu = TermMenu {
+                pos: Pos2::new(400.0, 300.0),
+                items: menus::terminal(menus::TerminalArea {
+                    sid: SessionId::new(),
+                    has_selection: true,
+                    panes: 2,
+                }),
+                opening: true,
+            };
+            let mut shapes = Vec::new();
+            for _ in 0..FADE_IN_FRAMES {
+                let out = headless_frame(&ctx, Vec::new(), |ctx| {
+                    show_terminal_menu(ctx, &mut menu, &mut Vec::new());
+                });
+                shapes = painted(&out);
+            }
+            assert!(
+                shapes.contains(&pal.popup),
+                "{name}: the terminal menu is not on the theme's popup fill"
+            );
+        }
+    }
+
     #[test]
     fn the_rename_dialog_confirms_with_enter_and_cancels_with_escape() {
         let ctx = egui::Context::default();
