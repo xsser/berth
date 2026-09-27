@@ -793,29 +793,38 @@ pub fn doctor_checks(input: &DoctorInput) -> Vec<Check> {
     let mut sessions = None;
     match SyncClient::connect(paths, ClientRole::Cli) {
         Ok(mut c) => {
-            match c.request(Request::DaemonStatus, TIMEOUT) {
-                Ok(Event::Status(s)) => checks.push(Check::new(
-                    Level::Ok,
-                    "berthd",
-                    format!(
-                        "可达：版本 {}，协议 v{PROTOCOL_VERSION}（与客户端一致），pid {}，\
-                         已运行 {}，session {} live / {} 共",
-                        s.version,
-                        s.pid,
-                        format_elapsed(s.uptime_ms),
-                        s.sessions_live,
-                        s.sessions_total
-                    ),
-                )),
+            let status = c.request(Request::DaemonStatus, TIMEOUT);
+            if let Ok((_, ss)) = list_all(&mut c) {
+                sessions = Some(ss);
+            }
+            match status {
+                Ok(Event::Status(s)) => {
+                    // The total counts archived sessions too (DESIGN §17.1);
+                    // how many, ListSessions tells.
+                    let archived = sessions.as_ref().map_or_else(String::new, |ss| {
+                        let n = ss.iter().filter(|m| m.is_archived()).count();
+                        format!("（含 {n} 已归档）")
+                    });
+                    checks.push(Check::new(
+                        Level::Ok,
+                        "berthd",
+                        format!(
+                            "可达：版本 {}，协议 v{PROTOCOL_VERSION}（与客户端一致），pid {}，\
+                             已运行 {}，session {} live / {} 共{archived}",
+                            s.version,
+                            s.pid,
+                            format_elapsed(s.uptime_ms),
+                            s.sessions_live,
+                            s.sessions_total
+                        ),
+                    ));
+                }
                 Ok(other) => checks.push(Check::new(
                     Level::Fail,
                     "berthd",
                     unexpected("DaemonStatus", other).to_string(),
                 )),
                 Err(e) => checks.push(Check::new(Level::Fail, "berthd", format!("{e:#}"))),
-            }
-            if let Ok((_, ss)) = list_all(&mut c) {
-                sessions = Some(ss);
             }
         }
         Err(e) => {
@@ -1861,6 +1870,58 @@ mod tests {
         assert!(find("Codex notify").detail.contains("不存在"));
         assert_eq!(find("berthd 可执行文件").level, Level::Fail);
         assert!(text.contains("shell 集成"));
+    }
+
+    /// The berthd line: archived sessions are in the total (DESIGN §17.1),
+    /// and how many of them, ListSessions tells.
+    #[test]
+    fn doctor_counts_archived_sessions_in_the_berthd_line() {
+        let d = TestDaemon::start();
+        let work = tempfile::tempdir().unwrap();
+        for _ in 0..2 {
+            debug(
+                &d.paths,
+                DebugCmd::NewSession {
+                    dir: Some(work.path().to_path_buf()),
+                    title: None,
+                    size: (40, 6),
+                    command: vec!["/bin/sh".into()],
+                },
+            )
+            .unwrap();
+        }
+        let (_, ss) = list_all(&mut connect(&d.paths).unwrap()).unwrap();
+        debug(
+            &d.paths,
+            DebugCmd::Archive {
+                session: ss[0].id.to_string(),
+            },
+        )
+        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let login = LoginEnv {
+            shell: PathBuf::from("/bin/zsh"),
+            path: Some("/usr/bin:/bin".into()),
+            claude: None,
+            codex: None,
+            error: None,
+        };
+        let checks = doctor_checks(&DoctorInput {
+            paths: &d.paths,
+            home: Some(home.path()),
+            uid: current_uid(),
+            login: &login,
+            berthd: None,
+        });
+        let berthd = checks.iter().find(|c| c.label == "berthd").unwrap();
+        assert_eq!(berthd.level, Level::Ok, "{}", berthd.detail);
+        assert!(
+            berthd
+                .detail
+                .ends_with("session 1 live / 2 共（含 1 已归档）"),
+            "{}",
+            berthd.detail
+        );
     }
 
     #[test]
