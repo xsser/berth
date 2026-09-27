@@ -198,6 +198,23 @@ fn clean(s: &str) -> String {
         .collect()
 }
 
+/// The label of a dormant card's resume button: the agent it resumes.
+fn resume_label(meta: &SessionMeta) -> Option<String> {
+    controller::resumable(meta)
+        .then(|| meta.agent.resume_kind())
+        .flatten()
+        .map(|kind| format!("Resume {}", agent_name(kind)))
+}
+
+fn agent_name(kind: &AgentKind) -> String {
+    match kind {
+        AgentKind::Shell => "shell".into(),
+        AgentKind::Claude => "claude".into(),
+        AgentKind::Codex => "codex".into(),
+        AgentKind::Other(name) => name.clone(),
+    }
+}
+
 fn kind_label(meta: &SessionMeta) -> String {
     match &meta.agent.kind {
         AgentKind::Shell => meta
@@ -210,9 +227,7 @@ fn kind_label(meta: &SessionMeta) -> String {
             .and_then(|n| n.to_str())
             .unwrap_or("shell")
             .to_string(),
-        AgentKind::Claude => "claude".into(),
-        AgentKind::Codex => "codex".into(),
-        AgentKind::Other(name) => name.clone(),
+        agent => agent_name(agent),
     }
 }
 
@@ -1272,8 +1287,7 @@ impl Sidebar {
                 ReviveMode::Shell,
                 "在原目录启动新的 shell，历史保留在上方",
             );
-            if resume {
-                let label = format!("Resume {}", kind_label(m));
+            if let Some(label) = resume_label(m) {
                 let tip = match ctl.resume_preview(m.id) {
                     Some(ResumePreview {
                         cwd,
@@ -1774,6 +1788,24 @@ mod tests {
         assert!(m.restart());
         let (button, _) = frame(Vec::new(), &m.banner().unwrap());
         assert_eq!(button, None, "nothing to press while it stops");
+    }
+
+    #[test]
+    fn a_session_whose_agent_left_offers_to_resume_that_agent() {
+        let mut m = SessionMeta {
+            status: SessionStatus::Restored,
+            command: vec!["/bin/zsh".into()],
+            ..SessionMeta::default()
+        };
+        m.agent.external_id = Some("abc".into());
+        assert_eq!(resume_label(&m), None, "a plain shell");
+        m.agent.last_agent = Some(AgentKind::Claude);
+        assert_eq!(resume_label(&m).as_deref(), Some("Resume claude"));
+        assert_eq!(kind_label(&m), "zsh", "the card still shows what runs");
+        m.agent.kind = AgentKind::Codex;
+        assert_eq!(resume_label(&m).as_deref(), Some("Resume codex"));
+        m.status = SessionStatus::Live;
+        assert_eq!(resume_label(&m), None, "live: nothing to resume");
     }
 
     #[test]

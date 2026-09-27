@@ -110,20 +110,22 @@ pub struct ResumePreview {
 }
 
 /// What a resume command is computed from.
-type ResumeKey = (AgentKind, Option<String>, Option<PathBuf>, PathBuf);
+type ResumeKey = (Option<AgentKind>, Option<String>, Option<PathBuf>, PathBuf);
 
 fn resume_key(m: &SessionMeta) -> ResumeKey {
     (
-        m.agent.kind.clone(),
+        m.agent.resume_kind().cloned(),
         m.agent.external_id.clone(),
         m.agent.transcript_path.clone(),
         m.cwd.clone(),
     )
 }
 
-/// A dormant card offers "Resume" when its agent left an id to resume.
+/// A dormant card offers "Resume" when its agent left an id to resume: the
+/// agent still running when the session ended, or the one that left before
+/// (`/exit`: the kind is `Shell` again).
 pub fn resumable(m: &SessionMeta) -> bool {
-    !m.is_live() && m.agent.kind.is_agent() && m.agent.external_id.is_some()
+    !m.is_live() && m.agent.resume_kind().is_some() && m.agent.external_id.is_some()
 }
 
 #[derive(Clone, Debug)]
@@ -1710,6 +1712,40 @@ mod tests {
             now,
         );
         assert!(c.resume_preview(did).unwrap().command.is_err());
+    }
+
+    #[test]
+    fn a_dormant_card_whose_agent_left_asks_for_its_resume_command() {
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        let w = ws(0);
+        let mut left = claude_dormant(&w, 0, "abc");
+        left.agent.kind = AgentKind::Shell;
+        left.agent.last_agent = Some(AgentKind::Claude);
+        let mut shell = session(&w, 1, false);
+        shell.agent.external_id = Some("abc".into()); // no agent to resume it
+        let (lid, sid) = (left.id, shell.id);
+        assert!(resumable(&left) && !resumable(&shell));
+        listed(&mut c, &mut out, vec![w], vec![left.clone(), shell]);
+        let now = Instant::now();
+        c.set_visible(&mut out, &[lid, sid], now);
+        let sent = out.take();
+        let asked = requests(&sent, |r| matches!(r, Request::ResumeCommand { .. }));
+        assert_eq!(asked.len(), 1, "{sent:?}");
+        assert_eq!(*asked[0].1, Request::ResumeCommand { session: lid });
+        let argv = vec!["claude".to_string(), "--resume".into(), "abc".into()];
+        let answer = Event::ResumeCommand {
+            session: lid,
+            cwd: PathBuf::from("/tmp/proj"),
+            command: Ok(argv),
+        };
+        c.handle(&mut out, reply(asked[0].0, answer), now);
+        assert!(c.resume_preview(lid).is_some());
+        // Another agent left since: the preview was for Claude.
+        let mut codex = left;
+        codex.agent.last_agent = Some(AgentKind::Codex);
+        c.handle(&mut out, push(Event::SessionUpdated(codex)), now);
+        assert!(c.resume_preview(lid).is_none());
     }
 
     #[test]
