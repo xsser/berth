@@ -64,7 +64,7 @@ use crate::menus::{self, MenuAction, MenuItem, RenameTarget};
 use crate::mismatch::Banner;
 use crate::panes::Axis;
 use crate::setup_hooks::command_line;
-use crate::theme::{contrast_ratio, mix, Rgb, Theme};
+use crate::theme::{contrast_ratio, mix, Rgb, Theme, BODY_TEXT_CONTRAST};
 use crate::timefmt::local_clock;
 
 const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
@@ -92,6 +92,13 @@ struct Palette {
     raised: Color32,
     danger: Color32,
     danger_fg: Color32,
+    /// Outline of those floating panels. Separate from `border`: a panel
+    /// fill is only a step off the terminal background (1.21:1 for
+    /// `raised` on white), so the outline is what tells the user where the
+    /// panel is — a UI boundary in the sense of WCAG 1.4.11, held to
+    /// [`ACCENT_CONTRAST`]. `border` stays the quiet hairline inside the
+    /// sidebar.
+    edge: Color32,
     /// egui's own popups (menus, dialogs), which float over the sidebar.
     popup: Color32,
     red: Color32,
@@ -100,7 +107,10 @@ struct Palette {
     blue: Color32,
     magenta: Color32,
     cyan: Color32,
-    /// `[theme].accent`: 「等授权」, the unread count, warnings.
+    /// `[theme].accent`: the 「等授权」 pulse, the 「N 需关注」 count in
+    /// the status line, the agent glyph, error copy, and the focused
+    /// pane's border (`app::pane_chrome`). Not the unread dot, which is
+    /// `blue`.
     accent: Color32,
     /// [`Theme::is_light`], for egui's own light / dark visuals.
     light: bool,
@@ -120,6 +130,7 @@ struct Steps {
     select: f32,
     hover: f32,
     border: f32,
+    edge: f32,
     raised: f32,
     danger: f32,
     dim: f32,
@@ -134,6 +145,7 @@ const DARK_STEPS: Steps = Steps {
     select: 0.12,
     hover: 0.05,
     border: 0.10,
+    edge: 0.45,
     raised: 0.06,
     danger: 0.34,
     dim: 0.45,
@@ -143,16 +155,18 @@ const DARK_STEPS: Steps = Steps {
 
 /// White goes dirty long before 0.22, so a light theme steps about a
 /// twentieth of that toward black. The amounts that run toward the
-/// foreground are not scaled the same way: `border` has to clear `select`
-/// (they are a step from the same fill, and at equal amounts a widget's
-/// stroke vanishes into its own fill), and `raised` has to lift a panel
-/// off a white terminal, where a 0.06 step is 1.12:1.
+/// foreground are not scaled the same way — they have to carry the same
+/// separation on a fill that starts far brighter: `hover` and `select`
+/// have to stay apart from the fill they sit on (at 0.06 / 0.14 they were
+/// 1.10:1 and 1.31:1), `border` has to clear `select`, and `raised` has
+/// to lift a panel off a white terminal, where a 0.06 step is 1.12:1.
 const LIGHT_STEPS: Steps = Steps {
     sidebar: 0.045,
     preview: 0.075,
-    select: 0.14,
-    hover: 0.06,
+    select: 0.18,
+    hover: 0.10,
     border: 0.26,
+    edge: 0.50,
     raised: 0.10,
     danger: 0.16,
     dim: 0.34,
@@ -171,6 +185,30 @@ pub fn border(t: &Theme) -> Rgb {
         t.foreground,
         Palette::steps(t).border,
     )
+}
+
+/// Text color for an error notice. `danger` is only a sixth of the way
+/// from the background toward `ansi[1]`, so the background itself tops out
+/// near 3:1 on it (3.14:1 over every possible pair) — a custom foreground
+/// sitting close to that fill leaves *both* of the theme's own ends
+/// unreadable. Prefer the theme's ends, and drop to plain black or white
+/// only when neither clears [`BODY_TEXT_CONTRAST`]; one of those two
+/// always clears 4.58:1 against any fill.
+fn on_danger(text: Rgb, bg: Rgb, danger: Rgb) -> Rgb {
+    let theirs = if contrast_ratio(text, danger) >= contrast_ratio(bg, danger) {
+        text
+    } else {
+        bg
+    };
+    if contrast_ratio(theirs, danger) >= BODY_TEXT_CONTRAST {
+        return theirs;
+    }
+    let (black, white) = ([0, 0, 0], [255, 255, 255]);
+    if contrast_ratio(black, danger) >= contrast_ratio(white, danger) {
+        black
+    } else {
+        white
+    }
 }
 
 impl Palette {
@@ -222,18 +260,10 @@ impl Palette {
             preview_bg: c32(mix(bg, black, s.preview)),
             preview_fg: fade(s.preview_fg),
             border: c32(border(t)),
+            edge: c32(mix(sidebar, fg, s.edge)),
             raised: c32(mix(bg, fg, s.raised)),
             danger: c32(danger),
-            // A custom `ansi[1]` can be any red, so the error notice takes
-            // whichever of the theme's two ends reads better on it rather
-            // than assuming the foreground does.
-            danger_fg: c32(
-                if contrast_ratio(text, danger) >= contrast_ratio(bg, danger) {
-                    text
-                } else {
-                    bg
-                },
-            ),
+            danger_fg: c32(on_danger(text, bg, danger)),
             // A raised surface is lighter in both modes: for a light theme
             // that is the terminal background itself, above the grayer
             // sidebar.
@@ -298,6 +328,9 @@ fn visuals(pal: &Palette) -> egui::Visuals {
     v.error_fg_color = pal.red;
     v.selection.bg_fill = pal.select;
     v.selection.stroke = Stroke::new(1.0, pal.fg);
+    // egui hardcodes a blue caret in `Visuals::light()`; the rename field
+    // sits on `preview_bg`, where the foreground reads best.
+    v.text_cursor.stroke = Stroke::new(2.0, pal.fg);
     v.widgets.noninteractive.bg_fill = pal.bg;
     v.widgets.noninteractive.weak_bg_fill = pal.bg;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal.border);
@@ -1073,7 +1106,7 @@ fn mismatch_panel(
         .show(ctx, |ui| {
             egui::Frame::new()
                 .fill(pal.raised)
-                .stroke(Stroke::new(1.0, pal.border))
+                .stroke(Stroke::new(1.0, pal.edge))
                 .corner_radius(8.0)
                 .inner_margin(Margin::same(16))
                 .show(ui, |ui| {
@@ -2097,7 +2130,7 @@ impl Sidebar {
                         };
                         egui::Frame::new()
                             .fill(fill)
-                            .stroke(Stroke::new(1.0, pal.border))
+                            .stroke(Stroke::new(1.0, pal.edge))
                             .corner_radius(6.0)
                             .inner_margin(Margin::symmetric(10, 6))
                             .show(ui, |ui| {
@@ -2212,6 +2245,16 @@ mod tests {
     use super::*;
     use crate::theme::ACCENT_CONTRAST;
 
+    /// Floors for surfaces that are meant to read as "this row is under
+    /// the pointer" / "this row is the current one" / "a panel is
+    /// floating here". They sit below WCAG's 3:1 on purpose: these are
+    /// fills behind text, not the text or the boundary itself. The
+    /// numbers are what the dark theme already achieved (1.33 / 1.66 /
+    /// 1.21), rounded down.
+    const HOVER_CONTRAST: f32 = 1.15;
+    const SELECT_CONTRAST: f32 = 1.35;
+    const PANEL_CONTRAST: f32 = 1.15;
+
     /// A painted color back as the theme's own `[u8; 3]`.
     fn rgb(c: Color32) -> Rgb {
         let [r, g, b, _] = c.to_srgba_unmultiplied();
@@ -2283,6 +2326,59 @@ mod tests {
         assert_eq!(badge(&AgentState::Thinking, 1), "◓", "spinner advances");
     }
 
+    /// The presets are not the product — "可以自定义" is. Everything
+    /// else here runs on the two built-in themes, where `on_danger`
+    /// always takes the theme's own foreground, so its fallback and the
+    /// whole derivation on a custom theme had no cover at all.
+    #[test]
+    fn a_custom_theme_still_derives_a_readable_sidebar() {
+        // A soft-gray foreground and a pale red: the notice fill lands on
+        // #fff7f7, where the better of the theme's two ends reads
+        // 2.28:1. Neither can carry text on this theme's own error
+        // notice, so `on_danger` has to leave the theme.
+        let mut t = Theme::light();
+        t.foreground = [0x9a, 0xa0, 0xa6];
+        t.cursor = t.foreground;
+        t.palette[1] = [0xff, 0xd0, 0xcc];
+        let p = Palette::from_theme(&t);
+        let danger = rgb(p.danger);
+        let text = mix(t.foreground, t.background, 0.08);
+        assert!(contrast_ratio(text, danger) < BODY_TEXT_CONTRAST);
+        assert!(contrast_ratio(t.background, danger) < BODY_TEXT_CONTRAST);
+        assert_ne!(rgb(p.danger_fg), text, "the theme's foreground was kept");
+        assert_ne!(rgb(p.danger_fg), t.background, "the background was kept");
+        let r = contrast_ratio(rgb(p.danger_fg), danger);
+        assert!(r >= BODY_TEXT_CONTRAST, "an error notice reads at {r:.2}:1");
+
+        // A plausible custom theme: warm paper and a green accent,
+        // nothing else set. Every surface derived from it has to survive.
+        let mut warm = Theme::light();
+        warm.background = [0xff, 0xfd, 0xf6];
+        warm.cursor_text = warm.background;
+        warm.accent = [0x0a, 0x7d, 0x55];
+        let p = Palette::from_theme(&warm);
+        let sidebar = rgb(p.bg);
+        assert_ne!(sidebar, warm.background, "the sidebar took the tint too");
+        for (label, c, floor) in [
+            ("fg", p.fg, BODY_TEXT_CONTRAST),
+            ("dim", p.dim, ACCENT_CONTRAST),
+            ("accent", p.accent, ACCENT_CONTRAST),
+            ("hover", p.hover, HOVER_CONTRAST),
+            ("select", p.select, SELECT_CONTRAST),
+        ] {
+            let r = contrast_ratio(rgb(c), sidebar);
+            assert!(r >= floor, "{label} is {r:.2}:1 on the custom sidebar");
+        }
+        let outline = contrast_ratio(rgb(p.edge), warm.background);
+        assert!(outline >= ACCENT_CONTRAST, "panel outline {outline:.2}:1");
+
+        // egui hardcodes a blue caret in its light visuals; a custom
+        // theme must not inherit it.
+        let v = visuals(&p);
+        assert_eq!(v.text_cursor.stroke.color, p.fg);
+        assert_ne!(v.text_cursor.stroke.color, Color32::from_rgb(0, 83, 125));
+    }
+
     /// Two surfaces that land on the same color are invisible against
     /// each other, and a check that only compares each one to the
     /// background cannot see it: the light theme's `select` and `border`
@@ -2298,6 +2394,7 @@ mod tests {
                 ("hover", p.hover),
                 ("select", p.select),
                 ("border", p.border),
+                ("edge", p.edge),
                 ("preview_bg", p.preview_bg),
                 ("raised", p.raised),
                 ("popup", p.popup),
@@ -2330,20 +2427,19 @@ mod tests {
         assert_ne!(rgb(p.select), mix(light.background, fg, LIGHT_STEPS.select));
         assert_ne!(rgb(p.hover), mix(light.background, fg, LIGHT_STEPS.hover));
 
-        // Why it matters: at the hover amount the terminal-derived tint
-        // is indistinguishable from the fill it is drawn on, and at both
-        // amounts it is a weaker step away from that fill than ours.
-        let vanished = mix(light.background, fg, LIGHT_STEPS.hover);
-        assert!(
-            contrast_ratio(vanished, sidebar) < 1.05,
-            "{vanished:02x?} on {sidebar:02x?} would have been visible after all"
-        );
-        for amount in [LIGHT_STEPS.hover, LIGHT_STEPS.select] {
-            let theirs = contrast_ratio(mix(light.background, fg, amount), sidebar);
-            let ours = contrast_ratio(mix(sidebar, fg, amount), sidebar);
+        // A floor, not "different from the fill": deriving these from the
+        // terminal background lands on 1.10:1 and 1.31:1, which an
+        // inequality check waves through — that is how the first fix went
+        // in without a guard. A hovered row and a selected row have to be
+        // seen.
+        for (label, c, floor) in [
+            ("hover", p.hover, HOVER_CONTRAST),
+            ("select", p.select, SELECT_CONTRAST),
+        ] {
+            let r = contrast_ratio(rgb(c), sidebar);
             assert!(
-                ours > theirs,
-                "at {amount}: {ours:.2} is no better than {theirs:.2}"
+                r >= floor,
+                "{label} is {r:.2}:1 on the sidebar, want {floor}"
             );
         }
 
@@ -2426,13 +2522,30 @@ mod tests {
                 assert!(r >= floor, "{name}: {label} is {r:.2}:1 on the sidebar");
             }
             // Notices and the mismatch banner float over the terminal.
+            // Their fill is only a step off it, so the outline is what
+            // says where the panel is: a UI boundary, held to 3:1. Being
+            // merely unequal to the terminal is not a check — #f2f2f2 on
+            // #ffffff passes that and is 1.12:1.
+            let terminal = theme.background;
+            let outline = contrast_ratio(rgb(p.edge), terminal);
+            assert!(
+                outline >= ACCENT_CONTRAST,
+                "{name}: the panel outline is {outline:.2}:1 on the terminal"
+            );
             for (label, fill, on) in [
                 ("raised", p.raised, p.fg),
                 ("danger", p.danger, p.danger_fg),
             ] {
-                assert_ne!(rgb(fill), theme.background, "{name}: {label} invisible");
+                let seen = contrast_ratio(rgb(fill), terminal);
+                assert!(
+                    seen >= PANEL_CONTRAST,
+                    "{name}: {label} is {seen:.2}:1 on the terminal it floats over"
+                );
                 let r = contrast_ratio(rgb(on), rgb(fill));
-                assert!(r >= 4.5, "{name}: text on {label} is {r:.2}:1");
+                assert!(
+                    r >= BODY_TEXT_CONTRAST,
+                    "{name}: text on {label} is {r:.2}:1"
+                );
             }
         }
     }
@@ -2795,18 +2908,19 @@ mod tests {
     /// terminal menu and checks the theme's colors reach the shapes.
     #[test]
     fn egui_dialogs_and_menus_paint_with_the_theme() {
-        fn fills(shape: &egui::Shape, out: &mut Vec<Color32>) {
+        // Fill *and* stroke of each rect, as a pair: "the border color is
+        // somewhere in the frame" is not a check, because a TextEdit's own
+        // bg_stroke is that color too — the window can lose its outline
+        // entirely and the color still shows up.
+        fn fills(shape: &egui::Shape, out: &mut Vec<(Color32, Color32)>) {
             match shape {
-                egui::Shape::Rect(r) => {
-                    out.push(r.fill);
-                    out.push(r.stroke.color);
-                }
+                egui::Shape::Rect(r) => out.push((r.fill, r.stroke.color)),
                 egui::Shape::Vec(v) => v.iter().for_each(|s| fills(s, out)),
                 _ => {}
             }
         }
         let painted = |out: &egui::FullOutput| {
-            let mut v = Vec::new();
+            let mut v: Vec<(Color32, Color32)> = Vec::new();
             for c in &out.shapes {
                 fills(&c.shape, &mut v);
             }
@@ -2844,15 +2958,12 @@ mod tests {
                 shapes = painted(&out);
             }
             assert!(
-                shapes.contains(&pal.popup),
-                "{name}: the rename dialog is not on the theme's popup fill"
+                shapes.contains(&(pal.popup, pal.border)),
+                "{name}: the dialog's own frame is not the theme's popup fill \
+                 outlined in the theme's border"
             );
             assert!(
-                shapes.contains(&pal.border),
-                "{name}: the rename dialog has no theme border"
-            );
-            assert!(
-                egui_own == pal.popup || !shapes.contains(&egui_own),
+                egui_own == pal.popup || !shapes.iter().any(|&(f, _)| f == egui_own),
                 "{name}: egui's own window fill is still painted"
             );
 
@@ -2873,7 +2984,7 @@ mod tests {
                 shapes = painted(&out);
             }
             assert!(
-                shapes.contains(&pal.popup),
+                shapes.iter().any(|&(f, _)| f == pal.popup),
                 "{name}: the terminal menu is not on the theme's popup fill"
             );
         }

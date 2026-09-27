@@ -176,8 +176,9 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 [theme]          preset = "light"          # "light"（默认，白底）| "dark"
                  background = "#ffffff"    foreground = "#1f2328"
                  cursor = "#1f2328"        cursor_text = "#ffffff"
-                 accent = "#b35c00"        # 「等授权」脉冲、未读计数、聚焦 pane 边框
-                 ansi = ["#383a42", "#e45649", ...]   # 正好 16 个
+                 accent = "#b35c00"        # 「等授权」脉冲、状态行「N 需关注」、agent 图标、出错文案、聚焦 pane 边框
+                                           # （未读圆点用的是蓝色 palette[4]，不走 accent）
+                 ansi = ["#383a42", "#c84c40", ...]   # 正好 16 个
 [agents.claude]  resume_command = "claude --resume {id}"
 [[keybind]]      key = "cmd+k"   action = "command_palette"
 ```
