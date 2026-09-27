@@ -115,6 +115,32 @@ pub struct Divider {
 }
 
 impl Divider {
+    /// Where the divider can be grabbed: its line widened across the split
+    /// to `reach` (never narrower than the line). The line stays thin and
+    /// the grab area overlaps the panes' edges, as in macOS split views.
+    pub fn grab_rect(&self, reach: f32) -> Rect {
+        let r = self.rect;
+        match self.axis {
+            Axis::Horizontal => {
+                let grow = ((reach - r.w) / 2.0).max(0.0);
+                Rect::new(r.x - grow, r.y, r.w + 2.0 * grow, r.h)
+            }
+            Axis::Vertical => {
+                let grow = ((reach - r.h) / 2.0).max(0.0);
+                Rect::new(r.x, r.y - grow, r.w, r.h + 2.0 * grow)
+            }
+        }
+    }
+
+    /// The center of the line along the split's axis: where
+    /// [`Self::ratio_at`] puts it back.
+    pub fn center(&self) -> f32 {
+        match self.axis {
+            Axis::Horizontal => self.rect.x + self.rect.w / 2.0,
+            Axis::Vertical => self.rect.y + self.rect.h / 2.0,
+        }
+    }
+
     /// The ratio that centers this divider on `pos`, the pointer coordinate
     /// along the split's axis (x for side by side, y for stacked).
     pub fn ratio_at(&self, pos: f32, divider: f32) -> f32 {
@@ -148,9 +174,15 @@ impl Layout {
         self.panes.iter().copied().find(|p| p.rect.contains(x, y))
     }
 
-    /// The divider under a point.
-    pub fn divider_at(&self, x: f32, y: f32) -> Option<&Divider> {
-        self.dividers.iter().find(|d| d.rect.contains(x, y))
+    /// The divider that can be grabbed at a point: its line, else its
+    /// grab area ([`Divider::grab_rect`], `reach` wide), which wins over the
+    /// pane edges it overlaps.
+    pub fn divider_at(&self, x: f32, y: f32, reach: f32) -> Option<&Divider> {
+        let on = |r: Rect| r.contains(x, y);
+        self.dividers
+            .iter()
+            .find(|d| on(d.rect))
+            .or_else(|| self.dividers.iter().find(|d| on(d.grab_rect(reach))))
     }
 }
 
@@ -611,13 +643,39 @@ mod tests {
         assert_eq!(l.pane_at(700.0, 400.0).map(|p| p.session), Some(s[2]));
         assert!(l.pane_at(602.0, 10.0).is_none(), "the divider is no pane");
         assert_eq!(
-            l.divider_at(602.0, 10.0).map(|d| d.axis),
+            l.divider_at(602.0, 10.0, 0.0).map(|d| d.axis),
             Some(Axis::Horizontal)
         );
+        assert_eq!(l.dividers[0].center(), 603.0);
+        assert_eq!(l.dividers[1].center(), 303.0);
         // A single pane is the whole area.
         let one = PaneTree::Leaf(s[0]).layout(AREA, DIV);
         assert_eq!(one.panes[0].rect, AREA);
         assert!(one.dividers.is_empty());
+    }
+
+    #[test]
+    fn a_thin_divider_is_grabbed_beyond_its_line() {
+        let (t, s) = three();
+        // A 2 px line, grabbed within 12 px (1 pt / 6 pt at 2x).
+        let l = t.layout(AREA, 2.0);
+        let v = &l.dividers[0];
+        assert_eq!(v.rect, Rect::new(602.0, 0.0, 2.0, 606.0));
+        assert_eq!(v.grab_rect(12.0), Rect::new(597.0, 0.0, 12.0, 606.0));
+        let h = &l.dividers[1];
+        assert_eq!(h.grab_rect(12.0), Rect::new(604.0, 297.0, 502.0, 12.0));
+        assert_eq!(v.grab_rect(1.0), v.rect, "never narrower than the line");
+        // Over a pane's edge: the divider is grabbed; the pane is still
+        // the pane there (for a right-click, the wheel).
+        assert_eq!(l.pane_at(599.0, 10.0).map(|p| p.session), Some(s[0]));
+        let at = |x, y| l.divider_at(x, y, 12.0).map(|d| d.path.clone());
+        assert_eq!(at(599.0, 10.0), Some(SplitPath(vec![])));
+        assert_eq!(at(608.0, 10.0), Some(SplitPath(vec![])));
+        assert_eq!(at(596.0, 10.0), None);
+        assert_eq!(at(700.0, 298.0), Some(SplitPath(vec![Branch::Second])));
+        // On one's line inside the other's grab area: the line wins.
+        assert_eq!(at(606.0, 303.0), Some(SplitPath(vec![Branch::Second])));
+        assert_eq!(at(700.0, 250.0), None);
     }
 
     #[test]

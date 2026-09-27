@@ -58,8 +58,11 @@ use crate::theme::{mix, rgba, Theme};
 
 /// Padding around the grid (Ghostty's default `window-padding-x/y = 2`).
 pub const PADDING_PT: f32 = 2.0;
-/// The gap between split panes, draggable (DESIGN §17.3).
-const DIVIDER_PT: f32 = 6.0;
+/// The line between split panes (DESIGN §17.3: a thin line).
+const DIVIDER_PT: f32 = 1.0;
+/// Where a divider can be grabbed and dragged: this wide, centered on its
+/// line (wider than the line on purpose, as in macOS split views).
+const DIVIDER_GRAB_PT: f32 = 6.0;
 /// A pane's border in a split: highlighted when focused, dark otherwise.
 const BORDER_PT: f32 = 1.0;
 const BLINK: Duration = Duration::from_millis(530);
@@ -266,35 +269,48 @@ fn traffic_label(ctl: &mut Controller) -> String {
     )
 }
 
-/// Dividers and pane borders of a split layout (nothing for one pane):
-/// dividers in the sidebar's shade, the focused pane's border in the
-/// accent color, the others dark.
+/// Dividers and pane borders of a split layout (nothing for one pane). A
+/// pane's border lies on the divider lines around it (inside the pane only
+/// at the edge of the terminal area, `area`), so neighbours are one thin
+/// line apart: dark, or the accent color along the focused pane, whose
+/// border is drawn last. `gap` is the divider line's width.
 fn pane_chrome(
     layout: &Layout,
     focused: Option<SessionId>,
     theme: &Theme,
     scale: f32,
+    area: PxRect,
+    gap: f32,
 ) -> Vec<QuadInstance> {
     if layout.panes.len() < 2 {
         return Vec::new();
     }
-    let divider = mix(theme.background, [0, 0, 0], 0.22);
-    let dark = mix(divider, theme.foreground, 0.10);
+    let dark = mix(
+        mix(theme.background, [0, 0, 0], 0.22),
+        theme.foreground,
+        0.10,
+    );
     let accent = theme.palette[4];
     let t = (BORDER_PT * scale).round().max(1.0);
     let r = |r: PxRect| [r.x, r.y, r.w, r.h];
     let mut quads: Vec<QuadInstance> = layout
         .dividers
         .iter()
-        .map(|d| fill_quad(r(d.rect), rgba(divider, 1.0)))
+        .map(|d| fill_quad(r(d.rect), rgba(dark, 1.0)))
         .collect();
-    for p in &layout.panes {
+    let mut panes: Vec<_> = layout.panes.iter().collect();
+    panes.sort_by_key(|p| Some(p.session) == focused);
+    for p in panes {
         let color = if Some(p.session) == focused {
             accent
         } else {
             dark
         };
-        quads.push(outline_quad(r(p.rect), t, rgba(color, 1.0)));
+        let (x0, y0) = ((p.rect.x - gap).max(area.x), (p.rect.y - gap).max(area.y));
+        let x1 = (p.rect.right() + gap).min(area.right());
+        let y1 = (p.rect.bottom() + gap).min(area.bottom());
+        let outer = PxRect::new(x0, y0, x1 - x0, y1 - y0);
+        quads.push(outline_quad(r(outer), t, rgba(color, 1.0)));
     }
     quads
 }
@@ -888,17 +904,18 @@ impl App {
             .layout()
             .map(|t| t.layout(g.area, g.divider))
             .unwrap_or_default();
+        let reach = (DIVIDER_GRAB_PT * gfx.scale).round();
+        let along = |d: &Divider| match d.axis {
+            Axis::Horizontal => px,
+            Axis::Vertical => py,
+        };
 
         // A divider drag owns the pointer until the button is released.
-        if let Some(d) = gfx.mouse.drag.clone() {
+        if let Some((d, offset)) = gfx.mouse.drag.clone() {
             match event {
                 WindowEvent::CursorMoved { .. } => {
-                    let along = match d.axis {
-                        Axis::Horizontal => px,
-                        Axis::Vertical => py,
-                    };
-                    self.ctl
-                        .set_ratio(&d.path, d.ratio_at(along, g.divider), now);
+                    let ratio = d.ratio_at(along(&d) - offset, g.divider);
+                    self.ctl.set_ratio(&d.path, ratio, now);
                     gfx.dirty = true;
                 }
                 WindowEvent::MouseInput {
@@ -917,7 +934,7 @@ impl App {
             let hover = if dialog || over_egui {
                 None
             } else {
-                layout.divider_at(px, py).map(|d| d.axis)
+                layout.divider_at(px, py, reach).map(|d| d.axis)
             };
             if hover != gfx.mouse.divider_hover {
                 gfx.mouse.divider_hover = hover;
@@ -1004,8 +1021,10 @@ impl App {
                     return;
                 }
                 if b == Button::Left {
-                    if let Some(d) = layout.divider_at(px, py) {
-                        gfx.mouse.drag = Some(d.clone());
+                    if let Some(d) = layout.divider_at(px, py, reach) {
+                        // Grabbed off-center: the line keeps its distance
+                        // to the pointer instead of jumping under it.
+                        gfx.mouse.drag = Some((d.clone(), along(d) - d.center()));
                         return;
                     }
                 }
@@ -1316,7 +1335,7 @@ impl App {
                 .mouse
                 .drag
                 .as_ref()
-                .map(|d| d.axis)
+                .map(|(d, _)| d.axis)
                 .or(gfx.mouse.divider_hover),
             mismatch: mismatch.as_ref(),
             demo_hover,
@@ -1862,8 +1881,9 @@ struct MouseState {
     /// Time, pane, cell and count of the last click (double / triple click).
     last_click: Option<(Instant, SessionId, (u16, u16), u8)>,
     wheel: WheelAccum,
-    /// A split divider is being dragged.
-    drag: Option<Divider>,
+    /// A split divider is being dragged, grabbed this far (px, along its
+    /// axis) from its line's center.
+    drag: Option<(Divider, f32)>,
     /// The pointer is over a divider (resize cursor).
     divider_hover: Option<Axis>,
 }
@@ -2332,7 +2352,14 @@ impl Gfx {
                     });
                 }
                 if let Some(layout) = &layout {
-                    chrome_quads = pane_chrome(layout, focused_pane, &self.theme, self.scale);
+                    chrome_quads = pane_chrome(
+                        layout,
+                        focused_pane,
+                        &self.theme,
+                        self.scale,
+                        g.area,
+                        g.divider,
+                    );
                 }
             }
         }

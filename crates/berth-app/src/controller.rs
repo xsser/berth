@@ -864,8 +864,10 @@ impl Controller {
         effects
     }
 
+    /// Someone sees `sid`: the window has the focus and a pane shows it,
+    /// focused or not (the sidebar and the Dock badge still count it).
     fn attended(&self, sid: SessionId) -> bool {
-        self.focused == Some(sid) && self.window_focused
+        self.window_focused && self.is_shown(sid)
     }
 
     /// No desktop notification for `sid`: it is being looked at, or it is
@@ -3076,7 +3078,7 @@ mod tests {
         assert!(c
             .handle(&mut out, changed(a.id, AgentState::Done), now)
             .is_empty());
-        // b is not focused.
+        // b is not on screen.
         let fx = c.handle(&mut out, changed(b.id, AgentState::WaitingInput), now);
         assert_eq!(
             fx,
@@ -3104,6 +3106,52 @@ mod tests {
             now,
         );
         assert_eq!(c.session(b.id).unwrap().agent.kind, AgentKind::Shell);
+    }
+
+    #[test]
+    fn a_session_in_a_visible_pane_does_not_notify_while_the_window_has_focus() {
+        let w = ws(0);
+        let (a, b) = (session(&w, 0, true), session(&w, 1, true));
+        let mut c = Controller::new(notify::DEFAULT_ON.iter().map(|s| s.to_string()).collect());
+        let mut out = Fake::default();
+        listed(&mut c, &mut out, vec![w], vec![a.clone(), b.clone()]);
+        let now = Instant::now();
+        c.open_in_split(&mut out, b.id, SplitDir::Right, now);
+        c.focus(&mut out, a.id, now);
+        assert_eq!(c.focused(), Some(a.id));
+        let changed = |state| {
+            push(Event::AgentChanged {
+                session: b.id,
+                agent: AgentInfo {
+                    kind: AgentKind::Claude,
+                    state,
+                    ..Default::default()
+                },
+            })
+        };
+        let note = || {
+            push(Event::Notify {
+                session: b.id,
+                title: None,
+                body: "hi".into(),
+            })
+        };
+        // b is on screen beside the focused pane: no notification.
+        assert!(c
+            .handle(&mut out, changed(AgentState::WaitingInput), now)
+            .is_empty());
+        assert!(c.handle(&mut out, note(), now).is_empty());
+        assert_eq!(c.attention_count(), 1, "the badge still counts it");
+        // Nobody looks at the window: it notifies.
+        c.set_window_focused(&mut out, false);
+        assert_eq!(c.handle(&mut out, changed(AgentState::Done), now).len(), 1);
+        // Back, with b out of the split: it notifies (after the repeat
+        // window of the previous one).
+        c.set_window_focused(&mut out, true);
+        assert!(c.remove_from_split(&mut out, b.id, now));
+        let later = now + notify::REPEAT_WINDOW + Duration::from_secs(1);
+        let fx = c.handle(&mut out, changed(AgentState::WaitingInput), later);
+        assert_eq!(fx.len(), 1);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! [`Policy`] decides (pure, unit-tested): an `AgentChanged` whose state
 //! needs attention, is listed in `[notify].on`, differs from the session's
 //! previous state (statusline updates repeat the state), for a session that
-//! is not being looked at (unfocused, or the window is unfocused), at most
+//! is not being looked at (in no pane, or the window is unfocused), at most
 //! once per session per [`REPEAT_WINDOW`]. Programs' own OSC 9 / 777
 //! notifications follow the same focus and repeat rules.
 //!
@@ -41,7 +41,7 @@ impl Policy {
         self.state.insert(sid, state.name());
     }
 
-    /// `attended`: the session is focused and the window has focus.
+    /// `attended`: a pane shows the session and the window has focus.
     pub fn agent_changed(
         &mut self,
         sid: SessionId,
