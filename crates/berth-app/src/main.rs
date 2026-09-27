@@ -4,12 +4,13 @@
 //! Without a subcommand the GUI starts: it connects to `berthd` (launching
 //! it when nothing listens) and shows the daemon's sessions.
 //! Modules: `app` (winit ApplicationHandler, run modes), `client` (daemon
-//! connection), `controller` (protocol state), `session_view` (screen and
-//! history mirror), `renderer/{grid, atlas, text, metrics, sprites,
-//! shaders.wgsl}`, `sidebar` (egui), `input` (key encoding), `ime`, `mouse`,
-//! `paste`, `selection`, `notify`, `dock` (Dock badge), `cli` (list / doctor
-//! / debug), `setup_hooks`, `fixture` (`--bench` data), `theme`, `timefmt`,
-//! `config`, `stats`.
+//! connection), `controller` (protocol state), `panes` (split layout),
+//! `gui_state` (`gui-state.json`), `session_view` (screen and history
+//! mirror), `renderer/{grid, atlas, text, metrics, sprites, shaders.wgsl}`,
+//! `sidebar` (egui), `menus` (context menus), `input` (key encoding), `ime`,
+//! `mouse`, `paste`, `selection`, `notify`, `dock` (Dock badge), `cli`
+//! (list / doctor / debug), `setup_hooks`, `fixture` (`--bench` data),
+//! `theme`, `timefmt`, `config`, `stats`.
 
 mod app;
 mod cli;
@@ -18,11 +19,14 @@ mod config;
 mod controller;
 mod dock;
 mod fixture;
+mod gui_state;
 mod ime;
 mod input;
+mod menus;
 mod mismatch;
 mod mouse;
 mod notify;
+mod panes;
 mod paste;
 mod renderer;
 mod selection;
@@ -39,8 +43,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use berth_core::{CursorShape, Paths};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
+
+use crate::panes::SplitDir;
 
 #[derive(Parser, Debug)]
 #[command(name = "berth", version, about = "berth terminal")]
@@ -69,6 +75,15 @@ struct GuiArgs {
     /// Focus this session (id or unique prefix) at start.
     #[arg(long, value_name = "ID")]
     session: Option<String>,
+    /// Also show this session in a pane right of the last one added (or of
+    /// the pane showing TARGET); applied in command-line order together
+    /// with `--split-down`, starting from `--session` (screenshot check;
+    /// ids or unique prefixes; repeatable).
+    #[arg(long, value_name = "SID[@TARGET]", hide = true, requires = "session")]
+    split_right: Vec<String>,
+    /// Like `--split-right`, below.
+    #[arg(long, value_name = "SID[@TARGET]", hide = true, requires = "session")]
+    split_down: Vec<String>,
     /// Scroll the focused session N lines into its history once shown.
     #[arg(long, value_name = "N", hide = true)]
     scroll: Option<u32>,
@@ -110,6 +125,9 @@ struct GuiArgs {
     /// (end-to-end check only).
     #[arg(long, hide = true)]
     demo_restart: bool,
+    /// Open the sidebar's 「归档」 section at start (screenshot check only).
+    #[arg(long, hide = true)]
+    demo_archive_open: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -187,9 +205,9 @@ fn main() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    let cli = Cli::parse();
+    let (cli, splits) = parse_cli(std::env::args_os()).unwrap_or_else(|e| e.exit());
     match cli.cmd {
-        None => app::run(gui_options(cli.gui)),
+        None => app::run(gui_options(cli.gui, splits)),
         Some(Cmd::List(args)) => cli::list(&Paths::resolve(), &args),
         Some(Cmd::Doctor) => cli::doctor(&Paths::resolve()),
         Some(Cmd::Debug(cmd)) => cli::debug(&Paths::resolve(), cmd),
@@ -201,8 +219,35 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn gui_options(gui: GuiArgs) -> app::GuiOptions {
+/// The command line, plus `--split-right` / `--split-down` in the order
+/// they were given (two lists lose it).
+fn parse_cli<I, T>(args: I) -> Result<(Cli, Vec<(SplitDir, String)>), clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let matches = Cli::command().try_get_matches_from(args)?;
+    let cli = Cli::from_arg_matches(&matches).map_err(|e| e.format(&mut Cli::command()))?;
+    Ok((cli, split_order(&matches)))
+}
+
+fn split_order(matches: &ArgMatches) -> Vec<(SplitDir, String)> {
+    let mut all: Vec<(usize, SplitDir, String)> = Vec::new();
+    for (id, dir) in [
+        ("split_right", SplitDir::Right),
+        ("split_down", SplitDir::Down),
+    ] {
+        if let (Some(at), Some(values)) = (matches.indices_of(id), matches.get_many::<String>(id)) {
+            all.extend(at.zip(values).map(|(i, v)| (i, dir, v.clone())));
+        }
+    }
+    all.sort_by_key(|&(i, ..)| i);
+    all.into_iter().map(|(_, dir, v)| (dir, v)).collect()
+}
+
+fn gui_options(gui: GuiArgs, splits: Vec<(SplitDir, String)>) -> app::GuiOptions {
     app::GuiOptions {
+        splits,
         screenshot_delay: if gui.screenshot.is_some() {
             Duration::from_millis(gui.screenshot_delay_ms)
         } else {
@@ -222,6 +267,7 @@ fn gui_options(gui: GuiArgs) -> app::GuiOptions {
         demo_preedit: gui.demo_preedit,
         demo_hover: gui.demo_hover,
         demo_restart: gui.demo_restart,
+        demo_archive_open: gui.demo_archive_open,
     }
 }
 
@@ -269,7 +315,7 @@ mod tests {
             "--stats",
         ])
         .unwrap();
-        let opts = gui_options(cli.gui);
+        let opts = gui_options(cli.gui, Vec::new());
         assert_eq!(opts.screenshot_delay, Duration::from_millis(1500));
         assert_eq!(opts.session.as_deref(), Some("ab12"));
         assert_eq!(opts.cells, Some((90, 30)));
@@ -300,5 +346,44 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn split_flags_keep_their_command_line_order() {
+        let (cli, splits) = parse_cli([
+            "berth",
+            "--screenshot",
+            "/tmp/split.png",
+            "--session",
+            "A",
+            "--split-right",
+            "B",
+            "--split-down",
+            "C@A",
+            "--stats",
+            "--split-down",
+            "D@B",
+            "--split-right",
+            "E",
+        ])
+        .unwrap();
+        let want = |d, s: &str| (d, s.to_string());
+        assert_eq!(
+            splits,
+            vec![
+                want(SplitDir::Right, "B"),
+                want(SplitDir::Down, "C@A"),
+                want(SplitDir::Down, "D@B"),
+                want(SplitDir::Right, "E"),
+            ]
+        );
+        let opts = gui_options(cli.gui, splits.clone());
+        assert_eq!(opts.splits, splits);
+        assert_eq!(opts.session.as_deref(), Some("A"));
+        assert!(opts.stats);
+        let (_, none) = parse_cli(["berth", "--session", "A"]).unwrap();
+        assert!(none.is_empty());
+        // Splits are placed relative to the pane of `--session`.
+        assert!(parse_cli(["berth", "--split-right", "B"]).is_err());
     }
 }

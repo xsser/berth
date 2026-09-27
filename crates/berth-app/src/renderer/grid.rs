@@ -1,10 +1,17 @@
-//! Terminal grid renderer (DESIGN §8.1).
+//! Terminal grid renderer (DESIGN §8.1, §17.3).
 //!
 //! Each frame is three instanced layers drawn in one render pass:
 //! 1. background quads (cell backgrounds merged per run, selection, block cursor),
 //! 2. glyph quads sampled 1:1 from the atlas (mask or color page),
 //! 3. decoration quads (underline variants, strikeout, beam/underline/hollow
 //!    cursor, IME preedit underline and caret).
+//!
+//! Split panes share the renderer — one glyph atlas, one shaping cache, one
+//! upload per layer: every pane's instances are built into the same layers
+//! and remembered as ranges, then each layer is drawn pane by pane with the
+//! pane's scissor rect (glyphs that overhang a cell never reach the
+//! neighbour). A full atlas rebuilds the whole frame, every pane. The pane
+//! chrome (dividers, focus borders) is drawn last, over the whole window.
 
 use berth_core::{
     char_cells, CellFlags, CursorShape, LineSnapshot, ScreenSnapshot, Style, StyleId, StyleTable,
@@ -12,6 +19,8 @@ use berth_core::{
 };
 use bytemuck::{Pod, Zeroable};
 use std::mem::size_of;
+use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use super::atlas::{AtlasEntry, AtlasFull, AtlasKind, GlyphAtlas};
 use super::metrics::{CellMetrics, FaceMetrics};
@@ -49,6 +58,24 @@ const QUAD_DOTTED: f32 = 2.0;
 const QUAD_DASHED: f32 = 3.0;
 const QUAD_HOLLOW: f32 = 4.0;
 
+/// A filled rectangle of the pane chrome (a divider).
+pub fn fill_quad(rect: [f32; 4], color: [f32; 4]) -> QuadInstance {
+    QuadInstance {
+        rect,
+        color,
+        params: [QUAD_SOLID; 4],
+    }
+}
+
+/// The inner `thickness` px of `rect` (a pane's border).
+pub fn outline_quad(rect: [f32; 4], thickness: f32, color: [f32; 4]) -> QuadInstance {
+    QuadInstance {
+        rect,
+        color,
+        params: [QUAD_HOLLOW, thickness, 0.0, 0.0],
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Globals {
@@ -76,6 +103,32 @@ pub struct GridLayout {
     pub origin: [f32; 2],
     pub cols: u16,
     pub rows: u16,
+}
+
+/// One pane of a frame.
+pub struct PaneInput<'a> {
+    pub frame: FrameInput<'a>,
+    pub layout: GridLayout,
+    /// The pixels the pane may draw into (x, y, w, h).
+    pub clip: [u32; 4],
+}
+
+/// A pane's instances within the frame's layers.
+#[derive(Clone, Debug)]
+struct PaneDraw {
+    clip: [u32; 4],
+    bg: Range<u32>,
+    glyphs: Range<u32>,
+    deco: Range<u32>,
+}
+
+/// `rect` (x, y, w, h in px) as a scissor rect inside `viewport`.
+pub fn clip_rect(rect: [f32; 4], viewport: [u32; 2]) -> [u32; 4] {
+    let x0 = rect[0].round().clamp(0.0, viewport[0] as f32) as u32;
+    let y0 = rect[1].round().clamp(0.0, viewport[1] as f32) as u32;
+    let x1 = (rect[0] + rect[2]).round().clamp(0.0, viewport[0] as f32) as u32;
+    let y1 = (rect[1] + rect[3]).round().clamp(0.0, viewport[1] as f32) as u32;
+    [x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)]
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -187,13 +240,30 @@ impl<T: Pod> Layer<T> {
         }
     }
 
-    fn draw(&self, pass: &mut wgpu::RenderPass<'_>, pipeline: &wgpu::RenderPipeline) {
-        if self.cpu.is_empty() {
-            return;
+    fn len(&self) -> u32 {
+        self.cpu.len() as u32
+    }
+
+    /// Draw instance ranges, each clipped to its scissor rect.
+    fn draw_ranges(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        pipeline: &wgpu::RenderPipeline,
+        ranges: impl Iterator<Item = ([u32; 4], Range<u32>)>,
+    ) {
+        let mut bound = false;
+        for (clip, range) in ranges {
+            if range.is_empty() || clip[2] == 0 || clip[3] == 0 {
+                continue;
+            }
+            if !bound {
+                pass.set_pipeline(pipeline);
+                pass.set_vertex_buffer(0, self.gpu.slice(..));
+                bound = true;
+            }
+            pass.set_scissor_rect(clip[0], clip[1], clip[2], clip[3]);
+            pass.draw(0..4, range);
         }
-        pass.set_pipeline(pipeline);
-        pass.set_vertex_buffer(0, self.gpu.slice(..));
-        pass.draw(0..4, 0..self.cpu.len() as u32);
     }
 }
 
@@ -214,6 +284,13 @@ pub struct GridRenderer {
     deco: Layer<QuadInstance>,
     cells: Vec<Cell>,
     colors: Vec<CellColors>,
+    /// This frame's panes (their ranges in the layers).
+    draws: Vec<PaneDraw>,
+    /// This frame's pane chrome, in `deco`.
+    chrome: Range<u32>,
+    /// How long building each pane's instances took this frame.
+    pane_times: Vec<Duration>,
+    viewport: [u32; 2],
 }
 
 fn bind_group(
@@ -370,7 +447,17 @@ impl GridRenderer {
             deco: Layer::new(device, "grid-deco"),
             cells: Vec::new(),
             colors: Vec::new(),
+            draws: Vec::new(),
+            chrome: 0..0,
+            pane_times: Vec::new(),
+            viewport: [1, 1],
         })
+    }
+
+    /// Instance building time of each pane of the last frame (in the order
+    /// they were given).
+    pub fn pane_times(&self) -> &[Duration] {
+        &self.pane_times
     }
 
     pub fn metrics(&self) -> CellMetrics {
@@ -422,18 +509,20 @@ impl GridRenderer {
         ]
     }
 
-    /// Build and upload this frame's instances.
+    /// Build and upload this frame's instances: every pane, then the pane
+    /// chrome (drawn over the whole window).
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        input: &FrameInput,
-        layout: &GridLayout,
+        panes: &[PaneInput],
+        chrome: &[QuadInstance],
         viewport: [u32; 2],
     ) -> PrepareStats {
         let mut stats = PrepareStats::default();
+        self.viewport = viewport;
         for attempt in 0..3 {
-            match self.build(input, layout, &mut stats) {
+            match self.build_frame(panes, chrome, &mut stats) {
                 Ok(()) => break,
                 Err(AtlasFull(kind)) => {
                     stats.atlas_rebuilds += 1;
@@ -478,9 +567,54 @@ impl GridRenderer {
 
     pub fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_bind_group(0, &self.bind_group, &[]);
-        self.bg.draw(pass, &self.quad_pipeline);
-        self.glyphs.draw(pass, &self.glyph_pipeline);
-        self.deco.draw(pass, &self.quad_pipeline);
+        let panes =
+            |pick: fn(&PaneDraw) -> Range<u32>| self.draws.iter().map(move |d| (d.clip, pick(d)));
+        self.bg
+            .draw_ranges(pass, &self.quad_pipeline, panes(|d| d.bg.clone()));
+        self.glyphs
+            .draw_ranges(pass, &self.glyph_pipeline, panes(|d| d.glyphs.clone()));
+        self.deco
+            .draw_ranges(pass, &self.quad_pipeline, panes(|d| d.deco.clone()));
+        let [w, h] = self.viewport;
+        let window = [0, 0, w, h];
+        self.deco.draw_ranges(
+            pass,
+            &self.quad_pipeline,
+            std::iter::once((window, self.chrome.clone())),
+        );
+        // Whatever draws next (the sidebar) starts unclipped.
+        pass.set_scissor_rect(0, 0, w, h);
+    }
+
+    fn build_frame(
+        &mut self,
+        panes: &[PaneInput],
+        chrome: &[QuadInstance],
+        stats: &mut PrepareStats,
+    ) -> Result<(), AtlasFull> {
+        self.bg.cpu.clear();
+        self.glyphs.cpu.clear();
+        self.deco.cpu.clear();
+        self.draws.clear();
+        self.pane_times.clear();
+        for p in panes {
+            let started = Instant::now();
+            let (bg, glyphs, deco) = (self.bg.len(), self.glyphs.len(), self.deco.len());
+            self.build(&p.frame, &p.layout, stats)?;
+            self.draws.push(PaneDraw {
+                clip: p.clip,
+                bg: bg..self.bg.len(),
+                glyphs: glyphs..self.glyphs.len(),
+                deco: deco..self.deco.len(),
+            });
+            self.pane_times.push(started.elapsed());
+        }
+        let start = self.deco.len();
+        for q in chrome {
+            Self::quad(&mut self.deco.cpu, q.rect, q.color, q.params);
+        }
+        self.chrome = start..self.deco.len();
+        Ok(())
     }
 
     fn glyph_entry(
@@ -590,9 +724,6 @@ impl GridRenderer {
         layout: &GridLayout,
         stats: &mut PrepareStats,
     ) -> Result<(), AtlasFull> {
-        self.bg.cpu.clear();
-        self.glyphs.cpu.clear();
-        self.deco.cpu.clear();
         let m = self.metrics;
         let (cw, ch) = (m.cell_w as f32, m.cell_h as f32);
         let [ox, oy] = layout.origin;
@@ -871,6 +1002,22 @@ mod tests {
         assert_eq!(l.caret, Some(4));
         let l = preedit_layout(&p, 3, 10, 120);
         assert_eq!(l.start, 10);
+    }
+
+    #[test]
+    fn pane_clips_stay_inside_the_viewport() {
+        let vp = [1000, 600];
+        assert_eq!(
+            clip_rect([100.0, 0.0, 450.0, 600.0], vp),
+            [100, 0, 450, 600]
+        );
+        assert_eq!(
+            clip_rect([556.4, 303.0, 444.0, 297.0], vp),
+            [556, 303, 444, 297]
+        );
+        // Partly or entirely outside: clamped, possibly empty.
+        assert_eq!(clip_rect([900.0, -5.0, 200.0, 50.0], vp), [900, 0, 100, 45]);
+        assert_eq!(clip_rect([1200.0, 0.0, 10.0, 10.0], vp), [1000, 0, 0, 10]);
     }
 
     #[test]

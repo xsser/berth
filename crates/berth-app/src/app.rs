@@ -26,9 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use berth_core::{
-    ClientRole, CursorShape, Dims, Paths, Request, ScreenSnapshot, StyleTable, TermModes,
-};
+use berth_core::{ClientRole, CursorShape, Paths, Request, SessionId, TermModes};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, WindowEvent};
@@ -41,19 +39,32 @@ use crate::config::Config;
 use crate::controller::{Controller, Effect, Outbound};
 use crate::dock::DockBadge;
 use crate::fixture::{Fixture, COLS, ROWS};
+use crate::gui_state;
 use crate::ime::{ImeOutcome, ImeState};
 use crate::input::{self, ImeGate, KeyAction, KeyPress, Mods, ScrollKey, Shortcut};
+use crate::menus::{self, AppEffect, RenameTarget};
 use crate::mismatch::Mismatch;
 use crate::mouse::{self, Button, MouseEvent, WheelAccum};
 use crate::notify::Notifier;
-use crate::renderer::{CellMetrics, FrameInput, GridLayout, GridRenderer, PrepareStats};
-use crate::selection::{Point, Selection, SelectionKind};
+use crate::panes::{Axis, Divider, Geometry, Layout, Rect as PxRect, SplitDir};
+use crate::renderer::{
+    clip_rect, fill_quad, outline_quad, CellMetrics, FrameInput, GridLayout, GridRenderer,
+    PaneInput, PrepareStats, QuadInstance,
+};
+use crate::selection::{Point, Selection, SelectionKind, SelectionSpans};
 use crate::sidebar::{Chrome, Sidebar, UiAction};
-use crate::stats::{FrameStats, FrameTiming};
-use crate::theme::Theme;
+use crate::stats::{FrameStats, FrameTiming, PaneSample};
+use crate::theme::{mix, rgba, Theme};
 
 /// Padding around the grid (Ghostty's default `window-padding-x/y = 2`).
 pub const PADDING_PT: f32 = 2.0;
+/// The line between split panes (DESIGN §17.3: a thin line).
+const DIVIDER_PT: f32 = 1.0;
+/// Where a divider can be grabbed and dragged: this wide, centered on its
+/// line (wider than the line on purpose, as in macOS split views).
+const DIVIDER_GRAB_PT: f32 = 6.0;
+/// A pane's border in a split: highlighted when focused, dark otherwise.
+const BORDER_PT: f32 = 1.0;
 const BLINK: Duration = Duration::from_millis(530);
 const SIDEBAR_TICK: Duration = Duration::from_millis(250);
 const TARGET_MS: f64 = 8.0;
@@ -63,6 +74,8 @@ const STATS_WINDOW: Duration = Duration::from_secs(5);
 const OFFSCREEN_INTERVAL: Duration = Duration::from_millis(8);
 const RECONNECT_MAX: Duration = Duration::from_secs(10);
 const MULTI_CLICK: Duration = Duration::from_millis(400);
+/// How long quitting waits for the last `gui-state.json` write.
+const LAYOUT_SAVE_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Default)]
 pub struct GuiOptions {
@@ -71,6 +84,9 @@ pub struct GuiOptions {
     pub screenshot_delay: Duration,
     /// Focus this session id (or unique prefix) at start.
     pub session: Option<String>,
+    /// With `session`: more panes at start, in order (`SID` or
+    /// `SID@TARGET`, see [`Controller::want_split`]).
+    pub splits: Vec<(SplitDir, String)>,
     /// Scroll the focused session this many lines up once it is shown.
     pub scroll: Option<u32>,
     pub stats: bool,
@@ -93,6 +109,8 @@ pub struct GuiOptions {
     /// (end-to-end check; a screenshot waits for the restarted daemon's
     /// session list instead of the banner).
     pub demo_restart: bool,
+    /// Open the sidebar's 「归档」 section at start (screenshot check).
+    pub demo_archive_open: bool,
 }
 
 /// Events from other threads.
@@ -116,6 +134,8 @@ pub enum UserEvent {
     },
     /// ⌘⇧N folder picker: `Ok(None)` when cancelled.
     FolderPicked(std::result::Result<Option<PathBuf>, String>),
+    /// A `gui-state.json` write failed; the saver has the message.
+    LayoutSaveFailed,
 }
 
 pub fn run(opts: GuiOptions) -> Result<()> {
@@ -202,8 +222,8 @@ impl LiveStats {
     }
 
     /// Record a frame; true when the current window is complete.
-    fn record(&mut self, start: Instant, t: FrameTiming) -> bool {
-        self.window.record(start, t);
+    fn record(&mut self, start: Instant, t: FrameTiming, panes: &[PaneSample]) -> bool {
+        self.window.record_frame(start, t, panes);
         self.total_frames += 1;
         self.started.elapsed() >= STATS_WINDOW
     }
@@ -232,15 +252,71 @@ impl LiveStats {
 /// What the daemon sent during a stats window.
 fn traffic_label(ctl: &mut Controller) -> String {
     let c = ctl.take_counters();
-    let dims = ctl.view().map(|v| v.dims()).unwrap_or_default();
+    let sizes: Vec<String> = ctl
+        .layout()
+        .map(|t| t.leaves())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|sid| ctl.pane_view(sid))
+        .map(|v| format!("{}×{}", v.dims().cols, v.dims().rows))
+        .collect();
+    let shown = match sizes.as_slice() {
+        [] => "focused 0×0".to_string(),
+        [one] => format!("focused {one}"),
+        many => format!("{} panes {}", many.len(), many.join(" ")),
+    };
     format!(
-        "focused {}×{}: {} screen updates applied; sidebar: {} preview updates from {} sessions",
-        dims.cols,
-        dims.rows,
+        "{shown}: {} screen updates applied; sidebar: {} preview updates from {} sessions",
         c.screens,
         c.previews,
         c.preview_sessions.len()
     )
+}
+
+/// Dividers and pane borders of a split layout (nothing for one pane). A
+/// pane's border lies on the divider lines around it (inside the pane only
+/// at the edge of the terminal area, `area`), so neighbours are one thin
+/// line apart: dark, or the accent color along the focused pane, whose
+/// border is drawn last. `gap` is the divider line's width.
+fn pane_chrome(
+    layout: &Layout,
+    focused: Option<SessionId>,
+    theme: &Theme,
+    scale: f32,
+    area: PxRect,
+    gap: f32,
+) -> Vec<QuadInstance> {
+    if layout.panes.len() < 2 {
+        return Vec::new();
+    }
+    let dark = mix(
+        mix(theme.background, [0, 0, 0], 0.22),
+        theme.foreground,
+        0.10,
+    );
+    let accent = theme.palette[4];
+    let t = (BORDER_PT * scale).round().max(1.0);
+    let r = |r: PxRect| [r.x, r.y, r.w, r.h];
+    let mut quads: Vec<QuadInstance> = layout
+        .dividers
+        .iter()
+        .map(|d| fill_quad(r(d.rect), rgba(dark, 1.0)))
+        .collect();
+    let mut panes: Vec<_> = layout.panes.iter().collect();
+    panes.sort_by_key(|p| Some(p.session) == focused);
+    for p in panes {
+        let color = if Some(p.session) == focused {
+            accent
+        } else {
+            dark
+        };
+        let (x0, y0) = ((p.rect.x - gap).max(area.x), (p.rect.y - gap).max(area.y));
+        let x1 = (p.rect.right() + gap).min(area.right());
+        let y1 = (p.rect.bottom() + gap).min(area.bottom());
+        let outer = PxRect::new(x0, y0, x1 - x0, y1 - y0);
+        quads.push(outline_quad(r(outer), t, rgba(color, 1.0)));
+    }
+    quads
 }
 
 /// Requests while no connection exists fail with a visible error.
@@ -294,6 +370,11 @@ struct App {
     error: Option<anyhow::Error>,
     /// When `run_app` was entered (startup breakdown: launch → resumed).
     loop_started: Option<Instant>,
+    /// Writes `gui-state.json` (interactive runs only: screenshots and
+    /// benches show what their flags say and leave the saved layout alone).
+    layout_saver: Option<gui_state::Saver>,
+    /// The focused pane as of the last focus in/out report.
+    pane_focus: Option<SessionId>,
 }
 
 impl App {
@@ -308,6 +389,9 @@ impl App {
         let mut ctl = Controller::new(config.notify_on.clone());
         if let Some(want) = &opts.session {
             ctl.want_session(want.clone());
+            for (dir, spec) in &opts.splits {
+                ctl.want_split(*dir, spec.clone());
+            }
         }
         let vsync = if opts.no_vsync { "no vsync" } else { "vsync" };
         let mode = if let Some(path) = &opts.screenshot {
@@ -348,6 +432,23 @@ impl App {
         };
         let exit_at = opts.exit_after.map(|d| t0 + d);
         let dock = (!matches!(mode, Mode::Bench { .. })).then(DockBadge::default);
+        let gui_state_path = matches!(mode, Mode::Interactive).then(|| gui_state::path(&paths));
+        if let Some(path) = &gui_state_path {
+            match gui_state::load(path) {
+                Ok(Some(state)) => ctl.restore(state),
+                Ok(None) => {}
+                Err(e) => ctl.info(format!("分屏布局未恢复：{e}")),
+            }
+        }
+        let layout_saver = gui_state_path.and_then(|path| {
+            let wake = proxy.clone();
+            let spawned = gui_state::Saver::spawn(path, move || {
+                let _ = wake.send_event(UserEvent::LayoutSaveFailed);
+            });
+            spawned
+                .map_err(|e| ctl.error(format!("分屏布局保存线程无法启动：{e}")))
+                .ok()
+        });
         Self {
             live_stats: opts.stats.then(LiveStats::new),
             pending_scroll: opts.scroll.map(i64::from),
@@ -376,6 +477,8 @@ impl App {
             exit_at,
             error: None,
             loop_started: None,
+            layout_saver,
+            pane_focus: None,
         }
     }
 
@@ -393,8 +496,61 @@ impl App {
     }
 
     fn quit(&mut self, event_loop: &ActiveEventLoop) {
+        // The layout as the window closes (once it is known: before the
+        // first listing it would replace the saved one with nothing), on
+        // disk before the process ends.
+        if let Some(mut saver) = self.layout_saver.take() {
+            if self.ctl.layout_ready() {
+                saver.save(self.ctl.gui_state());
+            }
+            if !saver.finish(LAYOUT_SAVE_WAIT) {
+                tracing::warn!(
+                    "gui-state.json not written within {LAYOUT_SAVE_WAIT:?}; quitting without it"
+                );
+            }
+            while let Some(e) = saver.take_error() {
+                tracing::warn!("{e}");
+            }
+        }
         self.mode = Mode::Exiting;
         event_loop.exit();
+    }
+
+    /// Hand a layout or focus change to the `gui-state.json` writer (a
+    /// divider drag once it ends); the UI does not wait for the write.
+    fn save_layout(&mut self) {
+        let Some(saver) = &self.layout_saver else {
+            return;
+        };
+        if self.gfx.as_ref().is_some_and(|g| g.mouse.drag.is_some()) {
+            return;
+        }
+        if let Some(state) = self.ctl.take_layout_changed() {
+            saver.save(state);
+        }
+    }
+
+    /// Focus in/out reports (DECSET 1004) when the focused pane changes
+    /// while the window has focus.
+    fn report_pane_focus(&mut self, now: Instant) {
+        let current = self.ctl.focused();
+        if current == self.pane_focus {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.pane_focus, current);
+        if !self.gfx.as_ref().is_some_and(|g| g.focused) {
+            return;
+        }
+        for (sid, seq) in [(previous, b"\x1b[O"), (current, b"\x1b[I")] {
+            let Some(sid) = sid else { continue };
+            let wants = self
+                .ctl
+                .pane_view(sid)
+                .is_some_and(|v| v.modes().contains(TermModes::FOCUS_IN_OUT));
+            if wants {
+                self.ctl.report_to(out!(self), sid, seq.to_vec(), now);
+            }
+        }
     }
 
     fn redraw_soon(&mut self) {
@@ -561,6 +717,13 @@ impl App {
                     Err(e) => self.ctl.error(format!("目录选择失败：{e}")),
                 }
             }
+            UserEvent::LayoutSaveFailed => {
+                if let Some(saver) = &self.layout_saver {
+                    while let Some(e) = saver.take_error() {
+                        self.ctl.error(e);
+                    }
+                }
+            }
         }
         self.redraw_soon();
     }
@@ -619,13 +782,13 @@ impl App {
             match press.logical {
                 WinitKey::Named(NamedKey::Escape) => {
                     if self.ctl.confirm().is_some() {
-                        self.ctl.answer_confirm(out!(self), false);
+                        self.ctl.answer_confirm(out!(self), false, now);
                     } else {
                         self.palette_open = false;
                     }
                 }
                 WinitKey::Named(NamedKey::Enter) if self.ctl.confirm().is_some() => {
-                    self.ctl.answer_confirm(out!(self), true);
+                    self.ctl.answer_confirm(out!(self), true, now);
                 }
                 _ => {}
             }
@@ -672,23 +835,52 @@ impl App {
             Shortcut::Quit => self.quit(event_loop),
             Shortcut::NewSession => self.ctl.new_session(out!(self)),
             Shortcut::NewWorkspace => self.pick_folder(),
-            Shortcut::Close => self.ctl.request_close(out!(self)),
+            Shortcut::Close => self.ctl.request_close(out!(self), now),
             Shortcut::Jump(n) => self.ctl.jump(out!(self), usize::from(n), now),
             Shortcut::Palette => self.palette_open = !self.palette_open,
-            Shortcut::Copy => {
-                if let Some(text) = self.ctl.copy_text() {
-                    if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
-                        self.ctl.error(format!("无法写入剪贴板：{e}"));
-                    }
-                }
-            }
-            Shortcut::Paste => match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-                Ok(text) => self.ctl.paste(out!(self), &text, now),
-                Err(arboard::Error::ContentNotAvailable) => self.ctl.info("剪贴板里没有文本"),
-                Err(e) => self.ctl.error(format!("无法读取剪贴板：{e}")),
-            },
+            Shortcut::Copy => self.copy_selection(),
+            Shortcut::Paste => self.paste_clipboard(now),
+            Shortcut::Split(dir) => self.ctl.split(out!(self), dir),
+            Shortcut::FocusPane(dir) => self.ctl.focus_dir(out!(self), dir, now),
             Shortcut::Unbound(chord) => {
                 tracing::debug!(chord, "unbound GUI shortcut");
+            }
+        }
+    }
+
+    /// ⌘C / 「复制」: the focused pane's selection.
+    fn copy_selection(&mut self) {
+        if let Some(text) = self.ctl.copy_text() {
+            if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
+                self.ctl.error(format!("无法写入剪贴板：{e}"));
+            }
+        }
+    }
+
+    /// ⌘V / 「粘贴」: into the focused pane's session.
+    fn paste_clipboard(&mut self, now: Instant) {
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(text) => self.ctl.paste(out!(self), &text, now),
+            Err(arboard::Error::ContentNotAvailable) => self.ctl.info("剪贴板里没有文本"),
+            Err(e) => self.ctl.error(format!("无法读取剪贴板：{e}")),
+        }
+    }
+
+    /// What a context menu entry left to the app.
+    fn app_effect(&mut self, effect: AppEffect, now: Instant) {
+        match effect {
+            AppEffect::Copy => self.copy_selection(),
+            AppEffect::Paste => self.paste_clipboard(now),
+            AppEffect::Rename(target) => {
+                let current = match target {
+                    RenameTarget::Session(sid) => {
+                        self.ctl.session(sid).map(|m| m.title().to_string())
+                    }
+                    RenameTarget::Workspace(id) => self.ctl.workspace(id).map(|w| w.name.clone()),
+                };
+                if let (Some(current), Some(gfx)) = (current, self.gfx.as_mut()) {
+                    gfx.sidebar.begin_rename(target, &current);
+                }
             }
         }
     }
@@ -713,38 +905,89 @@ impl App {
 
     // -- mouse ---------------------------------------------------------------
 
-    /// Pointer events for the terminal area (egui got them first).
+    /// Pointer events for the terminal area (egui got them first), routed
+    /// by pane (DESIGN §17.2–§17.3): a divider drags the split ratio; the
+    /// first click on a pane only focuses it; a plain right-click opens the
+    /// terminal menu (⇧+right-click goes to a program that reads the mouse);
+    /// presses, motion and selections belong to the focused pane; the wheel
+    /// scrolls (or is reported to) the pane under the pointer.
     fn on_pointer(&mut self, event: &WindowEvent) {
         let Some(gfx) = self.gfx.as_mut() else { return };
         if let WindowEvent::CursorMoved { position, .. } = event {
             gfx.mouse.pos = Some(*position);
         }
-        let dialog = self.ctl.confirm().is_some() || self.palette_open;
+        let dialog =
+            self.ctl.confirm().is_some() || self.palette_open || gfx.sidebar.wants_keyboard();
         let over_egui = gfx.sidebar.wants_pointer();
         let now = Instant::now();
         let Some(pos) = gfx.mouse.pos else { return };
-        let in_grid = gfx.in_grid(pos);
-        let Some(view) = self.ctl.view() else { return };
-        if !view.has_screen() {
+        let (px, py) = (pos.x as f32, pos.y as f32);
+        let g = gfx.geometry;
+        let layout = self
+            .ctl
+            .layout()
+            .map(|t| t.layout(g.area, g.divider))
+            .unwrap_or_default();
+        let reach = (DIVIDER_GRAB_PT * gfx.scale).round();
+        let along = |d: &Divider| match d.axis {
+            Axis::Horizontal => px,
+            Axis::Vertical => py,
+        };
+
+        // A divider drag owns the pointer until the button is released.
+        if let Some((d, offset)) = gfx.mouse.drag.clone() {
+            match event {
+                WindowEvent::CursorMoved { .. } => {
+                    let ratio = d.ratio_at(along(&d) - offset, g.divider);
+                    self.ctl.set_ratio(&d.path, ratio, now);
+                    gfx.dirty = true;
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Released,
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    gfx.mouse.drag = None;
+                    gfx.dirty = true;
+                }
+                _ => {}
+            }
             return;
         }
-        let modes = view.modes();
-        let dims = view.dims();
-        let cols = gfx.layout.cols.min(dims.cols);
-        let rows = gfx.layout.rows.min(dims.rows);
+        if let WindowEvent::CursorMoved { .. } = event {
+            let hover = if dialog || over_egui {
+                None
+            } else {
+                layout.divider_at(px, py, reach).map(|d| d.axis)
+            };
+            if hover != gfx.mouse.divider_hover {
+                gfx.mouse.divider_hover = hover;
+                gfx.dirty = true;
+            }
+        }
+        let under = layout.pane_at(px, py).map(|p| p.session);
+        let focused = self.ctl.focused();
         let m = gfx.grid.metrics();
-        let (col, row) = mouse::cell_at(
-            pos.x - f64::from(gfx.layout.origin[0]),
-            pos.y - f64::from(gfx.layout.origin[1]),
-            f64::from(m.cell_w),
-            f64::from(m.cell_h),
-            cols,
-            rows,
-        );
+        // The cell under the pointer in `sid`'s pane, clamped to it.
+        let cell_in = |ctl: &Controller, sid: SessionId| -> Option<(u16, u16)> {
+            let rect = layout.panes.iter().find(|p| p.session == sid)?.rect;
+            let dims = ctl.pane_view(sid)?.dims();
+            let fit = g.cells(rect);
+            let [ox, oy] = g.origin(rect);
+            Some(mouse::cell_at(
+                pos.x - f64::from(ox),
+                pos.y - f64::from(oy),
+                f64::from(m.cell_w),
+                f64::from(m.cell_h),
+                fit.cols.min(dims.cols),
+                fit.rows.min(dims.rows),
+            ))
+        };
         let mods = Mods::from_winit(gfx.mods, true);
-        // ⇧ forces local selection even when the program reads the mouse.
-        let reporting = modes.mouse_reporting() && !mods.shift;
-        let top = view.top_line();
+        let unshifted = Mods {
+            shift: false,
+            ..mods
+        };
         match event {
             WindowEvent::MouseInput { state, button, .. } => {
                 let b = match button {
@@ -753,74 +996,174 @@ impl App {
                     MouseButton::Right => Button::Right,
                     _ => return,
                 };
-                let pressed = *state == ElementState::Pressed;
-                if pressed && (dialog || over_egui || !in_grid) {
+                if *state == ElementState::Released {
+                    if gfx.mouse.held == Some(b) {
+                        gfx.mouse.held = None;
+                    }
+                    if gfx.mouse.swallow == Some(b) {
+                        gfx.mouse.swallow = None;
+                        return;
+                    }
+                    // The release goes where the press went.
+                    if gfx.mouse.reported_press {
+                        gfx.mouse.reported_press = false;
+                        let Some(sid) = gfx.mouse.press_pane.take() else {
+                            return;
+                        };
+                        let modes = self
+                            .ctl
+                            .pane_view(sid)
+                            .map(|v| v.modes())
+                            .unwrap_or_default();
+                        let mods = if b == Button::Right { unshifted } else { mods };
+                        if let Some((col, row)) = cell_in(&self.ctl, sid) {
+                            let ev = MouseEvent::Release(b);
+                            if let Some(bytes) = mouse::report(ev, col, row, mods, modes) {
+                                self.ctl.report_to(out!(self), sid, bytes, now);
+                            }
+                        }
+                        return;
+                    }
+                    if b == Button::Left {
+                        if let Some(sid) = gfx.mouse.selecting.take() {
+                            if let Some(v) = self.ctl.pane_view_mut(sid) {
+                                if v.selection.as_ref().is_some_and(Selection::is_empty) {
+                                    v.selection = None;
+                                }
+                            }
+                            gfx.dirty = true;
+                        }
+                    }
                     return;
                 }
-                if pressed {
-                    gfx.mouse.held = Some(b);
-                } else if gfx.mouse.held == Some(b) {
-                    gfx.mouse.held = None;
+                if dialog || over_egui {
+                    return;
                 }
-                if reporting || (!pressed && gfx.mouse.reported_press) {
-                    gfx.mouse.reported_press = pressed;
+                if gfx.sidebar.menu_open() {
+                    // This click only closes the menu (egui does that).
+                    gfx.mouse.swallow = Some(b);
+                    return;
+                }
+                if b == Button::Left {
+                    if let Some(d) = layout.divider_at(px, py, reach) {
+                        // Grabbed off-center: the line keeps its distance
+                        // to the pointer instead of jumping under it.
+                        gfx.mouse.drag = Some((d.clone(), along(d) - d.center()));
+                        return;
+                    }
+                }
+                let Some(sid) = under else { return };
+                let Some(view) = self.ctl.pane_view(sid) else {
+                    return;
+                };
+                let modes = view.modes();
+                let has_screen = view.has_screen();
+                let has_selection = view.selection_span().is_some();
+                let reporting = has_screen && modes.mouse_reporting();
+                let pass_right = b == Button::Right && reporting && mods.shift;
+                if b == Button::Right && !pass_right {
+                    if focused != Some(sid) {
+                        self.ctl.focus(out!(self), sid, now);
+                    }
+                    let items = menus::terminal(menus::TerminalArea {
+                        sid,
+                        has_selection,
+                        panes: self.ctl.pane_count(),
+                    });
+                    let s = gfx.scale.max(0.1);
+                    gfx.sidebar
+                        .open_terminal_menu(egui::pos2(px / s, py / s), items);
+                    gfx.mouse.swallow = Some(b);
+                    gfx.dirty = true;
+                    return;
+                }
+                if focused != Some(sid) {
+                    // The first click on a pane only focuses it.
+                    self.ctl.focus(out!(self), sid, now);
+                    gfx.mouse.swallow = Some(b);
+                    gfx.dirty = true;
+                    return;
+                }
+                if !has_screen {
+                    return;
+                }
+                let Some((col, row)) = cell_in(&self.ctl, sid) else {
+                    return;
+                };
+                gfx.mouse.held = Some(b);
+                // ⇧ keeps a press local (selection) even when the program
+                // reads the mouse — except ⇧+right-click, passed through
+                // as a plain right-click.
+                if (reporting && !mods.shift) || pass_right {
+                    gfx.mouse.reported_press = true;
+                    gfx.mouse.press_pane = Some(sid);
                     gfx.mouse.last_cell = Some((col, row));
-                    let ev = if pressed {
-                        MouseEvent::Press(b)
-                    } else {
-                        MouseEvent::Release(b)
-                    };
-                    if let Some(bytes) = mouse::report(ev, col, row, mods, modes) {
-                        self.ctl.report(out!(self), bytes, now);
+                    let mods = if pass_right { unshifted } else { mods };
+                    if let Some(bytes) = mouse::report(MouseEvent::Press(b), col, row, mods, modes)
+                    {
+                        self.ctl.report_to(out!(self), sid, bytes, now);
                     }
                     return;
                 }
                 if b != Button::Left {
                     return;
                 }
-                if pressed {
-                    let count = match gfx.mouse.last_click {
-                        Some((t, cell, n)) if now - t < MULTI_CLICK && cell == (col, row) => {
-                            n % 3 + 1
-                        }
-                        _ => 1,
-                    };
-                    gfx.mouse.last_click = Some((now, (col, row), count));
-                    let kind = match count {
-                        2 => SelectionKind::Semantic,
-                        3 => SelectionKind::Lines,
-                        _ if gfx.mods.alt_key() => SelectionKind::Block,
-                        _ => SelectionKind::Simple,
-                    };
-                    gfx.mouse.selecting = true;
-                    let point = Point::new(top + u64::from(row), col);
-                    if let Some(v) = self.ctl.view_mut() {
-                        v.selection = Some(Selection::new(kind, point));
+                let count = match gfx.mouse.last_click {
+                    Some((t, s, cell, n))
+                        if now - t < MULTI_CLICK && s == sid && cell == (col, row) =>
+                    {
+                        n % 3 + 1
                     }
-                } else if gfx.mouse.selecting {
-                    gfx.mouse.selecting = false;
-                    if let Some(v) = self.ctl.view_mut() {
-                        if v.selection.as_ref().is_some_and(Selection::is_empty) {
-                            v.selection = None;
-                        }
-                    }
+                    _ => 1,
+                };
+                gfx.mouse.last_click = Some((now, sid, (col, row), count));
+                let kind = match count {
+                    2 => SelectionKind::Semantic,
+                    3 => SelectionKind::Lines,
+                    _ if gfx.mods.alt_key() => SelectionKind::Block,
+                    _ => SelectionKind::Simple,
+                };
+                gfx.mouse.selecting = Some(sid);
+                if let Some(v) = self.ctl.pane_view_mut(sid) {
+                    let point = Point::new(v.top_line() + u64::from(row), col);
+                    v.selection = Some(Selection::new(kind, point));
                 }
                 gfx.dirty = true;
             }
             WindowEvent::CursorMoved { .. } => {
-                if gfx.mouse.selecting {
-                    let point = Point::new(top + u64::from(row), col);
-                    if let Some(v) = self.ctl.view_mut() {
-                        if let Some(sel) = v.selection.as_mut() {
-                            sel.update(point);
+                if let Some(sid) = gfx.mouse.selecting {
+                    if let Some((col, row)) = cell_in(&self.ctl, sid) {
+                        if let Some(v) = self.ctl.pane_view_mut(sid) {
+                            let point = Point::new(v.top_line() + u64::from(row), col);
+                            if let Some(sel) = v.selection.as_mut() {
+                                sel.update(point);
+                            }
                         }
                     }
                     gfx.dirty = true;
                     return;
                 }
-                if !reporting || dialog || over_egui || !in_grid {
+                if dialog || over_egui {
                     return;
                 }
+                // Motion goes to the pane the press went to, else to the
+                // focused pane while the pointer is over it.
+                let target = if gfx.mouse.reported_press {
+                    gfx.mouse.press_pane
+                } else {
+                    focused.filter(|f| under == Some(*f) && !mods.shift)
+                };
+                let Some(sid) = target else { return };
+                let Some(view) = self.ctl.pane_view(sid) else {
+                    return;
+                };
+                let modes = view.modes();
+                if !view.has_screen() || !modes.mouse_reporting() {
+                    return;
+                }
+                let Some((col, row)) = cell_in(&self.ctl, sid) else {
+                    return;
+                };
                 if gfx.mouse.last_cell == Some((col, row)) {
                     return;
                 }
@@ -829,17 +1172,29 @@ impl App {
                     held: gfx.mouse.held,
                 };
                 if let Some(bytes) = mouse::report(ev, col, row, mods, modes) {
-                    self.ctl.report(out!(self), bytes, now);
+                    self.ctl.report_to(out!(self), sid, bytes, now);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if dialog || over_egui || !in_grid {
+                if dialog || over_egui {
                     return;
                 }
+                let Some(sid) = under else { return };
+                let Some(view) = self.ctl.pane_view(sid) else {
+                    return;
+                };
+                if !view.has_screen() {
+                    return;
+                }
+                let modes = view.modes();
+                let reporting = modes.mouse_reporting() && !mods.shift;
                 let lines = gfx.mouse.wheel.lines(*delta, f64::from(m.cell_h));
                 if lines == 0 {
                     return;
                 }
+                let Some((col, row)) = cell_in(&self.ctl, sid) else {
+                    return;
+                };
                 if reporting {
                     let ev = if lines > 0 {
                         MouseEvent::WheelUp
@@ -852,11 +1207,11 @@ impl App {
                             bytes.extend(b);
                         }
                     }
-                    self.ctl.report(out!(self), bytes, now);
+                    self.ctl.report_to(out!(self), sid, bytes, now);
                 } else if let Some(bytes) = mouse::alternate_scroll(lines, modes) {
-                    self.ctl.report(out!(self), bytes, now);
+                    self.ctl.report_to(out!(self), sid, bytes, now);
                 } else {
-                    self.ctl.scroll(out!(self), i64::from(lines), now);
+                    self.ctl.scroll_in(out!(self), sid, i64::from(lines), now);
                     gfx.dirty = true;
                 }
             }
@@ -880,12 +1235,43 @@ impl App {
             return Some("正在读取 session 列表…".into());
         }
         match self.ctl.focused() {
-            None => Some("没有 session：按 ⌘N / ⌘T 新建".into()),
-            Some(_) if !self.ctl.view().is_some_and(|v| v.has_screen()) => {
-                Some("正在打开 session…".into())
+            None if self.ctl.jump_order().is_empty() => {
+                Some("没有 session：按 ⌘N / ⌘T 新建".into())
             }
+            // The last pane was closed (⌘W, archived).
+            None => Some("没有打开的 session：点侧栏里的一个，或按 ⌘N / ⌘T 新建".into()),
+            // Panes without a screen yet get a note each (`pane_notes`).
             Some(_) => None,
         }
+    }
+
+    /// Panes still waiting for their first screen, in points.
+    fn pane_notes(&self, g: Geometry, scale: f32) -> Vec<(egui::Rect, &'static str)> {
+        if self.is_bench() || !self.ctl.is_loaded() {
+            return Vec::new();
+        }
+        let s = scale.max(0.1);
+        let Some(tree) = self.ctl.layout() else {
+            return Vec::new();
+        };
+        tree.layout(g.area, g.divider)
+            .panes
+            .iter()
+            .filter(|p| {
+                !self
+                    .ctl
+                    .pane_view(p.session)
+                    .is_some_and(|v| v.has_screen())
+            })
+            .map(|p| {
+                let r = p.rect;
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(r.x / s, r.y / s),
+                    egui::vec2(r.w / s, r.h / s),
+                );
+                (rect, "正在打开 session…")
+            })
+            .collect()
     }
 
     fn status_line(&self) -> Option<String> {
@@ -918,6 +1304,10 @@ impl App {
         let mismatch = self.mismatch.banner();
         let status = self.status_line();
         let title = self.window_title();
+        let pane_notes = match self.gfx.as_ref() {
+            Some(gfx) => self.pane_notes(gfx.geometry, gfx.scale),
+            None => Vec::new(),
+        };
         let Some(gfx) = self.gfx.as_mut() else {
             return Ok(());
         };
@@ -926,7 +1316,7 @@ impl App {
             gfx.window.set_title(&title);
             gfx.title = title;
         }
-        if let Some(v) = self.ctl.view_mut() {
+        for v in self.ctl.views_mut() {
             v.set_cursor_override(self.opts.cursor_style);
         }
         let focused = gfx.focused || gfx.force_focused;
@@ -964,6 +1354,13 @@ impl App {
             palette_open: self.palette_open,
             status: status.as_deref(),
             placeholder: placeholder.as_deref(),
+            pane_notes,
+            divider_hover: gfx
+                .mouse
+                .drag
+                .as_ref()
+                .map(|(d, _)| d.axis)
+                .or(gfx.mouse.divider_hover),
             mismatch: mismatch.as_ref(),
             demo_hover,
         };
@@ -982,7 +1379,7 @@ impl App {
         )?;
         gfx.last_frame = Instant::now();
         let (frame, actions) = rendered;
-        let Some((timing, captured)) = frame else {
+        let Some((timing, captured, panes)) = frame else {
             // No drawable this time (occluded); retried on the next redraw.
             self.apply_ui(actions);
             return Ok(());
@@ -997,7 +1394,7 @@ impl App {
             .is_some_and(|v| v.has_screen() && v.cursor_blinking());
         self.apply_ui(actions);
         if let Some(live) = self.live_stats.as_mut() {
-            if live.record(start, timing) {
+            if live.record(start, timing, &panes) {
                 live.report(&traffic_label(&mut self.ctl));
             }
         }
@@ -1067,7 +1464,7 @@ impl App {
                 UiAction::NewSession => self.ctl.new_session(out!(self)),
                 UiAction::NewSessionIn(ws) => self.ctl.new_session_in(out!(self), ws),
                 UiAction::NewWorkspace => self.pick_folder(),
-                UiAction::Confirm(yes) => self.ctl.answer_confirm(out!(self), yes),
+                UiAction::Confirm(yes) => self.ctl.answer_confirm(out!(self), yes, now),
                 UiAction::DismissNotice(i) => self.ctl.dismiss_notice(i),
                 UiAction::ClosePalette => self.palette_open = false,
                 UiAction::RestartDaemon => self.restart_daemon(),
@@ -1075,6 +1472,17 @@ impl App {
                     if !self.is_bench() {
                         self.ctl.set_visible(out!(self), &ids, now)
                     }
+                }
+                UiAction::Menu(action) => {
+                    if let Some(effect) = menus::apply(&mut self.ctl, out!(self), action, now) {
+                        self.app_effect(effect, now);
+                    }
+                }
+                UiAction::Rename(RenameTarget::Session(sid), title) => {
+                    self.ctl.rename(out!(self), sid, &title)
+                }
+                UiAction::Rename(RenameTarget::Workspace(id), name) => {
+                    self.ctl.rename_workspace(out!(self), id, &name)
                 }
             }
         }
@@ -1094,10 +1502,17 @@ impl App {
         self.ctl.is_connected()
             && self.ctl.is_loaded()
             && self.pending_scroll.is_none()
-            && match self.ctl.focused() {
-                None => true,
-                Some(_) => self.ctl.view().is_some_and(|v| v.visible_complete()),
-            }
+            && self
+                .ctl
+                .layout()
+                .map(|t| t.leaves())
+                .unwrap_or_default()
+                .iter()
+                .all(|sid| {
+                    self.ctl
+                        .pane_view(*sid)
+                        .is_some_and(|v| v.visible_complete())
+                })
             && self.demo_hover_ready()
     }
 
@@ -1157,7 +1572,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 gfx.window.request_redraw();
                 let now = Instant::now();
-                self.ctl.set_grid(gfx.grid_dims(), now);
+                self.ctl.set_geometry(gfx.geometry, now);
                 self.gfx = Some(gfx);
                 if let Some(w) = self.config_warning.take() {
                     self.ctl.error(w);
@@ -1184,10 +1599,35 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput {
+                device_id,
                 event,
                 is_synthetic,
-                ..
             } => {
+                if gfx.sidebar.wants_keyboard() {
+                    // The rename dialog has the keyboard; ⌘Q still quits.
+                    let quit = event.state == ElementState::Pressed
+                        && gfx.mods.super_key()
+                        && matches!(&event.logical_key, WinitKey::Character(c) if c.eq_ignore_ascii_case("q"));
+                    let ev = WindowEvent::KeyboardInput {
+                        device_id,
+                        event,
+                        is_synthetic,
+                    };
+                    gfx.sidebar.on_window_event(&gfx.window, &ev);
+                    gfx.dirty = true;
+                    if quit {
+                        self.quit(event_loop);
+                    }
+                    return;
+                }
+                if event.state == ElementState::Pressed
+                    && event.logical_key == WinitKey::Named(NamedKey::Escape)
+                    && gfx.sidebar.menu_open()
+                {
+                    gfx.sidebar.close_menus();
+                    gfx.dirty = true;
+                    return;
+                }
                 let mods = gfx.mods;
                 let press = KeyPress {
                     logical: &event.logical_key,
@@ -1197,6 +1637,16 @@ impl ApplicationHandler<UserEvent> for App {
                     mods,
                 };
                 self.on_key(event_loop, press);
+            }
+            WindowEvent::Ime(ime) if gfx.sidebar.wants_keyboard() => {
+                // Composition goes to the rename dialog's text field; the
+                // terminal only keeps track of the IME being on or off.
+                if matches!(ime, Ime::Enabled | Ime::Disabled) {
+                    gfx.ime.handle(&ime);
+                }
+                gfx.sidebar
+                    .on_window_event(&gfx.window, &WindowEvent::Ime(ime));
+                gfx.dirty = true;
             }
             WindowEvent::Ime(ime) => {
                 if let ImeOutcome::Commit(text) = gfx.ime.handle(&ime) {
@@ -1246,8 +1696,8 @@ impl ApplicationHandler<UserEvent> for App {
                 gfx.sidebar
                     .on_window_event(&gfx.window, &WindowEvent::Resized(size));
                 gfx.dirty = true;
-                let dims = gfx.grid_dims();
-                self.ctl.set_grid(dims, Instant::now());
+                let g = gfx.geometry;
+                self.ctl.set_geometry(g, Instant::now());
             }
             WindowEvent::ScaleFactorChanged {
                 scale_factor,
@@ -1262,13 +1712,14 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 gfx.sidebar.on_window_event(&gfx.window, &ev);
                 gfx.dirty = true;
-                let dims = gfx.grid_dims();
-                self.ctl.set_grid(dims, Instant::now());
+                let g = gfx.geometry;
+                self.ctl.set_geometry(g, Instant::now());
             }
             other => {
-                // Pointer events: egui first (sidebar, overlays, dialogs),
-                // then the terminal unless egui wants them. Keyboard and IME
-                // events never reach egui: the terminal owns them.
+                // Pointer events: egui first (sidebar, overlays, dialogs,
+                // menus), then the terminal unless egui wants them. Keyboard
+                // and IME events reach egui only while the rename dialog is
+                // open (above): otherwise the terminal owns them.
                 if gfx.sidebar.on_window_event(&gfx.window, &other) {
                     gfx.dirty = true;
                 }
@@ -1306,6 +1757,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.redraw_soon();
                 }
             }
+            self.report_pane_focus(now);
+            self.save_layout();
         }
         let ready = self.screenshot_ready();
         if let Mode::Screenshot {
@@ -1440,18 +1893,31 @@ struct MouseState {
     held: Option<Button>,
     /// The press went to the program: its release does too.
     reported_press: bool,
+    /// The pane that press went to.
+    press_pane: Option<SessionId>,
+    /// The press of this button did something else (focused a pane,
+    /// opened or closed a menu): its release is dropped.
+    swallow: Option<Button>,
     /// Last cell a motion was reported for.
     last_cell: Option<(u16, u16)>,
-    /// A local selection drag is in progress.
-    selecting: bool,
-    /// Time, cell and count of the last click (double / triple click).
-    last_click: Option<(Instant, (u16, u16), u8)>,
+    /// A local selection drag is in progress in this pane.
+    selecting: Option<SessionId>,
+    /// Time, pane, cell and count of the last click (double / triple click).
+    last_click: Option<(Instant, SessionId, (u16, u16), u8)>,
     wheel: WheelAccum,
+    /// A split divider is being dragged, grabbed this far (px, along its
+    /// axis) from its line's center.
+    drag: Option<(Divider, f32)>,
+    /// The pointer is over a divider (resize cursor).
+    divider_hover: Option<Axis>,
 }
 
-/// A frame's timing and capture (when one was drawn) plus the sidebar's
-/// actions.
-type Rendered = (Option<(FrameTiming, Option<Capture>)>, Vec<UiAction>);
+/// A frame's timing, capture (when one was drawn) and panes, plus the
+/// sidebar's actions.
+type Rendered = (
+    Option<(FrameTiming, Option<Capture>, Vec<PaneSample>)>,
+    Vec<UiAction>,
+);
 
 /// Pending surface readback for `--screenshot`.
 struct Capture {
@@ -1480,7 +1946,8 @@ struct Gfx {
     focused: bool,
     scale: f32,
     sidebar_width: f32,
-    layout: GridLayout,
+    /// The terminal area (right of the sidebar) that the panes split.
+    geometry: Geometry,
     blink_epoch: Instant,
     anim_epoch: Instant,
     last_frame: Instant,
@@ -1502,8 +1969,6 @@ struct Gfx {
     cursor_blinking: bool,
     title: String,
     mouse: MouseState,
-    empty: ScreenSnapshot,
-    empty_styles: StyleTable,
 }
 
 fn content_size(
@@ -1673,10 +2138,12 @@ impl Gfx {
             focused: true,
             scale,
             sidebar_width: config.sidebar_width,
-            layout: GridLayout {
-                origin: [0.0, 0.0],
-                cols: 0,
-                rows: 0,
+            geometry: Geometry {
+                area: PxRect::default(),
+                cell_w: 1.0,
+                cell_h: 1.0,
+                pad: 0.0,
+                divider: 0.0,
             },
             blink_epoch: now,
             anim_epoch: now,
@@ -1694,10 +2161,11 @@ impl Gfx {
             cursor_blinking: false,
             title: String::new(),
             mouse: MouseState::default(),
-            empty: ScreenSnapshot::default(),
-            empty_styles: StyleTable::new(),
         };
         gfx.update_layout();
+        if opts.demo_archive_open {
+            gfx.sidebar.open_archive();
+        }
         if let Some(text) = &opts.demo_preedit {
             gfx.ime.handle(&Ime::Enabled);
             gfx.ime
@@ -1722,32 +2190,43 @@ impl Gfx {
         self.update_layout();
     }
 
-    /// Recompute the grid origin and how many cells fit (HiDPI-aware).
+    /// Recompute the terminal area and the cell size (HiDPI-aware); one
+    /// pane covering it has its first cell at (sidebar + pad, pad).
     fn update_layout(&mut self) {
         let m = self.grid.metrics();
         let pad = (PADDING_PT * self.scale).round();
         let sidebar = (self.sidebar_width * self.scale).round();
-        let w = self.surface_config.width as f32 - sidebar - 2.0 * pad;
-        let h = self.surface_config.height as f32 - 2.0 * pad;
-        let cols = (w / m.cell_w as f32).floor().clamp(0.0, u16::MAX as f32) as u16;
-        let rows = (h / m.cell_h as f32).floor().clamp(0.0, u16::MAX as f32) as u16;
-        let layout = GridLayout {
-            origin: [sidebar + pad, pad],
-            cols,
-            rows,
+        let w = (self.surface_config.width as f32 - sidebar).max(0.0);
+        let h = self.surface_config.height as f32;
+        let geometry = Geometry {
+            area: PxRect::new(sidebar, 0.0, w, h),
+            cell_w: m.cell_w as f32,
+            cell_h: m.cell_h as f32,
+            pad,
+            divider: (DIVIDER_PT * self.scale).round(),
         };
-        if layout != self.layout {
-            if (layout.cols, layout.rows) != (self.layout.cols, self.layout.rows) {
-                tracing::info!(cols, rows, scale = self.scale, "grid size");
+        if geometry != self.geometry {
+            let (old, new) = (self.full_layout(), geometry.cells(geometry.area));
+            if (old.cols, old.rows) != (new.cols, new.rows) {
+                tracing::info!(
+                    cols = new.cols,
+                    rows = new.rows,
+                    scale = self.scale,
+                    "grid size"
+                );
             }
-            self.layout = layout;
+            self.geometry = geometry;
         }
     }
 
-    fn grid_dims(&self) -> Dims {
-        Dims {
-            cols: self.layout.cols,
-            rows: self.layout.rows,
+    /// One pane covering the whole terminal area (`--bench`, logs).
+    fn full_layout(&self) -> GridLayout {
+        let g = self.geometry;
+        let cells = g.cells(g.area);
+        GridLayout {
+            origin: g.origin(g.area),
+            cols: cells.cols,
+            rows: cells.rows,
         }
     }
 
@@ -1762,14 +2241,6 @@ impl Gfx {
                 self.surface_config.height as f32 / s,
             ),
         )
-    }
-
-    fn in_grid(&self, pos: PhysicalPosition<f64>) -> bool {
-        let x0 = f64::from((self.sidebar_width * self.scale).round());
-        pos.x >= x0
-            && pos.x < f64::from(self.surface_config.width)
-            && pos.y >= 0.0
-            && pos.y < f64::from(self.surface_config.height)
     }
 
     /// Next idle wake-up: cursor blink toggle, sidebar tick, or egui's request.
@@ -1826,51 +2297,116 @@ impl Gfx {
             chrome,
             berth_core::now_ms(),
         );
-        let focused = self.focused || self.force_focused;
+        let window_focused = self.focused || self.force_focused;
+        let g = self.geometry;
+        let whole = |r: PxRect| [r.x, r.y, r.w, r.h];
+        let mut inputs: Vec<PaneInput> = Vec::new();
+        let mut chrome_quads = Vec::new();
+        let mut caret = None;
         let fixture_spans;
-        let session_spans;
-        let input = match fixture {
+        let session_spans: Vec<Option<SelectionSpans>>;
+        match fixture {
             Some(f) => {
                 fixture_spans = f.selection.map(|s| s.spans());
-                FrameInput {
+                let layout = self.full_layout();
+                let frame = FrameInput {
                     screen: &f.screen,
                     styles: f.interner.table(),
                     theme: &self.theme,
                     selection: fixture_spans.as_ref(),
                     cursor_alpha,
-                    focused,
+                    focused: window_focused,
                     preedit: self.ime.preedit(),
-                }
+                };
+                caret = Some(self.grid.ime_caret_rect(&frame, &layout));
+                inputs.push(PaneInput {
+                    frame,
+                    layout,
+                    clip: clip_rect(whole(g.area), size),
+                });
             }
-            None => match ctl.view_mut().filter(|v| v.has_screen()) {
-                Some(view) => {
-                    session_spans = view.selection_spans();
-                    let (screen, styles) = view.frame();
-                    FrameInput {
+            None => {
+                let layout = ctl.layout().map(|t| t.layout(g.area, g.divider));
+                let panes = layout.as_ref().map(|l| l.panes.as_slice()).unwrap_or(&[]);
+                for p in panes {
+                    if let Some(v) = ctl.pane_view_mut(p.session) {
+                        v.refresh();
+                    }
+                }
+                let focused_pane = ctl.focused();
+                let ctl = &*ctl;
+                let views: Vec<_> = panes
+                    .iter()
+                    .map(|p| ctl.pane_view(p.session).filter(|v| v.has_screen()))
+                    .collect();
+                session_spans = views
+                    .iter()
+                    .map(|v| v.and_then(|v| v.selection_spans()))
+                    .collect();
+                for ((p, view), spans) in panes.iter().zip(&views).zip(&session_spans) {
+                    let Some(view) = view else {
+                        continue; // Not shown yet: the sidebar notes it.
+                    };
+                    let (screen, styles) = view.composed();
+                    let is_focused = Some(p.session) == focused_pane;
+                    let cells = g.cells(p.rect);
+                    let layout = GridLayout {
+                        origin: g.origin(p.rect),
+                        cols: cells.cols,
+                        rows: cells.rows,
+                    };
+                    // Only the focused pane blinks and composes; the others
+                    // show a steady unfocused (hollow) cursor.
+                    let frame = FrameInput {
                         screen,
                         styles,
                         theme: &self.theme,
-                        selection: session_spans.as_ref(),
-                        cursor_alpha,
-                        focused,
-                        preedit: self.ime.preedit(),
+                        selection: spans.as_ref(),
+                        cursor_alpha: if is_focused { cursor_alpha } else { 1.0 },
+                        focused: window_focused && is_focused,
+                        preedit: if is_focused { self.ime.preedit() } else { None },
+                    };
+                    if is_focused {
+                        caret = Some(self.grid.ime_caret_rect(&frame, &layout));
                     }
+                    inputs.push(PaneInput {
+                        frame,
+                        layout,
+                        clip: clip_rect(whole(p.rect), size),
+                    });
                 }
-                None => FrameInput {
-                    screen: &self.empty,
-                    styles: &self.empty_styles,
-                    theme: &self.theme,
-                    selection: None,
-                    cursor_alpha,
-                    focused,
-                    preedit: None,
-                },
-            },
-        };
+                if let Some(layout) = &layout {
+                    chrome_quads = pane_chrome(
+                        layout,
+                        focused_pane,
+                        &self.theme,
+                        self.scale,
+                        g.area,
+                        g.divider,
+                    );
+                }
+            }
+        }
+        // A text field of the sidebar (rename) owns the IME meanwhile.
+        if self.sidebar.wants_keyboard() {
+            if let Some(r) = self.sidebar.ime_rect {
+                let s = self.scale;
+                caret = Some([r.min.x * s, r.min.y * s, r.width() * s, r.height() * s]);
+            }
+        }
         self.last_prepare =
             self.grid
-                .prepare(&self.device, &self.queue, &input, &self.layout, size);
-        let caret = self.grid.ime_caret_rect(&input, &self.layout);
+                .prepare(&self.device, &self.queue, &inputs, &chrome_quads, size);
+        let samples: Vec<PaneSample> = inputs
+            .iter()
+            .zip(self.grid.pane_times())
+            .map(|(p, &build)| PaneSample {
+                cols: p.layout.cols.min(p.frame.screen.cols),
+                rows: p.layout.rows.min(p.frame.screen.rows),
+                build,
+            })
+            .collect();
+        drop(inputs);
         let t_prepared = Instant::now();
 
         let frame = match self.surface.get_current_texture() {
@@ -1985,7 +2521,9 @@ impl Gfx {
             None
         };
         self.sidebar.after_submit();
-        self.update_ime_area(caret);
+        if let Some(caret) = caret {
+            self.update_ime_area(caret);
+        }
         let timing = FrameTiming {
             prepare: t_prepared - t0,
             acquire: t_acquired - t_prepared,
@@ -1993,7 +2531,7 @@ impl Gfx {
             gpu,
             offscreen,
         };
-        Ok((Some((timing, captured)), actions))
+        Ok((Some((timing, captured, samples)), actions))
     }
 
     /// Offscreen render target matching the surface (format and size).
@@ -2166,6 +2704,7 @@ impl Gfx {
         );
         let m = self.grid.metrics();
         let font = self.grid.font();
+        let full = self.full_layout();
         eprintln!(
             "[gpu] {} · surface {:?} {}×{} px, {:?}, scale {} · grid {}×{} at ({}, {}) px",
             self.adapter,
@@ -2174,10 +2713,10 @@ impl Gfx {
             self.surface_config.height,
             self.surface_config.present_mode,
             self.scale,
-            self.layout.cols,
-            self.layout.rows,
-            self.layout.origin[0],
-            self.layout.origin[1]
+            full.cols,
+            full.rows,
+            full.origin[0],
+            full.origin[1]
         );
         eprintln!(
             "[fonts] grid: \"{}\" {}pt → {:.0}px, cell {}×{} px, baseline {} ({} faces in fontdb)",
