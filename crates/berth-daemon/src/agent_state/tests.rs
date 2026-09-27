@@ -544,6 +544,7 @@ fn foreground_agent_to_non_agent_is_agent_left() {
     );
     let info = m.info();
     assert_eq!(info.kind, AgentKind::Shell);
+    assert_eq!(info.last_agent, Some(AgentKind::Claude));
     assert_eq!(
         (info.state.clone(), info.source, info.confidence),
         (
@@ -617,6 +618,7 @@ fn osc_prompt_marks_end_an_agent_as_agent_left() {
             StateSource::ShellIntegration
         )
     );
+    assert_eq!(info.last_agent, Some(AgentKind::Claude));
     assert_eq!(info.external_id.as_deref(), Some("claude-uuid"));
     assert_eq!(info.transcript_path, Some(PathBuf::from("/t.jsonl")));
     // Back to plain shell marks.
@@ -719,6 +721,7 @@ fn session_end_is_agent_left_not_exited() {
         (info.kind, info.state),
         (AgentKind::Shell, AgentState::Idle)
     );
+    assert_eq!(info.last_agent, Some(AgentKind::Claude));
     assert_eq!(info.external_id.as_deref(), Some("claude-uuid"));
     assert_eq!(info.transcript_path, Some(PathBuf::from("/t.jsonl")));
     // The shell's marks move it again.
@@ -776,6 +779,51 @@ fn session_end_is_agent_left_not_exited() {
         )
     );
     assert_eq!(info.external_id.as_deref(), Some("new-run"));
+}
+
+/// `last_agent` names the agent the ids belong to: an agent of another
+/// kind taking over the session drops them rather than resuming them as
+/// its own; the same agent again keeps them.
+#[test]
+fn ids_stay_with_the_agent_that_reported_them() {
+    let mut m = machine();
+    m.apply(&hook(ClaudeHookEvent::UserPromptSubmit), T0);
+    m.apply(&hook(ClaudeHookEvent::SessionEnd { reason: None }), T0 + 1);
+    assert_eq!(m.info().resume_kind(), Some(&AgentKind::Claude));
+    let later = T0 + HOOK_PRIORITY_MS + 1; // heuristics count again
+                                           // Claude again (heuristic first, before its hooks): same ids.
+    let mut again = m.clone();
+    again.apply(&Signal::ForegroundProcess("claude".into()), later);
+    assert_eq!(again.info().kind, AgentKind::Claude);
+    assert_eq!(again.info().external_id.as_deref(), Some("claude-uuid"));
+    // Codex: Claude's ids are not its own.
+    m.apply(&Signal::ForegroundProcess("codex".into()), later);
+    let info = m.info();
+    assert_eq!(info.kind, AgentKind::Codex);
+    assert_eq!(
+        (info.external_id.as_deref(), info.transcript_path.as_deref()),
+        (None, None)
+    );
+    m.apply(&Signal::ForegroundProcess("zsh".into()), later + 1);
+    let info = m.info();
+    assert_eq!(
+        (
+            info.kind.clone(),
+            info.last_agent.clone(),
+            info.external_id.clone()
+        ),
+        (AgentKind::Shell, Some(AgentKind::Codex), None),
+        "nothing to resume rather than codex with Claude's id"
+    );
+    // A statusline brings Claude back with its own id.
+    m.apply_statusline(&StatuslineUpdate {
+        session_id: "claude-2".into(),
+        ..StatuslineUpdate::default()
+    });
+    assert_eq!(
+        (m.info().kind.clone(), m.info().external_id.as_deref()),
+        (AgentKind::Claude, Some("claude-2"))
+    );
 }
 
 #[test]

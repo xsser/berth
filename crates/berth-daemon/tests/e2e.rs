@@ -10,7 +10,7 @@ use berth_core::{
     decode_payload, encode_frame, now_ms, AgentKind, AgentSignal, AgentState, ClaudeHook,
     ClaudeHookEvent, ClientMsg, ClientRole, DaemonMsg, Dims, Event, FrameReader, HookEnvelope,
     LineSnapshot, Paths, Request, ReviveMode, ScreenUpdate, SessionId, SessionMeta, SessionStatus,
-    SubscribeMode, WorkspaceId, PROTOCOL_VERSION,
+    StateSource, SubscribeMode, Workspace, WorkspaceId, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -964,6 +964,199 @@ async fn resume_agent_execs_the_resume_argv_without_a_shell() {
             }
         ),
         "a fast-exiting resume must leave the session Dormant"
+    );
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
+
+/// M3 review: after `/exit` (`SessionEnd`) the kind is `Shell` again, and
+/// the agent that left (`last_agent`) is what `ResumeCommand` and `Revive {
+/// ResumeAgent }` resume — across a daemon restart too. `Revive { Shell }`
+/// of an agent session keeps the agent as `last_agent` the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_agent_that_left_is_resumed_even_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let config = || {
+        berth_daemon::Config::parse(
+            "[agents.claude]\nresume_command = \"/bin/echo resumed-by {id}\"\n",
+        )
+        .unwrap()
+    };
+    let daemon = start_daemon_with(&paths, config());
+    let mut c = Client::connect(&paths.socket).await;
+    let (_ws, meta) = workspace_and_shell(&mut c, root.path()).await;
+    let sid = meta.id;
+    let id = "0f8c2e1a-1111-2222-3333-444455556666";
+    let mut hook = Client::connect_as(&paths.socket, ClientRole::Hook).await;
+    hook.send(claude_as(sid, id, ClaudeHookEvent::UserPromptSubmit))
+        .await;
+    let end = ClaudeHookEvent::SessionEnd {
+        reason: Some("prompt_input_exit".into()),
+    };
+    hook.send(claude_as(sid, id, end)).await;
+    c.wait_for("the agent left", |m| {
+        matches!(&m.event, Event::AgentChanged { session, agent }
+            if *session == sid
+                && agent.kind == AgentKind::Shell
+                && agent.last_agent == Some(AgentKind::Claude))
+    })
+    .await;
+    let want = vec!["/bin/echo".to_string(), "resumed-by".into(), id.into()];
+    match c.request(Request::ResumeCommand { session: sid }).await {
+        Event::ResumeCommand { command, .. } => assert_eq!(command, Ok(want.clone())),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(c.request(Request::Kill { session: sid }).await, Event::Ok);
+    exited(&mut c, sid).await;
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+
+    let daemon = start_daemon_with(&paths, config());
+    let mut c = Client::connect(&paths.socket).await;
+    let restored = session_meta(&mut c, sid).await;
+    assert_eq!(restored.status, SessionStatus::Restored);
+    assert_eq!(
+        (
+            restored.agent.kind,
+            restored.agent.last_agent,
+            restored.agent.external_id.as_deref()
+        ),
+        (AgentKind::Shell, Some(AgentKind::Claude), Some(id))
+    );
+    match c.request(Request::ResumeCommand { session: sid }).await {
+        Event::ResumeCommand { command, .. } => assert_eq!(command, Ok(want)),
+        other => panic!("{other:?}"),
+    }
+    let revive = |mode| Request::Revive { session: sid, mode };
+    match c.request(revive(ReviveMode::ResumeAgent)).await {
+        Event::SessionUpdated(m) => {
+            assert_eq!(m.agent.kind, AgentKind::Claude, "the agent is back")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(exited(&mut c, sid).await, Some(0));
+    let text = all_text(&mut c, sid).await;
+    assert!(
+        text.iter()
+            .any(|t| t.trim_end() == format!("resumed-by {id}")),
+        "{text:#?}"
+    );
+
+    // `Revive { Shell }` of a session whose agent never left (killed while
+    // it ran, so `last_agent` is still empty) keeps it the same way.
+    let root2 = tempfile::tempdir().unwrap();
+    let (_ws2, meta2) = workspace_and_shell(&mut c, root2.path()).await;
+    let sid2 = meta2.id;
+    let mut hook = Client::connect_as(&paths.socket, ClientRole::Hook).await;
+    hook.send(claude_as(sid2, id, ClaudeHookEvent::UserPromptSubmit))
+        .await;
+    c.wait_for("claude runs", |m| {
+        matches!(&m.event, Event::AgentChanged { session, agent }
+            if *session == sid2 && agent.kind == AgentKind::Claude && agent.last_agent.is_none())
+    })
+    .await;
+    assert_eq!(c.request(Request::Kill { session: sid2 }).await, Event::Ok);
+    exited(&mut c, sid2).await;
+    let revive2 = Request::Revive {
+        session: sid2,
+        mode: ReviveMode::Shell,
+    };
+    match c.request(revive2).await {
+        Event::SessionUpdated(m) => assert_eq!(
+            (
+                m.agent.kind,
+                m.agent.last_agent,
+                m.agent.external_id.as_deref()
+            ),
+            (AgentKind::Shell, Some(AgentKind::Claude), Some(id))
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(c.request(Request::Kill { session: sid2 }).await, Event::Ok);
+    exited(&mut c, sid2).await;
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
+
+/// A snapshot in format 1 (M1 / M2) as the berthd of main (c606246) wrote
+/// it: `fixtures/format1-claude.bin.zst`, a session whose Claude state came
+/// from simulated hooks (hand-written JSON through that build's berth-hook:
+/// SessionStart, statusline, UserPromptSubmit), saved on SIGTERM. berth-store
+/// refuses the format; the daemon reads the old layout, so the history and
+/// the agent survive the upgrade.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_format_1_snapshot_of_an_older_berthd_is_restored() {
+    let file = include_bytes!("fixtures/format1-claude.bin.zst");
+    let raw = zstd::stream::decode_all(&file[..]).unwrap();
+    let old = berth_core::snapshot::v1::decode(&raw).unwrap();
+    let meta = old.session.clone();
+    let a = &meta.agent;
+    let id = "0f8c2e1a-1111-4222-8333-000000000f01";
+    assert_eq!(
+        (
+            &a.kind,
+            a.external_id.as_deref(),
+            a.model.as_deref(),
+            a.context_pct,
+            a.cost_usd
+        ),
+        (
+            &AgentKind::Claude,
+            Some(id),
+            Some("claude-opus-5-5"),
+            Some(12.0),
+            Some(0.04)
+        )
+    );
+    assert_eq!(
+        (a.state.clone(), a.source),
+        (AgentState::Thinking, StateSource::Hook)
+    );
+    let transcript = format!("/tmp/berth-m3/v1fix/projects/-w/{id}.jsonl");
+    assert_eq!(a.transcript_path.as_deref(), Some(Path::new(&transcript)));
+    assert_eq!(
+        (meta.title_user.as_deref(), meta.cols, meta.rows),
+        (Some("v1-claude"), 90, 20)
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    paths.ensure_dirs().unwrap();
+    {
+        let store = berth_store::Store::open(&paths).unwrap();
+        let ws = Workspace {
+            id: meta.workspace,
+            name: "work".into(),
+            root: meta.cwd.clone(),
+            color: None,
+            order: 0,
+            created_at_ms: meta.created_at_ms,
+        };
+        store.upsert_workspace(&ws).unwrap();
+        store.upsert_session(&meta).unwrap();
+        std::fs::create_dir_all(&paths.snapshots_dir).unwrap();
+        std::fs::write(paths.snapshot_file(&meta.id), file).unwrap();
+        assert!(matches!(
+            store.read_snapshot(meta.id),
+            Err(berth_store::StoreError::Format { found: 1, .. })
+        ));
+    }
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    let restored = session_meta(&mut c, meta.id).await;
+    assert_eq!(restored.status, SessionStatus::Restored);
+    assert_eq!(restored.agent.external_id.as_deref(), Some(id));
+    let text = all_text(&mut c, meta.id).await;
+    assert!(
+        text.iter()
+            .any(|t| t.trim_end() == "format-1 history marker"),
+        "{text:#?}"
+    );
+    assert!(
+        text.iter().any(|t| t.trim_end() == "hooks sent"),
+        "{text:#?}"
     );
     assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
     daemon.join().await;

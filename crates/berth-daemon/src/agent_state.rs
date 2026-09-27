@@ -168,8 +168,9 @@ impl AgentMachine {
     }
 
     /// The agent process is gone and the shell is back: kind `Shell` and
-    /// `state`; external id and transcript stay (for a later resume).
-    /// Returns whether the state changed.
+    /// `state`; the agent becomes `last_agent`, and external id and
+    /// transcript stay (for a later resume). Returns whether the state
+    /// changed.
     fn agent_left(
         &mut self,
         state: AgentState,
@@ -177,6 +178,9 @@ impl AgentMachine {
         confidence: f32,
         now_ms: i64,
     ) -> bool {
+        if self.info.kind.is_agent() {
+            self.info.last_agent = Some(self.info.kind.clone());
+        }
         self.info.kind = AgentKind::Shell;
         let before = self.info.state.clone();
         self.enter(state, source, confidence, now_ms);
@@ -198,6 +202,13 @@ impl AgentMachine {
     fn set_kind(&mut self, kind: AgentKind) -> bool {
         if self.info.kind == kind {
             return false;
+        }
+        // Ids and transcript belong to the agent that reported them (the one
+        // `resume_kind` names): another agent resuming them would open the
+        // wrong session. It reports its own.
+        if kind.is_agent() && self.info.resume_kind() != Some(&kind) {
+            self.info.external_id = None;
+            self.info.transcript_path = None;
         }
         self.info.kind = kind;
         true
@@ -561,8 +572,7 @@ impl AgentMachine {
     pub fn apply_statusline(&mut self, s: &StatuslineUpdate) -> bool {
         let mut changed = false;
         if self.info.kind == AgentKind::Shell {
-            self.info.kind = AgentKind::Claude;
-            changed = true;
+            changed |= self.set_kind(AgentKind::Claude);
         }
         changed |= self.set_external_id(Some(&s.session_id));
         if s.model.is_some() && self.info.model != s.model {

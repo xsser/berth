@@ -803,11 +803,22 @@ impl Manager {
             e.meta.cwd = cwd;
             e.meta.last_active_ms = now;
             // Review #17: whatever the agent was doing is over. `Shell` does
-            // not bring it back (kind `Shell`, as when an agent leaves);
-            // `ResumeAgent` does. Ids and transcript stay for a later resume.
+            // not bring it back (kind `Shell` and `last_agent`, as when an
+            // agent leaves); `ResumeAgent` does, also after it left. Ids and
+            // transcript stay for a later resume.
             let mut agent = e.meta.agent.clone();
-            if matches!(mode, ReviveMode::Shell) {
-                agent.kind = AgentKind::Shell;
+            match mode {
+                ReviveMode::Shell => {
+                    if agent.kind.is_agent() {
+                        agent.last_agent = Some(agent.kind.clone());
+                    }
+                    agent.kind = AgentKind::Shell;
+                }
+                ReviveMode::ResumeAgent => {
+                    if let Some(kind) = agent.resume_kind().cloned() {
+                        agent.kind = kind;
+                    }
+                }
             }
             agent.state = AgentState::Idle;
             agent.since_ms = now;
@@ -1141,7 +1152,8 @@ fn revive_command(original: &[String]) -> Vec<String> {
 }
 
 /// argv of a revive. `Shell`: the original plain shell, else the login
-/// shell. `ResumeAgent`: the agent's resume command, executed directly —
+/// shell. `ResumeAgent`: the resume command of the running agent, else of
+/// the one that left last (`AgentInfo::resume_kind`), executed directly —
 /// never typed into or parsed by a shell — with the word `{id}` replaced by
 /// the external id, which must be a plain token (ids stored before that
 /// check existed are refused here too).
@@ -1157,7 +1169,8 @@ fn revive_argv(config: &Config, meta: &SessionMeta, mode: ReviveMode) -> Result<
             if !is_valid_external_id(id) {
                 return Err("agent session id is not a plain token; refusing to resume".into());
             }
-            config.resume_argv(&meta.agent.kind, id)
+            let kind = meta.agent.resume_kind().unwrap_or(&meta.agent.kind);
+            config.resume_argv(kind, id)
         }
     }
 }
@@ -1169,8 +1182,9 @@ fn revive_argv(config: &Config, meta: &SessionMeta, mode: ReviveMode) -> Result<
 /// (`claude --resume <id>` elsewhere does not find the session). Without a
 /// match it is `cwd`, as for every other revive.
 fn revive_start_dir(meta: &SessionMeta, mode: ReviveMode) -> PathBuf {
-    let claude_transcript = match (mode, &meta.agent.kind, &meta.agent.transcript_path) {
-        (ReviveMode::ResumeAgent, AgentKind::Claude, Some(t)) => Some(t),
+    let kind = meta.agent.resume_kind();
+    let claude_transcript = match (mode, kind, &meta.agent.transcript_path) {
+        (ReviveMode::ResumeAgent, Some(AgentKind::Claude), Some(t)) => Some(t),
         _ => None,
     };
     claude_transcript
@@ -1276,6 +1290,19 @@ mod tests {
             revive_argv(&config, &meta, ReviveMode::Shell).unwrap(),
             v(&["/bin/zsh"])
         );
+
+        // After `/exit` the kind is `Shell` again: the agent that left is
+        // resumed; a plain shell with nothing that left is not.
+        meta.agent.external_id = Some("0f8c2e1a-1111-2222-3333-444455556666".into());
+        meta.agent.kind = AgentKind::Shell;
+        meta.agent.last_agent = Some(AgentKind::Claude);
+        assert_eq!(
+            revive_argv(&config, &meta, ReviveMode::ResumeAgent).unwrap(),
+            v(&["claude", "--resume", "0f8c2e1a-1111-2222-3333-444455556666"])
+        );
+        meta.agent.last_agent = None;
+        let err = revive_argv(&config, &meta, ReviveMode::ResumeAgent).unwrap_err();
+        assert!(err.contains("plain shell"), "{err}");
     }
 
     /// Review high #2: a panicking actor leaves a Dormant session that a
@@ -1639,5 +1666,9 @@ mod tests {
         meta.agent.transcript_path = Some(transcript);
         meta.agent.kind = AgentKind::Codex;
         assert_eq!(revive_start_dir(&meta, ReviveMode::ResumeAgent), sub);
+        // Claude left (kind `Shell`): still its project directory.
+        meta.agent.kind = AgentKind::Shell;
+        meta.agent.last_agent = Some(AgentKind::Claude);
+        assert_eq!(revive_start_dir(&meta, ReviveMode::ResumeAgent), project);
     }
 }
