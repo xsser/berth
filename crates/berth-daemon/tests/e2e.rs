@@ -1768,3 +1768,96 @@ async fn archive_and_unarchive_over_the_protocol() {
     assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
     daemon.join().await;
 }
+
+/// A Claude hook event from outside berth (no `BERTH_SESSION_ID`): only the
+/// agent's session id and its cwd can route it.
+fn claude_outside(session_id: &str, cwd: &Path, event: ClaudeHookEvent) -> Request {
+    Request::Hook(HookEnvelope {
+        berth_session: None,
+        pid: std::process::id(),
+        sent_at_ms: now_ms(),
+        signal: AgentSignal::Claude(ClaudeHook {
+            session_id: session_id.into(),
+            cwd: Some(cwd.to_path_buf()),
+            transcript_path: None,
+            permission_mode: Some("default".into()),
+            event,
+        }),
+    })
+}
+
+/// M4 (DESIGN §17.1 / task §3): after archiving, hooks do not reach the
+/// session through the fallbacks. With A (archived, its Claude id `ext-a`)
+/// and B (live) in the same cwd, a hook carrying `ext-a` is dropped rather
+/// than routed to B by cwd, while a hook of another agent in that cwd goes
+/// to B, the only live session there. A stays as archived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hooks_do_not_reach_an_archived_session_by_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    let mut hook = Client::connect_as(&paths.socket, ClientRole::Hook).await;
+    let (ws, a) = workspace_and_shell(&mut c, root.path()).await;
+    let b = match c
+        .request(Request::CreateSession {
+            workspace: ws,
+            cwd: None,
+            command: Some(vec!["/bin/sh".into()]),
+            title: None,
+            dims: DIMS,
+        })
+        .await
+    {
+        Event::SessionUpdated(m) => m,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(b.cwd, root.path());
+
+    let start = claude_as(
+        a.id,
+        "ext-a",
+        ClaudeHookEvent::SessionStart { source: None },
+    );
+    assert_eq!(hook.request(start).await, Event::Ok);
+    let before = session_meta(&mut c, a.id).await;
+    assert_eq!(before.agent.external_id.as_deref(), Some("ext-a"));
+    match c.request(Request::Archive { session: a.id }).await {
+        Event::SessionUpdated(m) => assert!(m.is_archived()),
+        other => panic!("Archive answered {other:?}"),
+    }
+    let archived = session_meta(&mut c, a.id).await;
+
+    let tool = || ClaudeHookEvent::PreToolUse {
+        tool_name: "Bash".into(),
+    };
+    // The hook is handled before it is answered: the metadata below
+    // already shows where it went.
+    let late = claude_outside("ext-a", root.path(), tool());
+    assert_eq!(hook.request(late).await, Event::Ok);
+    let b_now = session_meta(&mut c, b.id).await;
+    assert_eq!(
+        (b_now.agent.kind, b_now.agent.state),
+        (AgentKind::Shell, b.agent.state.clone()),
+        "not routed to B by cwd"
+    );
+    assert_eq!(session_meta(&mut c, a.id).await, archived);
+
+    let other_agent = claude_outside("ext-b", root.path(), tool());
+    assert_eq!(hook.request(other_agent).await, Event::Ok);
+    let b_now = session_meta(&mut c, b.id).await;
+    assert_eq!(
+        (b_now.agent.kind, b_now.agent.state),
+        (
+            AgentKind::Claude,
+            AgentState::ToolRunning {
+                tool: "Bash".into()
+            }
+        ),
+        "B is the only live session in that cwd"
+    );
+    assert_eq!(session_meta(&mut c, a.id).await, archived);
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
