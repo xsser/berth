@@ -164,7 +164,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 
 ### 8.4 配置
 
-- `~/.config/berth/config.toml`，热重载（`notify` 监听）。示例：
+- `~/.config/berth/config.toml`，**启动时读一次**：改完要重启 `berth`（GUI）或 `berthd`（daemon 侧的段）才生效。热重载仍在 M5，代码里没有文件监听。示例：
 
 ```toml
 [font]           family = "SF Mono"   size = 13
@@ -254,7 +254,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 | M2 GUI 终端 | 可日常使用的单 session 终端 | vttest 子集；vim / htop / claude TUI 手工清单；resize 无错位 |
 | M3 侧栏 + workspace + agent 状态 | hooks CLI、`setup-hooks`、zsh 集成、进程树回退、通知 | 3 个 claude 并行，状态转移与实际一致；hook 未装时启发式标注为推断 |
 | M4 持久化 L2 | 快照 / 恢复 / revive / resume | `kill -9 berthd` → 重启 → 历史可见 → revive 续写在下方；`claude --resume` 成功 |
-| M5 打磨 | 配置热重载、主题、搜索、URL、`.app` 打包、launchd 可选 | 冷启动 <300ms；30 session 预览 CPU <5% |
+| M5 打磨 | 配置热重载、搜索、URL、`.app` 打包、launchd 可选（主题已提前随 §8.4 `[theme]` 落地） | 冷启动 <300ms；30 session 预览 CPU <5% |
 
 分工（按既有约定）：Fable 5 设计 / 验收 / 审核；opus（effort max）或 codex 在各自 worktree 按 crate 所有权并发实现（`berth-vt` / `berth-daemon` / `berth-app` 三条线，`berth-core` 先冻结接口）。
 

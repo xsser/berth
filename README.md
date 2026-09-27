@@ -94,6 +94,8 @@ accent = "#0a7d55"        # the 「等授权」 pulse and the focused pane's bor
 background = "#fffdf6"    # foreground, cursor, cursor_text and ansi = [16 colors] too
 ```
 
+The file is read once at startup, so restart `berth` to apply a change.
+
 ### Keys
 
 | Key | Action |
@@ -209,6 +211,8 @@ preset = "dark"           # "light"（默认）| "dark"
 accent = "#0a7d55"        # 「等授权」脉冲与聚焦 pane 的边框
 background = "#fffdf6"    # foreground、cursor、cursor_text、ansi = [16 色] 同理
 ```
+
+配置只在启动时读一次，改完重启 `berth` 生效。
 
 ### 快捷键
 
