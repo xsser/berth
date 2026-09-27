@@ -74,6 +74,8 @@ const STATS_WINDOW: Duration = Duration::from_secs(5);
 const OFFSCREEN_INTERVAL: Duration = Duration::from_millis(8);
 const RECONNECT_MAX: Duration = Duration::from_secs(10);
 const MULTI_CLICK: Duration = Duration::from_millis(400);
+/// How long quitting waits for the last `gui-state.json` write.
+const LAYOUT_SAVE_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Default)]
 pub struct GuiOptions {
@@ -132,6 +134,8 @@ pub enum UserEvent {
     },
     /// ⌘⇧N folder picker: `Ok(None)` when cancelled.
     FolderPicked(std::result::Result<Option<PathBuf>, String>),
+    /// A `gui-state.json` write failed; the saver has the message.
+    LayoutSaveFailed,
 }
 
 pub fn run(opts: GuiOptions) -> Result<()> {
@@ -366,9 +370,9 @@ struct App {
     error: Option<anyhow::Error>,
     /// When `run_app` was entered (startup breakdown: launch → resumed).
     loop_started: Option<Instant>,
-    /// `gui-state.json` (interactive runs only: screenshots and benches
-    /// show what their flags say and leave the saved layout alone).
-    gui_state_path: Option<PathBuf>,
+    /// Writes `gui-state.json` (interactive runs only: screenshots and
+    /// benches show what their flags say and leave the saved layout alone).
+    layout_saver: Option<gui_state::Saver>,
     /// The focused pane as of the last focus in/out report.
     pane_focus: Option<SessionId>,
 }
@@ -436,6 +440,15 @@ impl App {
                 Err(e) => ctl.info(format!("分屏布局未恢复：{e}")),
             }
         }
+        let layout_saver = gui_state_path.and_then(|path| {
+            let wake = proxy.clone();
+            let spawned = gui_state::Saver::spawn(path, move || {
+                let _ = wake.send_event(UserEvent::LayoutSaveFailed);
+            });
+            spawned
+                .map_err(|e| ctl.error(format!("分屏布局保存线程无法启动：{e}")))
+                .ok()
+        });
         Self {
             live_stats: opts.stats.then(LiveStats::new),
             pending_scroll: opts.scroll.map(i64::from),
@@ -464,7 +477,7 @@ impl App {
             exit_at,
             error: None,
             loop_started: None,
-            gui_state_path,
+            layout_saver,
             pane_focus: None,
         }
     }
@@ -484,32 +497,36 @@ impl App {
 
     fn quit(&mut self, event_loop: &ActiveEventLoop) {
         // The layout as the window closes (once it is known: before the
-        // first listing it would replace the saved one with nothing).
-        if let Some(path) = self.gui_state_path.clone() {
+        // first listing it would replace the saved one with nothing), on
+        // disk before the process ends.
+        if let Some(mut saver) = self.layout_saver.take() {
             if self.ctl.layout_ready() {
-                if let Err(e) = gui_state::save(&path, &self.ctl.gui_state()) {
-                    tracing::warn!("saving {}: {e}", path.display());
-                }
+                saver.save(self.ctl.gui_state());
+            }
+            if !saver.finish(LAYOUT_SAVE_WAIT) {
+                tracing::warn!(
+                    "gui-state.json not written within {LAYOUT_SAVE_WAIT:?}; quitting without it"
+                );
+            }
+            while let Some(e) = saver.take_error() {
+                tracing::warn!("{e}");
             }
         }
         self.mode = Mode::Exiting;
         event_loop.exit();
     }
 
-    /// Write `gui-state.json` after a layout or focus change (a divider
-    /// drag is written once it ends).
+    /// Hand a layout or focus change to the `gui-state.json` writer (a
+    /// divider drag once it ends); the UI does not wait for the write.
     fn save_layout(&mut self) {
-        let Some(path) = self.gui_state_path.clone() else {
+        let Some(saver) = &self.layout_saver else {
             return;
         };
         if self.gfx.as_ref().is_some_and(|g| g.mouse.drag.is_some()) {
             return;
         }
         if let Some(state) = self.ctl.take_layout_changed() {
-            if let Err(e) = gui_state::save(&path, &state) {
-                self.ctl
-                    .error(format!("无法保存分屏布局到 {}：{e}", path.display()));
-            }
+            saver.save(state);
         }
     }
 
@@ -698,6 +715,13 @@ impl App {
                     Ok(Some(dir)) => self.ctl.new_workspace(out!(self), dir),
                     Ok(None) => {}
                     Err(e) => self.ctl.error(format!("目录选择失败：{e}")),
+                }
+            }
+            UserEvent::LayoutSaveFailed => {
+                if let Some(saver) = &self.layout_saver {
+                    while let Some(e) = saver.take_error() {
+                        self.ctl.error(e);
+                    }
                 }
             }
         }
