@@ -339,13 +339,50 @@ mod tests {
     /// above the 3:1 non-text contrast floor (WCAG 1.4.11). Bright colors
     /// sit between 3:1 and 4.5:1 by design: they are accents, not body
     /// text, and darkening them further loses the "bright" reading.
+    ///
+    /// `cargo test -p berth-app light_preset -- --nocapture` prints the
+    /// whole table, which is how a change to the palette is reviewed.
     #[test]
     fn light_preset_clears_three_to_one_on_its_background() {
+        const NAMES: [&str; 16] = [
+            "black",
+            "red",
+            "green",
+            "yellow",
+            "blue",
+            "magenta",
+            "cyan",
+            "white",
+            "br black",
+            "br red",
+            "br green",
+            "br yellow",
+            "br blue",
+            "br magenta",
+            "br cyan",
+            "br white",
+        ];
         let t = Theme::light();
         let bg = t.background;
+        println!("light preset on {bg:02x?} (WCAG contrast)");
         for (i, c) in t.palette[..16].iter().enumerate() {
             let r = contrast_ratio(*c, bg);
+            println!(
+                "  {i:>2} {:<11} #{:02x}{:02x}{:02x}  {r:5.2}:1",
+                NAMES[i], c[0], c[1], c[2]
+            );
             assert!(r >= 3.0, "ansi {i} {c:02x?} is {r:.2}:1 on {bg:02x?}");
+        }
+        for (name, c) in [
+            ("foreground", t.foreground),
+            ("accent", LIGHT_ACCENT),
+            ("cursor", t.cursor),
+        ] {
+            let r = contrast_ratio(c, bg);
+            println!(
+                "     {name:<11} #{:02x}{:02x}{:02x}  {r:5.2}:1",
+                c[0], c[1], c[2]
+            );
         }
         assert!(contrast_ratio(t.foreground, bg) >= 7.0);
         assert!(contrast_ratio(LIGHT_ACCENT, bg) >= 4.5);
