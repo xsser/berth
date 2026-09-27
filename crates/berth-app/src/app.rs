@@ -104,6 +104,8 @@ pub struct GuiOptions {
     /// (end-to-end check; a screenshot waits for the restarted daemon's
     /// session list instead of the banner).
     pub demo_restart: bool,
+    /// Open the sidebar's 「归档」 section at start (screenshot check).
+    pub demo_archive_open: bool,
 }
 
 /// Events from other threads.
@@ -740,13 +742,13 @@ impl App {
             match press.logical {
                 WinitKey::Named(NamedKey::Escape) => {
                     if self.ctl.confirm().is_some() {
-                        self.ctl.answer_confirm(out!(self), false);
+                        self.ctl.answer_confirm(out!(self), false, now);
                     } else {
                         self.palette_open = false;
                     }
                 }
                 WinitKey::Named(NamedKey::Enter) if self.ctl.confirm().is_some() => {
-                    self.ctl.answer_confirm(out!(self), true);
+                    self.ctl.answer_confirm(out!(self), true, now);
                 }
                 _ => {}
             }
@@ -793,7 +795,7 @@ impl App {
             Shortcut::Quit => self.quit(event_loop),
             Shortcut::NewSession => self.ctl.new_session(out!(self)),
             Shortcut::NewWorkspace => self.pick_folder(),
-            Shortcut::Close => self.ctl.request_close(out!(self)),
+            Shortcut::Close => self.ctl.request_close(out!(self), now),
             Shortcut::Jump(n) => self.ctl.jump(out!(self), usize::from(n), now),
             Shortcut::Palette => self.palette_open = !self.palette_open,
             Shortcut::Copy => self.copy_selection(),
@@ -1190,7 +1192,11 @@ impl App {
             return Some("正在读取 session 列表…".into());
         }
         match self.ctl.focused() {
-            None => Some("没有 session：按 ⌘N / ⌘T 新建".into()),
+            None if self.ctl.jump_order().is_empty() => {
+                Some("没有 session：按 ⌘N / ⌘T 新建".into())
+            }
+            // The last pane was closed (⌘W, archived).
+            None => Some("没有打开的 session：点侧栏里的一个，或按 ⌘N / ⌘T 新建".into()),
             // Panes without a screen yet get a note each (`pane_notes`).
             Some(_) => None,
         }
@@ -1415,7 +1421,7 @@ impl App {
                 UiAction::NewSession => self.ctl.new_session(out!(self)),
                 UiAction::NewSessionIn(ws) => self.ctl.new_session_in(out!(self), ws),
                 UiAction::NewWorkspace => self.pick_folder(),
-                UiAction::Confirm(yes) => self.ctl.answer_confirm(out!(self), yes),
+                UiAction::Confirm(yes) => self.ctl.answer_confirm(out!(self), yes, now),
                 UiAction::DismissNotice(i) => self.ctl.dismiss_notice(i),
                 UiAction::ClosePalette => self.palette_open = false,
                 UiAction::RestartDaemon => self.restart_daemon(),
@@ -2113,6 +2119,9 @@ impl Gfx {
             mouse: MouseState::default(),
         };
         gfx.update_layout();
+        if opts.demo_archive_open {
+            gfx.sidebar.open_archive();
+        }
         if let Some(text) = &opts.demo_preedit {
             gfx.ime.handle(&Ime::Enabled);
             gfx.ime

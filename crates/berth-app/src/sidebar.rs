@@ -23,6 +23,11 @@
 //! ([`Sidebar::open_terminal_menu`]). 「重命名…」 opens a dialog with a text
 //! field.
 //!
+//! Archived sessions (DESIGN §17.1) are not cards: the 「归档 (N)」 section
+//! at the end of the list, collapsed by default, has a row each — title ·
+//! workspace · how long ago — with 「恢复」 / 「彻底删除…」 on hover and on
+//! its context menu. No preview: berthd refuses to subscribe to them.
+//!
 //! IME ownership: the terminal owns the window IME. egui-winit toggles
 //! `Window::set_ime_allowed` from `PlatformOutput::ime`, so the sidebar clears
 //! that field every frame (egui-winit then never touches it). Keyboard and
@@ -501,6 +506,7 @@ pub struct Sidebar {
     theme: Theme,
     width_pt: f32,
     dormant_open: bool,
+    archive_open: bool,
     jobs: Vec<egui::ClippedPrimitive>,
     screen: egui_wgpu::ScreenDescriptor,
     to_free: Vec<egui::TextureId>,
@@ -681,6 +687,171 @@ fn put_inside(ui: &mut egui::Ui, r: Rect, widget: impl egui::Widget) -> egui::Re
     .add(widget)
 }
 
+/// A collapsible group header; returns true when clicked.
+fn group_header(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    painted: &mut Option<&mut Painted>,
+    title: &str,
+    open: Option<bool>,
+) -> bool {
+    let sense = if open.is_some() {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), sense);
+    let y = rect.center().y;
+    let arrow = match open {
+        Some(false) => "▸",
+        _ => "▾",
+    };
+    paint_text(
+        ui,
+        painted,
+        Pos2::new(rect.left(), y),
+        Align2::LEFT_CENTER,
+        arrow,
+        prop(12.0),
+        pal.dim,
+        12.0,
+    );
+    paint_text(
+        ui,
+        painted,
+        Pos2::new(rect.left() + 14.0, y),
+        Align2::LEFT_CENTER,
+        title,
+        bold(12.0),
+        pal.dim,
+        rect.width() - 14.0,
+    );
+    resp.clicked()
+}
+
+/// The 「归档 (N)」 section (only with archived sessions): a header that
+/// opens and closes it, then a row per archived session while `open`.
+fn archive_section(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    ctl: &Controller,
+    open: &mut bool,
+    now_ms: i64,
+    painted: &mut Option<&mut Painted>,
+    actions: &mut Vec<UiAction>,
+) {
+    let archived = ctl.archived();
+    if archived.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    let title = format!("归档 ({})", archived.len());
+    if group_header(ui, pal, painted, &title, Some(*open)) {
+        *open = !*open;
+    }
+    if *open {
+        for m in archived {
+            archived_row(ui, pal, ctl, m, now_ms, painted, actions);
+        }
+    }
+}
+
+/// A row of the 「归档」 section: title · workspace · archived how long
+/// ago. Under the pointer, 「恢复」 and 「彻底删除…」 buttons take the
+/// age's place (the same entries as its context menu).
+fn archived_row(
+    ui: &mut egui::Ui,
+    pal: Palette,
+    ctl: &Controller,
+    m: &SessionMeta,
+    now_ms: i64,
+    painted: &mut Option<&mut Painted>,
+    actions: &mut Vec<UiAction>,
+) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::hover());
+    let resp = ui.interact(rect, Id::new(("archived", m.id)), Sense::click());
+    context_menu(&resp, &menus::archived_row(m.id), actions);
+    // Not `hovered()`: the pointer over a button is still over the row.
+    let hot = ui.rect_contains_pointer(rect);
+    if hot {
+        ui.painter().rect_filled(rect, 6.0, pal.hover);
+    }
+    let y = rect.center().y;
+    let mut right = rect.right() - 6.0;
+    if hot {
+        for (label, action, tip) in [
+            (
+                "彻底删除…",
+                MenuAction::DeleteForever(m.id),
+                "删除它的全部历史（先确认）",
+            ),
+            (
+                "恢复",
+                MenuAction::Unarchive(m.id),
+                "回到原 workspace（休眠，可 Revive）",
+            ),
+        ] {
+            let w = ui
+                .painter()
+                .layout_no_wrap(label.to_string(), prop(11.0), pal.fg)
+                .size()
+                .x
+                + 14.0;
+            let r = Rect::from_min_size(Pos2::new(right - w, y - 10.0), Vec2::new(w, 20.0));
+            right -= w + 4.0;
+            let b = egui::Button::new(egui::RichText::new(label).size(11.0));
+            if put_inside(ui, r, b).on_hover_text(tip).clicked() {
+                actions.push(UiAction::Menu(action));
+            }
+        }
+    } else if let Some(at) = m.archived_at_ms {
+        let age = format!("{}前", format_elapsed(now_ms.saturating_sub(at)));
+        let age = paint_text(
+            ui,
+            painted,
+            Pos2::new(right, y),
+            Align2::RIGHT_CENTER,
+            &age,
+            prop(11.0),
+            pal.faint,
+            80.0,
+        );
+        right = age.left();
+    }
+    let x = rect.left() + 14.0;
+    let avail = (right - 8.0 - x).max(20.0);
+    let ws = ctl
+        .workspace(m.workspace)
+        .map_or("（workspace 已删除）", |w| w.name.as_str());
+    let ws = format!(" · {ws}");
+    let ws_w = ui
+        .painter()
+        .layout_no_wrap(ws.clone(), prop(11.0), pal.faint)
+        .size()
+        .x;
+    let title = paint_text(
+        ui,
+        painted,
+        Pos2::new(x, y),
+        Align2::LEFT_CENTER,
+        m.title(),
+        prop(12.5),
+        pal.preview_fg,
+        avail - ws_w.min(avail * 0.45),
+    );
+    paint_text(
+        ui,
+        painted,
+        Pos2::new(title.right(), y),
+        Align2::LEFT_CENTER,
+        &ws,
+        prop(11.0),
+        pal.faint,
+        (x + avail - title.right()).max(1.0),
+    );
+    ui.add_space(2.0);
+}
+
 /// The version-mismatch banner, centered in the terminal area. Returns its
 /// button, when it has one.
 fn mismatch_panel(
@@ -770,6 +941,7 @@ impl Sidebar {
             theme: theme.clone(),
             width_pt,
             dormant_open: true,
+            archive_open: false,
             jobs: Vec::new(),
             screen: egui_wgpu::ScreenDescriptor {
                 size_in_pixels: [1, 1],
@@ -783,6 +955,11 @@ impl Sidebar {
             rename: None,
             ime_rect: None,
         }
+    }
+
+    /// Expand the 「归档」 section (`--demo-archive-open`).
+    pub fn open_archive(&mut self) {
+        self.archive_open = true;
     }
 
     /// Open the terminal area's context menu at `pos` (points).
@@ -1209,7 +1386,7 @@ impl Sidebar {
         }
         let orphans = ctl.live_orphans();
         if !orphans.is_empty() {
-            self.group_header(ui, painted, "（workspace 已删除）", None);
+            group_header(ui, pal, painted, "（workspace 已删除）", None);
             for m in orphans {
                 self.card(ui, ctl, m, number(m.id), now_ms, painted, actions, visible);
             }
@@ -1217,7 +1394,7 @@ impl Sidebar {
         let dormant = ctl.dormant();
         if !dormant.is_empty() {
             let title = format!("休眠 ({})  只读历史 · 可 Revive", dormant.len());
-            if self.group_header(ui, painted, &title, Some(self.dormant_open)) {
+            if group_header(ui, pal, painted, &title, Some(self.dormant_open)) {
                 self.dormant_open = !self.dormant_open;
             }
             if self.dormant_open {
@@ -1241,49 +1418,15 @@ impl Sidebar {
                 rect.width(),
             );
         }
-    }
-
-    /// A collapsible group header; returns true when clicked.
-    fn group_header(
-        &self,
-        ui: &mut egui::Ui,
-        painted: &mut Option<&mut Painted>,
-        title: &str,
-        open: Option<bool>,
-    ) -> bool {
-        let pal = self.palette;
-        let sense = if open.is_some() {
-            Sense::click()
-        } else {
-            Sense::hover()
-        };
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), sense);
-        let y = rect.center().y;
-        let arrow = match open {
-            Some(false) => "▸",
-            _ => "▾",
-        };
-        paint_text(
+        archive_section(
             ui,
+            pal,
+            ctl,
+            &mut self.archive_open,
+            now_ms,
             painted,
-            Pos2::new(rect.left(), y),
-            Align2::LEFT_CENTER,
-            arrow,
-            prop(12.0),
-            pal.dim,
-            12.0,
+            actions,
         );
-        paint_text(
-            ui,
-            painted,
-            Pos2::new(rect.left() + 14.0, y),
-            Align2::LEFT_CENTER,
-            title,
-            bold(12.0),
-            pal.dim,
-            rect.width() - 14.0,
-        );
-        resp.clicked()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1799,15 +1942,15 @@ impl Sidebar {
         }
         if let Some(confirm) = ctl.confirm() {
             let (title, body, yes) = match confirm {
-                Confirm::Kill { title, what, .. } => (
-                    format!("关闭「{title}」？"),
-                    format!("{what}。关闭会结束其中的进程，历史保留在休眠组。"),
-                    "关闭",
+                Confirm::Archive { title, what, .. } => (
+                    format!("归档「{title}」？"),
+                    format!("{what}。归档会先结束其中的进程；历史保留，可在侧栏「归档」里恢复。"),
+                    "归档",
                 ),
                 Confirm::Delete { title, .. } => (
-                    format!("删除「{title}」？"),
+                    format!("彻底删除「{title}」？"),
                     "这会删除这个 session 的全部历史（快照与记录），不可撤销。".to_string(),
-                    "删除",
+                    "彻底删除",
                 ),
                 Confirm::DeleteWorkspace { name, .. } => (
                     format!("删除 workspace「{name}」？"),
@@ -1848,7 +1991,10 @@ impl Sidebar {
                 for (keys, what) in [
                     ("⌘N / ⌘T", "当前 workspace 新建 session"),
                     ("⌘⇧N", "新建 workspace（选择目录）"),
-                    ("⌘W", "关闭 session（agent 运行时二次确认）"),
+                    (
+                        "⌘W",
+                        "关闭 pane 并归档其 session（agent 或命令运行时先确认）",
+                    ),
                     ("⌘1…⌘9", "跳到第 n 个 session"),
                     ("⌘D / ⌘⇧D", "向右 / 向下分屏（新 session，同目录）"),
                     ("⌥⌘←→↑↓", "在分屏之间移动焦点"),
@@ -2099,15 +2245,139 @@ mod tests {
         events: Vec<egui::Event>,
         mut show: impl FnMut(&egui::Context),
     ) -> egui::FullOutput {
+        headless_ui(ctx, events, |ui| show(ui.ctx()))
+    }
+
+    /// One frame of `show` in the whole (1000×600) screen.
+    fn headless_ui(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        mut show: impl FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 600.0))),
             events,
             ..Default::default()
         };
-        let mut out = ctx.run_ui(input, |ui| show(ui.ctx()));
+        let mut out = ctx.run_ui(input, |ui| show(ui));
         // No renderer here: the font atlas upload is dropped on purpose.
         out.textures_delta.clear();
         out
+    }
+
+    /// A controller that listed `sessions` (requests go nowhere).
+    fn listed(wss: Vec<berth_core::Workspace>, sessions: Vec<SessionMeta>) -> Controller {
+        struct Nowhere(u32);
+        impl controller::Outbound for Nowhere {
+            fn send(&mut self, _: berth_core::Request) -> anyhow::Result<u32> {
+                self.0 += 1;
+                Ok(self.0)
+            }
+        }
+        let mut c = Controller::new(vec![]);
+        c.auto_session = false;
+        let mut out = Nowhere(0);
+        c.on_connected(&mut out); // ListWorkspaces = 1, ListSessions = 2
+        let now = std::time::Instant::now();
+        let answer = |id, event| berth_core::DaemonMsg {
+            reply_to: Some(id),
+            event,
+        };
+        c.handle(&mut out, answer(1, berth_core::Event::Workspaces(wss)), now);
+        c.handle(
+            &mut out,
+            answer(2, berth_core::Event::Sessions(sessions)),
+            now,
+        );
+        assert!(c.is_loaded());
+        c
+    }
+
+    #[test]
+    fn the_archive_section_opens_and_its_rows_restore_or_delete() {
+        let ws = berth_core::Workspace {
+            id: WorkspaceId::new(),
+            name: "proj".into(),
+            root: "/tmp/proj".into(),
+            color: None,
+            order: 0,
+            created_at_ms: 0,
+        };
+        let now_ms = 10 * 86_400_000;
+        let live = SessionMeta {
+            id: SessionId::new(),
+            workspace: ws.id,
+            title_auto: "live".into(),
+            status: SessionStatus::Live,
+            ..Default::default()
+        };
+        let old = SessionMeta {
+            id: SessionId::new(),
+            workspace: ws.id,
+            title_auto: "old-build".into(),
+            status: SessionStatus::Restored,
+            archived_at_ms: Some(now_ms - 3 * 86_400_000),
+            ..Default::default()
+        };
+        let ctl = listed(vec![ws], vec![live, old.clone()]);
+        let pal = Palette::from_theme(&Theme::ghostty_default());
+        let ctx = egui::Context::default();
+        // egui's own fonts, with the "bold" family headers use.
+        let mut fonts = FontDefinitions::default();
+        let regular = fonts.families[&FontFamily::Proportional].clone();
+        fonts
+            .families
+            .insert(FontFamily::Name("bold".into()), regular);
+        ctx.set_fonts(fonts);
+        let mut open = false;
+        let mut frame = |events| {
+            let mut actions = Vec::new();
+            let out = headless_ui(&ctx, events, |ui| {
+                archive_section(ui, pal, &ctl, &mut open, now_ms, &mut None, &mut actions);
+            });
+            (actions, out)
+        };
+        // Collapsed: the header only.
+        let (_, out) = frame(Vec::new());
+        let header = painted_at(&out, "归档 (1)").expect("归档 (1)");
+        assert!(painted_at(&out, "old-build").is_none());
+        for events in click_at(header.center()) {
+            frame(events);
+        }
+        // Open: title · workspace · how long ago; no buttons until hovered.
+        let away = vec![egui::Event::PointerMoved(Pos2::new(500.0, 500.0))];
+        let (_, out) = frame(away.clone());
+        let title = painted_at(&out, "old-build").expect("the row");
+        assert!(painted_at(&out, " · proj").is_some());
+        assert!(painted_at(&out, "3d前").is_some());
+        assert!(painted_at(&out, "恢复").is_none());
+        // Hovered: 「恢复」 and 「彻底删除…」 instead of the age.
+        let (_, out) = frame(vec![egui::Event::PointerMoved(title.center())]);
+        assert!(painted_at(&out, "3d前").is_none());
+        assert!(painted_at(&out, "彻底删除…").is_some());
+        let restore = painted_at(&out, "恢复").expect("恢复");
+        let mut got = Vec::new();
+        for events in click_at(restore.center()) {
+            got.extend(frame(events).0);
+        }
+        assert_eq!(got, [UiAction::Menu(MenuAction::Unarchive(old.id))]);
+        // Its context menu has the same entries.
+        let secondary = |pressed| egui::Event::PointerButton {
+            pos: title.center(),
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(vec![secondary(true)]);
+        frame(vec![secondary(false)]);
+        frame(away.clone());
+        let (_, out) = frame(away);
+        let delete = painted_at(&out, "彻底删除…").expect("the menu");
+        let mut got = Vec::new();
+        for events in click_at(delete.center()) {
+            got.extend(frame(events).0);
+        }
+        assert_eq!(got, [UiAction::Menu(MenuAction::DeleteForever(old.id))]);
     }
 
     #[test]

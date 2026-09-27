@@ -3,8 +3,6 @@
 //! entry chosen comes back to the app as `UiAction::Menu` and is applied by
 //! [`apply`]; what only the app can do (clipboard, the rename dialog) is
 //! returned as an [`AppEffect`].
-//!
-//! Archive entries (「归档」, 「归档 session」) come with the archive UI.
 
 use std::time::Instant;
 
@@ -22,6 +20,13 @@ pub enum MenuAction {
     MarkRead(SessionId),
     /// 「恢复运行」 = Revive (a new shell in the session's directory).
     Revive(SessionId),
+    /// 「归档」 / 「归档 session」: asks first while an agent or a command
+    /// runs in it.
+    Archive(SessionId),
+    /// 「恢复」 of an archived session.
+    Unarchive(SessionId),
+    /// 「彻底删除…」 of an archived session: asks first.
+    DeleteForever(SessionId),
     NewSessionIn(WorkspaceId),
     RenameWorkspace(WorkspaceId),
     /// Asks first.
@@ -34,7 +39,8 @@ pub enum MenuAction {
     Split(SplitDir),
     /// Close the pane, keep the session.
     RemoveFromSplit(SessionId),
-    /// 「关闭 pane」 = ⌘W on the pane's session.
+    /// 「关闭 pane」 = ⌘W on that pane: it closes and its session is
+    /// archived.
     ClosePane(SessionId),
 }
 
@@ -114,6 +120,7 @@ pub fn session_row(r: SessionRow) -> Vec<MenuItem> {
             r.unread,
             "没有未读",
         ),
+        item("归档", MenuAction::Archive(r.sid)),
     ];
     if !r.live {
         v.push(item("恢复运行", MenuAction::Revive(r.sid)));
@@ -121,7 +128,16 @@ pub fn session_row(r: SessionRow) -> Vec<MenuItem> {
     v
 }
 
-/// `has_sessions`: dormant ones count (they would be orphaned).
+/// A row of the sidebar's 「归档」 section.
+pub fn archived_row(sid: SessionId) -> Vec<MenuItem> {
+    vec![
+        item("恢复", MenuAction::Unarchive(sid)),
+        item("彻底删除…", MenuAction::DeleteForever(sid)),
+    ]
+}
+
+/// `has_sessions`: dormant and archived ones count (they would be
+/// orphaned).
 pub fn workspace_header(id: WorkspaceId, has_sessions: bool) -> Vec<MenuItem> {
     vec![
         item("新建 session", MenuAction::NewSessionIn(id)),
@@ -157,6 +173,7 @@ pub fn terminal(t: TerminalArea) -> Vec<MenuItem> {
             "只有一个 pane",
         ),
         item("关闭 pane", MenuAction::ClosePane(t.sid)),
+        item("归档 session", MenuAction::Archive(t.sid)),
         item("重命名…", MenuAction::RenameSession(t.sid)),
     ]);
     v
@@ -176,6 +193,9 @@ pub fn apply(
         }
         MenuAction::MarkRead(sid) => ctl.mark_read_now(out, sid),
         MenuAction::Revive(sid) => ctl.revive(out, sid, ReviveMode::Shell, now),
+        MenuAction::Archive(sid) => ctl.request_archive(out, sid, now),
+        MenuAction::Unarchive(sid) => ctl.unarchive(out, sid),
+        MenuAction::DeleteForever(sid) => ctl.request_delete(sid),
         MenuAction::NewSessionIn(ws) => ctl.new_session_in(out, ws),
         MenuAction::RenameWorkspace(id) => {
             return Some(AppEffect::Rename(RenameTarget::Workspace(id)))
@@ -189,7 +209,7 @@ pub fn apply(
         }
         MenuAction::ClosePane(sid) => {
             ctl.focus(out, sid, now);
-            ctl.request_close(out);
+            ctl.request_close(out, now);
         }
     }
     None
@@ -219,13 +239,20 @@ mod tests {
         let m = session_row(row);
         assert_eq!(
             labels(&m),
-            ["在右侧分屏打开", "在下方分屏打开", "重命名…", "标记已读"]
+            [
+                "在右侧分屏打开",
+                "在下方分屏打开",
+                "重命名…",
+                "标记已读",
+                "归档"
+            ]
         );
         assert!(m.iter().all(|i| i.enabled && i.hint.is_none()));
         assert_eq!(
             get(&m, "在下方分屏打开").action,
             MenuAction::OpenInSplit(sid, SplitDir::Down)
         );
+        assert_eq!(get(&m, "归档").action, MenuAction::Archive(sid));
         let m = session_row(SessionRow {
             shown: true,
             unread: false,
@@ -240,6 +267,17 @@ mod tests {
         }
         assert!(!get(&m, "标记已读").enabled, "nothing unread");
         assert!(get(&m, "重命名…").enabled);
+        assert!(get(&m, "归档").enabled, "dormant sessions are archived too");
+    }
+
+    #[test]
+    fn an_archived_row_offers_restore_and_delete() {
+        let sid = SessionId::new();
+        let m = archived_row(sid);
+        assert_eq!(labels(&m), ["恢复", "彻底删除…"]);
+        assert!(m.iter().all(|i| i.enabled));
+        assert_eq!(get(&m, "恢复").action, MenuAction::Unarchive(sid));
+        assert_eq!(get(&m, "彻底删除…").action, MenuAction::DeleteForever(sid));
     }
 
     #[test]
@@ -272,6 +310,7 @@ mod tests {
                 "向下分屏",
                 "从分屏移除",
                 "关闭 pane",
+                "归档 session",
                 "重命名…"
             ]
         );
@@ -288,5 +327,6 @@ mod tests {
             MenuAction::RemoveFromSplit(sid)
         );
         assert_eq!(get(&m, "关闭 pane").action, MenuAction::ClosePane(sid));
+        assert_eq!(get(&m, "归档 session").action, MenuAction::Archive(sid));
     }
 }

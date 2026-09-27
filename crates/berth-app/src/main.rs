@@ -125,6 +125,9 @@ struct GuiArgs {
     /// (end-to-end check only).
     #[arg(long, hide = true)]
     demo_restart: bool,
+    /// Open the sidebar's 「归档」 section at start (screenshot check only).
+    #[arg(long, hide = true)]
+    demo_archive_open: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -264,6 +267,7 @@ fn gui_options(gui: GuiArgs, splits: Vec<(SplitDir, String)>) -> app::GuiOptions
         demo_preedit: gui.demo_preedit,
         demo_hover: gui.demo_hover,
         demo_restart: gui.demo_restart,
+        demo_archive_open: gui.demo_archive_open,
     }
 }
 

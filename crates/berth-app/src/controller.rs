@@ -152,13 +152,14 @@ struct ResumeEntry {
 /// A question the UI must ask before acting.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Confirm {
-    /// ⌘W on a live session running an agent or a command.
-    Kill {
+    /// ⌘W / 「归档」 on a live session running an agent or a command:
+    /// archiving ends it.
+    Archive {
         session: SessionId,
         title: String,
         what: String,
     },
-    /// ⌘W on a dormant / restored session: its history is deleted.
+    /// 「彻底删除…」 of an archived session: its history is deleted.
     Delete { session: SessionId, title: String },
     /// 「删除 workspace…」 on a workspace without sessions.
     DeleteWorkspace { id: WorkspaceId, name: String },
@@ -167,7 +168,7 @@ pub enum Confirm {
 impl Confirm {
     fn session(&self) -> Option<SessionId> {
         match self {
-            Confirm::Kill { session, .. } | Confirm::Delete { session, .. } => Some(*session),
+            Confirm::Archive { session, .. } | Confirm::Delete { session, .. } => Some(*session),
             Confirm::DeleteWorkspace { .. } => None,
         }
     }
@@ -452,10 +453,10 @@ impl Controller {
             .and_then(|e| e.preview.as_ref())
     }
 
-    /// Live sessions whose agent state needs attention (Dock badge).
+    /// Live sessions whose agent state needs attention (Dock badge); never
+    /// archived ones (DESIGN §17.1).
     pub fn attention_count(&self) -> usize {
-        self.sessions
-            .values()
+        self.unarchived()
             .filter(|m| m.is_live() && m.agent.state.needs_attention())
             .count()
     }
@@ -482,11 +483,21 @@ impl Controller {
         self.workspaces.iter().find(|w| w.id == id)
     }
 
+    /// The sessions of the workspace lists: all but the archived ones.
+    fn unarchived(&self) -> impl Iterator<Item = &SessionMeta> {
+        self.sessions.values().filter(|m| !m.is_archived())
+    }
+
+    /// Known and not archived: it may have a pane and a preview (berthd
+    /// refuses to attach or subscribe to an archived session).
+    fn showable(&self, sid: SessionId) -> bool {
+        self.sessions.get(&sid).is_some_and(|m| !m.is_archived())
+    }
+
     /// Live sessions of a workspace in display order.
     pub fn live_in(&self, ws: WorkspaceId) -> Vec<&SessionMeta> {
         let mut v: Vec<&SessionMeta> = self
-            .sessions
-            .values()
+            .unarchived()
             .filter(|m| m.workspace == ws && m.is_live())
             .collect();
         v.sort_by_key(|m| (m.order, m.created_at_ms, m.id));
@@ -496,23 +507,30 @@ impl Controller {
     /// Live sessions whose workspace is unknown.
     pub fn live_orphans(&self) -> Vec<&SessionMeta> {
         let mut v: Vec<&SessionMeta> = self
-            .sessions
-            .values()
+            .unarchived()
             .filter(|m| m.is_live() && self.workspace(m.workspace).is_none())
             .collect();
         v.sort_by_key(|m| (m.created_at_ms, m.id));
         v
     }
 
-    /// Dormant and restored sessions (history only).
+    /// Dormant and restored sessions (history only), not archived.
     pub fn dormant(&self) -> Vec<&SessionMeta> {
         let ws_order = |id: WorkspaceId| self.workspace(id).map_or(u32::MAX, |w| w.order);
-        let mut v: Vec<&SessionMeta> = self.sessions.values().filter(|m| !m.is_live()).collect();
+        let mut v: Vec<&SessionMeta> = self.unarchived().filter(|m| !m.is_live()).collect();
         v.sort_by_key(|m| (ws_order(m.workspace), m.order, m.created_at_ms, m.id));
         v
     }
 
-    /// Sidebar order, which ⌘1..9 follow.
+    /// Archived sessions, the most recently archived first (the sidebar's
+    /// 「归档」 section).
+    pub fn archived(&self) -> Vec<&SessionMeta> {
+        let mut v: Vec<&SessionMeta> = self.sessions.values().filter(|m| m.is_archived()).collect();
+        v.sort_by_key(|m| (std::cmp::Reverse(m.archived_at_ms), m.created_at_ms, m.id));
+        v
+    }
+
+    /// Sidebar order, which ⌘1..9 follow (archived sessions are not in it).
     pub fn jump_order(&self) -> Vec<SessionId> {
         let mut out: Vec<SessionId> = Vec::new();
         for ws in &self.workspaces {
@@ -777,7 +795,7 @@ impl Controller {
             } => {
                 if self
                     .policy
-                    .program_notify(session, self.attended(session), now)
+                    .program_notify(session, self.muted(session), now)
                 {
                     let body = match title {
                         Some(t) if !t.is_empty() => format!("{t}: {body}"),
@@ -790,11 +808,8 @@ impl Controller {
                 }
             }
             Event::AgentChanged { session, agent } => {
-                let attended = self.attended(session);
-                if self
-                    .policy
-                    .agent_changed(session, &agent.state, attended, now)
-                {
+                let muted = self.muted(session);
+                if self.policy.agent_changed(session, &agent.state, muted, now) {
                     effects.push(Effect::Notify {
                         title: self.qualified_title(session),
                         body: notify::body(&agent.kind, &agent.state),
@@ -851,6 +866,16 @@ impl Controller {
 
     fn attended(&self, sid: SessionId) -> bool {
         self.focused == Some(sid) && self.window_focused
+    }
+
+    /// No desktop notification for `sid`: it is being looked at, or it is
+    /// archived (DESIGN §17.1). The policy still follows its state.
+    fn muted(&self, sid: SessionId) -> bool {
+        self.attended(sid)
+            || self
+                .sessions
+                .get(&sid)
+                .is_some_and(SessionMeta::is_archived)
     }
 
     fn on_error(
@@ -943,7 +968,7 @@ impl Controller {
         }
         // `--session`, with `--split-*` a whole layout.
         if let Some(want) = self.want.take() {
-            match self.find_session(&want) {
+            match self.find_showable(&want) {
                 Ok(sid) => {
                     let splits = std::mem::take(&mut self.want_splits);
                     if splits.is_empty() {
@@ -956,20 +981,24 @@ impl Controller {
             }
         }
         self.want_splits.clear();
-        // Sessions that went away while disconnected.
+        // Sessions that went away or were archived while disconnected.
         let sessions = &self.sessions;
         self.layout = self
             .layout
             .take()
-            .and_then(|t| t.prune(|sid| sessions.contains_key(&sid)));
-        if self.layout.is_none() {
+            .and_then(|t| t.prune(|sid| sessions.get(&sid).is_some_and(|m| !m.is_archived())));
+        // The first listing fills an empty terminal area; a later one (a
+        // reconnect) leaves it as it was (the last pane may have been closed).
+        if self.layout.is_none() && !self.layout_ready {
             if let Some(first) = self.jump_order().first().copied() {
                 self.show(first);
             }
         }
         self.layout_ready = true;
         self.sync_panes(out, now);
-        if self.sessions.is_empty() && self.auto_session && !self.auto_created {
+        // First start: berthd has no session (archived ones aside).
+        let none = self.sessions.values().all(SessionMeta::is_archived);
+        if none && self.auto_session && !self.auto_created {
             self.auto_created = true;
             self.new_session(out);
         }
@@ -985,7 +1014,7 @@ impl Controller {
                 Some((s, t)) => (s, Some(t)),
                 None => (spec.as_str(), None),
             };
-            let placed = self.find_session(want).and_then(|sid| {
+            let placed = self.find_showable(want).and_then(|sid| {
                 let target = match target {
                     Some(t) => self.find_session(t)?,
                     None => last,
@@ -1003,6 +1032,16 @@ impl Controller {
         }
         self.layout = Some(tree);
         self.focused = Some(first);
+    }
+
+    /// [`Self::find_session`] for a pane: not an archived session.
+    fn find_showable(&self, want: &str) -> std::result::Result<SessionId, String> {
+        let sid = self.find_session(want)?;
+        if self.showable(sid) {
+            Ok(sid)
+        } else {
+            Err(format!("{} 已归档，先在侧栏「归档」里恢复", sid.short()))
+        }
     }
 
     /// A session id or unique prefix (with or without dashes).
@@ -1040,6 +1079,7 @@ impl Controller {
             self.mark_read_sent.remove(&sid);
         }
         let live = meta.is_live();
+        let archived = meta.is_archived();
         self.sessions.insert(sid, meta);
         if let Some(Awaiting::CreateSession { split }) = awaiting {
             // Beside the pane it was split from; if that pane went away
@@ -1062,6 +1102,15 @@ impl Controller {
             } else {
                 self.focus(out, sid, now);
             }
+            return;
+        }
+        if archived {
+            // By us or by berthd's scan: it leaves its pane (berthd refuses
+            // to attach it), and a question about archiving it is moot.
+            if matches!(&self.confirm, Some(Confirm::Archive { session, .. }) if *session == sid) {
+                self.confirm = None;
+            }
+            self.close_pane(out, sid, now);
             return;
         }
         let Some(p) = self.panes.get_mut(&sid) else {
@@ -1134,7 +1183,7 @@ impl Controller {
     /// Show `sid`: focus its pane if it has one, else show it in the
     /// focused pane (sidebar click, ⌘1..9, a new session).
     pub fn focus(&mut self, out: &mut dyn Outbound, sid: SessionId, now: Instant) {
-        if !self.sessions.contains_key(&sid) {
+        if !self.showable(sid) {
             return;
         }
         self.show(sid);
@@ -1166,7 +1215,7 @@ impl Controller {
         dir: SplitDir,
         now: Instant,
     ) {
-        if !self.sessions.contains_key(&sid) {
+        if !self.showable(sid) {
             return;
         }
         let target = self.focused.filter(|f| self.panes_in_layout(*f));
@@ -1444,10 +1493,14 @@ impl Controller {
             return;
         }
         for &sid in visible {
+            // Archived (just now, the list was drawn before): no preview.
+            if !self.showable(sid) {
+                continue;
+            }
             if self.sessions.get(&sid).is_some_and(resumable) {
                 self.want_resume(out, sid);
             }
-            if self.panes.contains_key(&sid) || !self.sessions.contains_key(&sid) {
+            if self.panes.contains_key(&sid) {
                 continue;
             }
             match self.subs.get_mut(&sid) {
@@ -1834,38 +1887,101 @@ impl Controller {
         }
     }
 
-    /// ⌘W: kill a live session (asking first when an agent or a command
-    /// runs); a dormant one is deleted after confirmation.
-    pub fn request_close(&mut self, out: &mut dyn Outbound) {
-        let Some(meta) = self.focused_meta() else {
+    /// ⌘W / 「关闭 pane」 (DESIGN §17.3): close the focused pane and archive
+    /// its session ([`Self::request_archive`]). A session never has a
+    /// second pane, so no pane is left showing it. Deleting a session is
+    /// 「彻底删除…」 in the 「归档」 section.
+    pub fn request_close(&mut self, out: &mut dyn Outbound, now: Instant) {
+        if let Some(sid) = self.focused {
+            self.request_archive(out, sid, now);
+        }
+    }
+
+    /// 「归档」 (DESIGN §17.1): a live session running an agent or a
+    /// command asks first ([`Confirm::Archive`]), any other at once. Only
+    /// `Archive` is sent (berthd ends a live session itself); its pane
+    /// closes as it goes out.
+    pub fn request_archive(&mut self, out: &mut dyn Outbound, sid: SessionId, now: Instant) {
+        let Some(meta) = self.sessions.get(&sid).filter(|m| !m.is_archived()) else {
             return;
         };
-        let (sid, title) = (meta.id, meta.title().to_string());
-        if meta.is_live() {
-            let agent = &meta.agent;
-            if agent.kind.is_agent() || agent.state.is_busy() {
-                let what = if agent.kind.is_agent() {
-                    format!("{} 正在这个 session 里运行", notify_name(&agent.kind))
-                } else {
-                    "这个 session 里有命令正在运行".to_string()
-                };
-                self.confirm = Some(Confirm::Kill {
-                    session: sid,
-                    title,
-                    what,
-                });
+        let agent = &meta.agent;
+        if meta.is_live() && (agent.kind.is_agent() || agent.state.is_busy()) {
+            let what = if agent.kind.is_agent() {
+                format!("{} 正在这个 session 里运行", notify_name(&agent.kind))
             } else {
-                self.kill(out, sid);
+                "这个 session 里有命令正在运行".to_string()
+            };
+            self.confirm = Some(Confirm::Archive {
+                session: sid,
+                title: meta.title().to_string(),
+                what,
+            });
+            return;
+        }
+        self.archive(out, sid, now);
+    }
+
+    /// Send `Archive`; once sent, `sid`'s pane closes.
+    fn archive(&mut self, out: &mut dyn Outbound, sid: SessionId, now: Instant) {
+        let req = Request::Archive { session: sid };
+        if self
+            .send(out, req, Some(Awaiting::Command("归档")))
+            .is_some()
+        {
+            self.close_pane(out, sid, now);
+        }
+    }
+
+    /// Take `sid`'s pane out of the layout: the neighbour takes the space
+    /// (and the focus, if it had it); after the last pane the terminal area
+    /// is empty.
+    fn close_pane(&mut self, out: &mut dyn Outbound, sid: SessionId, now: Instant) {
+        let Some(tree) = self.layout.as_mut() else {
+            return;
+        };
+        match tree.remove(sid) {
+            Removal::Removed { focus } => {
+                if self.focused == Some(sid) {
+                    self.focused = Some(focus);
+                }
             }
-        } else {
+            Removal::LastPane => {
+                self.layout = None;
+                self.focused = None;
+            }
+            Removal::NotShown => return,
+        }
+        self.sync_panes(out, now);
+    }
+
+    /// 「恢复」 of an archived session: back in its workspace, dormant
+    /// (Revive as before).
+    pub fn unarchive(&mut self, out: &mut dyn Outbound, sid: SessionId) {
+        if self
+            .sessions
+            .get(&sid)
+            .is_some_and(SessionMeta::is_archived)
+        {
+            self.send(
+                out,
+                Request::Unarchive { session: sid },
+                Some(Awaiting::Command("恢复")),
+            );
+        }
+    }
+
+    /// 「彻底删除…」 of an archived session: asks first.
+    pub fn request_delete(&mut self, sid: SessionId) {
+        if let Some(m) = self.sessions.get(&sid).filter(|m| m.is_archived()) {
             self.confirm = Some(Confirm::Delete {
                 session: sid,
-                title,
+                title: m.title().to_string(),
             });
         }
     }
 
-    pub fn answer_confirm(&mut self, out: &mut dyn Outbound, yes: bool) {
+    pub fn answer_confirm(&mut self, out: &mut dyn Outbound, yes: bool, now: Instant) {
         let Some(c) = self.confirm.take() else {
             return;
         };
@@ -1873,7 +1989,7 @@ impl Controller {
             return;
         }
         match c {
-            Confirm::Kill { session, .. } => self.kill(out, session),
+            Confirm::Archive { session, .. } => self.archive(out, session, now),
             Confirm::Delete { session, .. } => {
                 self.send(
                     out,
@@ -1925,8 +2041,8 @@ impl Controller {
         );
     }
 
-    /// Whether a workspace has sessions (dormant ones count: deleting the
-    /// workspace would orphan them).
+    /// Whether a workspace has sessions (dormant and archived ones count:
+    /// deleting the workspace would orphan them).
     pub fn workspace_has_sessions(&self, id: WorkspaceId) -> bool {
         self.sessions.values().any(|m| m.workspace == id)
     }
@@ -1953,14 +2069,6 @@ impl Controller {
             out,
             Request::MarkRead { session: sid },
             Some(Awaiting::Command("标记已读")),
-        );
-    }
-
-    fn kill(&mut self, out: &mut dyn Outbound, session: SessionId) {
-        self.send(
-            out,
-            Request::Kill { session },
-            Some(Awaiting::Command("关闭 session ")),
         );
     }
 
@@ -2694,8 +2802,19 @@ mod tests {
         assert!(c.notices().is_empty());
     }
 
+    /// A session archived by berthd (its answer to `Archive`, or its scan).
+    fn archived(m: &SessionMeta, at_ms: i64) -> SessionMeta {
+        let mut m = m.clone();
+        m.status = SessionStatus::Dormant {
+            exit_code: None,
+            at_ms,
+        };
+        m.archived_at_ms = Some(at_ms);
+        m
+    }
+
     #[test]
-    fn close_confirms_for_agents_and_dormant_sessions() {
+    fn close_archives_the_focused_session_and_asks_first_while_it_is_busy() {
         let w = ws(0);
         let mut agent = session(&w, 0, true);
         agent.agent = AgentInfo {
@@ -2703,40 +2822,236 @@ mod tests {
             state: AgentState::Idle,
             ..Default::default()
         };
-        let shell = session(&w, 1, true);
-        let dormant = session(&w, 2, false);
+        let mut busy = session(&w, 1, true);
+        busy.agent.state = AgentState::Thinking;
+        let shell = session(&w, 2, true);
+        let dormant = session(&w, 3, false);
         let mut c = Controller::new(vec![]);
         let mut out = Fake::default();
         listed(
             &mut c,
             &mut out,
             vec![w],
-            vec![agent.clone(), shell.clone(), dormant.clone()],
+            vec![agent.clone(), busy.clone(), shell.clone(), dormant.clone()],
         );
         let now = Instant::now();
-        c.request_close(&mut out);
-        assert!(matches!(c.confirm(), Some(Confirm::Kill { session, .. }) if *session == agent.id));
-        c.answer_confirm(&mut out, false);
+        // Live with an agent: asks; 「取消」 changes nothing.
+        c.request_close(&mut out, now);
+        assert!(matches!(
+            c.confirm(),
+            Some(Confirm::Archive { session, what, .. })
+                if *session == agent.id && what.contains("claude")
+        ));
+        c.answer_confirm(&mut out, false, now);
         assert!(out.take().is_empty() && c.confirm().is_none());
-        c.request_close(&mut out);
-        c.answer_confirm(&mut out, true);
-        assert!(
-            matches!(out.take().as_slice(), [(_, Request::Kill { session })] if *session == agent.id)
+        assert_eq!(c.layout(), Some(&PaneTree::Leaf(agent.id)));
+        // Confirmed: only `Archive` (berthd ends the session itself); the
+        // pane closes, and without another one the terminal area is empty.
+        c.request_close(&mut out, now);
+        c.answer_confirm(&mut out, true, now);
+        assert_eq!(
+            names(&out.take()),
+            [n("Archive", agent.id), n("Detach", agent.id)]
         );
-        c.focus(&mut out, shell.id, now);
+        assert_eq!(c.layout(), None);
+        assert_eq!(c.focused(), None);
+        c.request_close(&mut out, now);
+        assert!(out.take().is_empty() && c.confirm().is_none(), "no pane");
+        // A command running: asks too.
+        c.focus(&mut out, busy.id, now);
         out.take();
-        c.request_close(&mut out);
-        assert!(
-            matches!(out.take().as_slice(), [(_, Request::Kill { session })] if *session == shell.id)
+        c.request_close(&mut out, now);
+        assert!(matches!(
+            c.confirm(),
+            Some(Confirm::Archive { session, what, .. })
+                if *session == busy.id && what.contains("命令")
+        ));
+        c.answer_confirm(&mut out, false, now);
+        // An idle shell and a dormant session: at once.
+        for s in [&shell, &dormant] {
+            c.focus(&mut out, s.id, now);
+            out.take();
+            c.request_close(&mut out, now);
+            assert!(c.confirm().is_none());
+            assert_eq!(names(&out.take()), [n("Archive", s.id), n("Detach", s.id)]);
+            assert_eq!(c.layout(), None);
+        }
+    }
+
+    #[test]
+    fn archived_sessions_are_left_out_of_the_lists_the_badge_and_notifications() {
+        let w = ws(0);
+        let mut a = session(&w, 0, true);
+        a.agent.state = AgentState::WaitingInput;
+        let b = session(&w, 1, false);
+        let mut old = archived(&session(&w, 2, false), 10);
+        old.agent.state = AgentState::Done;
+        // Never sent by berthd (an archived session is not live); the
+        // filters do not rely on that.
+        let mut odd = session(&w, 3, true);
+        odd.archived_at_ms = Some(20);
+        odd.agent.state = AgentState::WaitingPermission { tool: None };
+        let mut c = Controller::new(notify::DEFAULT_ON.iter().map(|s| s.to_string()).collect());
+        let mut out = Fake::default();
+        listed(
+            &mut c,
+            &mut out,
+            vec![w.clone()],
+            vec![a.clone(), b.clone(), old.clone(), odd.clone()],
         );
-        c.focus(&mut out, dormant.id, now);
+        assert_eq!(c.jump_order(), [a.id, b.id], "⌘1..9");
+        assert_eq!(c.live_in(w.id).len(), 1);
+        assert_eq!(c.dormant().len(), 1);
+        let ids: Vec<SessionId> = c.archived().iter().map(|m| m.id).collect();
+        assert_eq!(ids, [odd.id, old.id], "most recently archived first");
+        assert_eq!(c.attention_count(), 1, "the Dock badge");
+        let now = Instant::now();
+        // No preview, no pane.
+        c.set_visible(&mut out, &[a.id, b.id, old.id, odd.id], now);
+        assert_eq!(names(&out.take()), [n("Subscribe", b.id)]);
+        c.focus(&mut out, old.id, now);
+        c.open_in_split(&mut out, odd.id, SplitDir::Right, now);
+        assert_eq!(c.layout(), Some(&PaneTree::Leaf(a.id)));
+        assert!(out.take().is_empty());
+        // Nobody looks at the window: only sessions in the lists notify.
+        c.set_window_focused(&mut out, false);
+        let changed = |sid| {
+            push(Event::AgentChanged {
+                session: sid,
+                agent: AgentInfo {
+                    kind: AgentKind::Claude,
+                    state: AgentState::WaitingInput,
+                    ..Default::default()
+                },
+            })
+        };
+        let note = |sid| {
+            push(Event::Notify {
+                session: sid,
+                title: None,
+                body: "hi".into(),
+            })
+        };
+        for sid in [old.id, odd.id] {
+            assert!(c.handle(&mut out, changed(sid), now).is_empty());
+            assert!(c.handle(&mut out, note(sid), now).is_empty());
+        }
+        assert_eq!(c.attention_count(), 1);
+        assert_eq!(c.handle(&mut out, changed(b.id), now).len(), 1);
+        assert_eq!(c.handle(&mut out, note(a.id), now).len(), 1);
+    }
+
+    #[test]
+    fn an_archived_session_leaves_its_pane_and_the_last_one_leaves_the_area_empty() {
+        let w = ws(0);
+        let a = session(&w, 0, true);
+        let mut b = session(&w, 1, true);
+        b.agent.kind = AgentKind::Claude;
+        let x = session(&w, 2, true);
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        listed(
+            &mut c,
+            &mut out,
+            vec![w.clone()],
+            vec![a.clone(), b.clone(), x.clone()],
+        );
+        let now = Instant::now();
+        c.open_in_split(&mut out, b.id, SplitDir::Right, now);
+        c.request_archive(&mut out, b.id, now);
+        assert!(matches!(c.confirm(), Some(Confirm::Archive { session, .. }) if *session == b.id));
         out.take();
-        c.request_close(&mut out);
-        assert!(matches!(c.confirm(), Some(Confirm::Delete { .. })));
-        c.answer_confirm(&mut out, true);
-        assert!(
-            matches!(out.take().as_slice(), [(_, Request::Delete { session })] if *session == dormant.id)
+        // berthd's scan archives it meanwhile: its pane closes (the
+        // neighbour takes the focus) and the question is moot.
+        c.handle(&mut out, push(Event::SessionUpdated(archived(&b, 5))), now);
+        assert!(c.confirm().is_none());
+        assert_eq!(c.layout(), Some(&PaneTree::Leaf(a.id)));
+        assert_eq!(c.focused(), Some(a.id));
+        assert_eq!(names(&out.take()), [n("Detach", b.id)]);
+        // The last pane: the terminal area is empty; nothing else opens.
+        c.handle(&mut out, push(Event::SessionUpdated(archived(&a, 6))), now);
+        assert_eq!(c.layout(), None);
+        assert_eq!(c.focused(), None);
+        assert_eq!(names(&out.take()), [n("Detach", a.id)]);
+        assert_eq!(c.jump_order(), [x.id]);
+        // A click opens one.
+        c.focus(&mut out, x.id, now);
+        assert_eq!(names(&out.take()), [n("Attach", x.id)]);
+
+        // Archived while disconnected: pruned at the reconnect …
+        c.open_in_split(&mut out, a.id, SplitDir::Down, now);
+        assert_eq!(c.layout(), Some(&PaneTree::Leaf(x.id)), "not archived ones");
+        c.handle(&mut out, push(Event::SessionUpdated(a.clone())), now); // restored, revived
+        c.open_in_split(&mut out, a.id, SplitDir::Down, now);
+        assert_eq!(c.layout().unwrap().leaves(), [x.id, a.id]);
+        out.take();
+        c.on_disconnected("gone");
+        let sent = listed(
+            &mut c,
+            &mut out,
+            vec![w.clone()],
+            vec![archived(&a, 7), archived(&b, 5), x.clone()],
         );
+        assert_eq!(c.layout(), Some(&PaneTree::Leaf(x.id)));
+        assert_eq!(names(&sent), [n("Attach", x.id)]);
+        // … and a reconnect leaves an empty area empty.
+        c.on_disconnected("gone");
+        let sent = listed(
+            &mut c,
+            &mut out,
+            vec![w],
+            vec![archived(&a, 7), archived(&b, 5), archived(&x, 8)],
+        );
+        assert_eq!(c.layout(), None);
+        assert!(sent.is_empty(), "{sent:?}");
+    }
+
+    #[test]
+    fn an_archived_session_is_not_opened_at_start() {
+        let w = ws(0);
+        let a = session(&w, 0, true);
+        let old = archived(&session(&w, 1, false), 1);
+        // `--session` / `--split-right` naming it: an error, the rest opens.
+        for split in [false, true] {
+            let mut c = Controller::new(vec![]);
+            if split {
+                c.want_session(a.id.short());
+                c.want_split(SplitDir::Right, old.id.short());
+            } else {
+                c.want_session(old.id.short());
+            }
+            let mut out = Fake::default();
+            let sent = listed(
+                &mut c,
+                &mut out,
+                vec![w.clone()],
+                vec![a.clone(), old.clone()],
+            );
+            assert_eq!(c.layout(), Some(&PaneTree::Leaf(a.id)));
+            assert_eq!(names(&sent), [n("Attach", a.id)]);
+            assert!(
+                c.notices().iter().any(|n| n.text.contains("已归档")),
+                "{:?}",
+                c.notices()
+            );
+        }
+        // Nothing but archived sessions: a first start (one is created).
+        let mut c = Controller::new(vec![]);
+        let mut out = Fake::default();
+        c.on_connected(&mut out);
+        let sent = out.take();
+        let now = Instant::now();
+        c.handle(
+            &mut out,
+            reply(sent[0].0, Event::Workspaces(vec![w.clone()])),
+            now,
+        );
+        c.handle(&mut out, reply(sent[1].0, Event::Sessions(vec![old])), now);
+        assert_eq!(c.layout(), None);
+        assert!(matches!(
+            out.take().as_slice(),
+            [(_, Request::CreateSession { workspace, .. })] if *workspace == w.id
+        ));
     }
 
     #[test]
@@ -2888,7 +3203,10 @@ mod tests {
                     | Request::Resize { session, .. }
                     | Request::Kill { session }
                     | Request::MarkRead { session }
-                    | Request::Revive { session, .. } => Some(*session),
+                    | Request::Revive { session, .. }
+                    | Request::Archive { session }
+                    | Request::Unarchive { session }
+                    | Request::Delete { session } => Some(*session),
                     _ => None,
                 };
                 (name.to_string(), session)
@@ -3024,13 +3342,14 @@ mod tests {
         );
         c.set_visible(&mut out, &[a.id, b.id, x.id], now);
         assert_eq!(names(&out.take()), [n("Subscribe", a.id)]);
-        // ⌘W acts on the focused pane's session; once berthd removed it
-        // the neighbour takes the space and the focus (no Detach).
-        c.request_close(&mut out);
-        assert_eq!(names(&out.take()), [n("Kill", x.id)]);
-        c.handle(&mut out, push(Event::SessionRemoved(x.id)), now);
+        // ⌘W closes only the focused pane and archives its session (an
+        // idle shell: at once); the neighbour takes the space and the focus.
+        c.request_close(&mut out, now);
+        assert_eq!(names(&out.take()), [n("Archive", x.id), n("Detach", x.id)]);
         assert_eq!(c.layout(), Some(&PaneTree::Leaf(b.id)));
         assert_eq!(c.focused(), Some(b.id));
+        c.handle(&mut out, push(Event::SessionUpdated(archived(&x, 1))), now);
+        assert_eq!(c.layout(), Some(&PaneTree::Leaf(b.id)));
         assert!(out.take().is_empty());
         assert_eq!(
             c.pane_dims(b.id),
@@ -3255,8 +3574,12 @@ mod tests {
         act(&mut c, MenuAction::Revive(b.id));
         act(&mut c, MenuAction::NewSessionIn(w.id));
         act(&mut c, MenuAction::Split(SplitDir::Right));
-        // 「关闭 pane」 is ⌘W on that pane.
+        // 「关闭 pane」 is ⌘W on that pane: it closes (the last one) and its
+        // session is archived.
         act(&mut c, MenuAction::ClosePane(a.id));
+        assert_eq!(c.layout(), None);
+        // 「归档」 of a dormant session: at once.
+        act(&mut c, MenuAction::Archive(b.id));
         // Refused while the workspace has sessions.
         act(&mut c, MenuAction::DeleteWorkspace(w.id));
         assert!(c.confirm().is_none());
@@ -3279,7 +3602,9 @@ mod tests {
                 "CreateSession", // Split
                 "Detach",        // ClosePane focuses a again …
                 "Attach",
-                "Kill", // … and closes it (idle shell)
+                "Archive", // … archives it (an idle shell: at once) …
+                "Detach",  // … and its pane closes
+                "Archive", // Archive (b)
             ],
             "{sent:?}"
         );
@@ -3287,10 +3612,22 @@ mod tests {
             &sent[5].1,
             Request::Revive { session, mode: ReviveMode::Shell } if *session == b.id
         ));
+        assert!(matches!(&sent[10].1, Request::Archive { session } if *session == a.id));
+        assert!(matches!(&sent[12].1, Request::Archive { session } if *session == b.id));
+        // The 「归档」 section's entries, once berthd archived b.
+        c.handle(&mut out, push(Event::SessionUpdated(archived(&b, 1))), now);
+        apply(&mut c, &mut out, MenuAction::Unarchive(b.id), now);
+        assert_eq!(names(&out.take()), [n("Unarchive", b.id)]);
+        apply(&mut c, &mut out, MenuAction::DeleteForever(b.id), now);
+        assert!(matches!(c.confirm(), Some(Confirm::Delete { session, .. }) if *session == b.id));
+        assert!(out.take().is_empty(), "asks first");
+        c.answer_confirm(&mut out, true, now);
+        assert_eq!(names(&out.take()), [n("Delete", b.id)]);
     }
 
     /// Against the real daemon: create, type, page through history, paste
-    /// through the chunked pipeline, kill and revive with history kept.
+    /// through the chunked pipeline, close (archive), restore and revive
+    /// with history kept.
     #[test]
     fn real_daemon_session_lifecycle() {
         use crate::client::ClientEvent;
@@ -3391,16 +3728,31 @@ mod tests {
         );
         assert!(c.notices().is_empty(), "{:?}", c.notices());
 
-        // Kill (a plain command: no confirmation), then revive the same argv.
-        c.request_close(&mut client);
+        // ⌘W (a plain command: no confirmation): the pane closes and berthd
+        // ends the session, then archives it.
+        c.request_close(&mut client, Instant::now());
         if c.confirm().is_some() {
-            c.answer_confirm(&mut client, true);
+            c.answer_confirm(&mut client, true, Instant::now());
         }
+        assert_eq!(c.layout(), None);
         pump(
             &mut c,
             &mut client,
-            &|c| c.session(sid).is_some_and(|m| !m.is_live()),
-            "the session to go dormant",
+            &|c| {
+                c.session(sid)
+                    .is_some_and(|m| m.is_archived() && !m.is_live())
+            },
+            "the session to be archived",
+        );
+        assert!(c.jump_order().is_empty());
+        assert_eq!(c.archived().len(), 1);
+        // 「恢复」, then revive the same argv.
+        c.unarchive(&mut client, sid);
+        pump(
+            &mut c,
+            &mut client,
+            &|c| c.session(sid).is_some_and(|m| !m.is_archived()),
+            "the session to be restored",
         );
         c.revive(&mut client, sid, ReviveMode::Shell, Instant::now());
         pump(
