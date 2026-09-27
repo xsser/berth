@@ -64,6 +64,11 @@ pub struct Manager {
     pub(crate) store: Store,
     started_ms: i64,
     reg: Mutex<Registry>,
+    /// Orders the writes of session and workspace metadata to the store and
+    /// their broadcasts (`persist`, `commit_workspace`) with the removals
+    /// (`delete_session`, `delete_workspace`). Taken before `reg`, never
+    /// while holding it.
+    persist_lock: Mutex<()>,
     conns: Mutex<HashMap<ConnId, ConnEntry>>,
     next_conn: AtomicU64,
     stop_tx: watch::Sender<bool>,
@@ -185,6 +190,7 @@ impl Manager {
             store,
             started_ms: now,
             reg: Mutex::new(reg),
+            persist_lock: Mutex::new(()),
             conns: Mutex::new(HashMap::new()),
             next_conn: AtomicU64::new(1),
             stop_tx,
@@ -239,17 +245,54 @@ impl Manager {
 
     // -- persistence helpers ------------------------------------------------
 
-    fn persist(&self, meta: &SessionMeta) {
-        if let Err(e) = self.store.upsert_session(meta) {
-            tracing::warn!(session = %meta.id, error = %e, "cannot persist session");
+    /// Store the session's current metadata and, with `send`, broadcast it
+    /// as `SessionUpdated`; returns it. `None`: the session is gone, and
+    /// nothing is stored or sent — a removed session is never written back.
+    ///
+    /// The metadata is read from the registry here, under `persist_lock`,
+    /// not taken from the caller. Callers change the registry under `reg`
+    /// and write afterwards, so two of them can write in the opposite order
+    /// of their changes: with their own clones, the later write could carry
+    /// the older state (an exit's Dormant clone, taken before `archive` set
+    /// its mark, stored after it, erased the mark). Read and written under
+    /// one lock, the last write always has the latest state, in the store
+    /// and for the clients.
+    fn persist(&self, sid: SessionId, send: bool) -> Option<SessionMeta> {
+        let _order = self.persist_lock.lock();
+        let meta = self.meta(sid)?;
+        if let Err(e) = self.store.upsert_session(&meta) {
+            tracing::warn!(session = %sid, error = %e, "cannot persist session");
         }
+        if send {
+            self.broadcast(Event::SessionUpdated(meta.clone()));
+        }
+        Some(meta)
     }
 
-    /// Persist + broadcast `SessionUpdated`.
+    /// Persist + broadcast `SessionUpdated` for `meta`'s session, with its
+    /// current metadata rather than `meta` (see `persist`); returns that, or
+    /// `meta` when the session is gone (then nothing was written or sent).
     fn commit(&self, meta: SessionMeta) -> SessionMeta {
-        self.persist(&meta);
-        self.broadcast(Event::SessionUpdated(meta.clone()));
-        meta
+        self.persist(meta.id, true).unwrap_or(meta)
+    }
+
+    /// Like `commit` for a workspace: store and broadcast its current state,
+    /// read under `persist_lock` (a rename's late write cannot undo a later
+    /// rename, nor bring back a deleted workspace).
+    fn commit_workspace(&self, ws: Workspace) -> Result<Workspace> {
+        let _order = self.persist_lock.lock();
+        let ws = self
+            .reg
+            .lock()
+            .workspaces
+            .get(&ws.id)
+            .cloned()
+            .ok_or("unknown workspace")?;
+        self.store
+            .upsert_workspace(&ws)
+            .map_err(|e| e.to_string())?;
+        self.broadcast(Event::WorkspaceUpdated(ws.clone()));
+        Ok(ws)
     }
 
     fn update(
@@ -326,14 +369,13 @@ impl Manager {
             (applied, entry.meta.clone(), unread_changed)
         };
         self.record(sid, now, applied.kind, &meta.agent.state, applied.detail);
-        self.persist(&meta);
+        // This transition's own result (clients may act on each state), then
+        // the current metadata: stored, and sent when it matters.
         self.broadcast(Event::AgentChanged {
             session: sid,
             agent: meta.agent.clone(),
         });
-        if unread_changed || !meta.is_live() {
-            self.broadcast(Event::SessionUpdated(meta));
-        }
+        self.persist(sid, unread_changed || !meta.is_live());
         true
     }
 
@@ -419,16 +461,15 @@ impl Manager {
     }
 
     pub(crate) fn set_dims(&self, sid: SessionId, dims: Dims) {
-        let meta = {
+        {
             let mut reg = self.reg.lock();
             let Some(e) = reg.sessions.get_mut(&sid) else {
                 return;
             };
             e.meta.cols = dims.cols;
             e.meta.rows = dims.rows;
-            e.meta.clone()
-        };
-        self.persist(&meta);
+        }
+        self.persist(sid, false);
     }
 }
 
@@ -546,12 +587,11 @@ impl Manager {
             reg.workspaces.insert(ws.id, ws.clone());
             ws
         };
-        if let Err(e) = self.store.upsert_workspace(&ws) {
-            self.reg.lock().workspaces.remove(&ws.id);
-            return Err(format!("cannot persist workspace: {e}"));
-        }
-        self.broadcast(Event::WorkspaceUpdated(ws.clone()));
-        Ok(ws)
+        let id = ws.id;
+        self.commit_workspace(ws).map_err(|e| {
+            self.reg.lock().workspaces.remove(&id);
+            format!("cannot persist workspace: {e}")
+        })
     }
 
     pub fn rename_workspace(&self, id: WorkspaceId, name: String) -> Result<Workspace> {
@@ -561,17 +601,16 @@ impl Manager {
             ws.name = name;
             ws.clone()
         };
-        self.store
-            .upsert_workspace(&ws)
-            .map_err(|e| e.to_string())?;
-        self.broadcast(Event::WorkspaceUpdated(ws.clone()));
-        Ok(ws)
+        self.commit_workspace(ws)
     }
 
     /// Refuses while sessions still belong to the workspace, archived ones
     /// included (DESIGN §17.2), saying how many: deleting them would purge
     /// history, and the client must do that explicitly.
     pub fn delete_workspace(&self, id: WorkspaceId) -> Result<()> {
+        // Removed and deleted under `persist_lock`: a write that read the
+        // workspace before cannot land after (see `commit_workspace`).
+        let _order = self.persist_lock.lock();
         {
             let mut reg = self.reg.lock();
             if !reg.workspaces.contains_key(&id) {
@@ -674,8 +713,17 @@ impl Manager {
             Err(e) => Err(format!("cannot start session thread: {e}")),
         };
         if let Err(e) = started {
-            // Dropping the handle stops an actor that is merely late.
-            let entry = self.reg.lock().sessions.remove(&meta.id);
+            // Dropping the handle stops an actor that is merely late. What it
+            // may have stored meanwhile goes too: removed and purged under
+            // `persist_lock`, like `delete_session`.
+            let entry = {
+                let _order = self.persist_lock.lock();
+                let entry = self.reg.lock().sessions.remove(&meta.id);
+                if let Err(e) = self.store.purge_session(meta.id) {
+                    tracing::warn!(session = %meta.id, error = %e, "cannot purge a session that did not start");
+                }
+                entry
+            };
             if let Some(join) = entry.and_then(|e| e.actor).and_then(|a| a.join) {
                 join_within(join, Duration::from_secs(1)).await;
             }
@@ -1111,6 +1159,10 @@ impl Manager {
                 }
             }
         }
+        // Removed and purged under `persist_lock`: a write that read the
+        // session before cannot land after the purge, and one after finds
+        // it gone (`persist`).
+        let _order = self.persist_lock.lock();
         self.reg.lock().sessions.remove(&sid);
         self.store.purge_session(sid).map_err(|e| e.to_string())?;
         self.broadcast(Event::SessionRemoved(sid));
@@ -1209,7 +1261,7 @@ impl Manager {
                 self.transition(sid, Signal::Codex(notify), |_| {});
             }
             AgentSignal::Statusline(update) => {
-                let meta = {
+                let agent = {
                     let mut reg = self.reg.lock();
                     let Some(e) = reg.sessions.get_mut(&sid) else {
                         return;
@@ -1218,13 +1270,13 @@ impl Manager {
                         return;
                     }
                     e.meta.agent = e.machine.info().clone();
-                    e.meta.clone()
+                    e.meta.agent.clone()
                 };
-                self.persist(&meta);
                 self.broadcast(Event::AgentChanged {
                     session: sid,
-                    agent: meta.agent,
+                    agent,
                 });
+                self.persist(sid, false);
             }
         }
     }
@@ -1345,17 +1397,11 @@ impl Manager {
                 }
             }
         }
-        let metas: Vec<SessionMeta> = self
-            .reg
-            .lock()
-            .sessions
-            .values()
-            .map(|e| e.meta.clone())
-            .collect();
-        for meta in &metas {
-            self.persist(meta);
+        let sids: Vec<SessionId> = self.reg.lock().sessions.keys().copied().collect();
+        for sid in &sids {
+            self.persist(*sid, false);
         }
-        tracing::info!(sessions = metas.len(), "sessions saved");
+        tracing::info!(sessions = sids.len(), "sessions saved");
     }
 }
 
@@ -2161,6 +2207,134 @@ mod tests {
         let later = || now_ms() + 10_000;
         assert_eq!(mgr.scan_archive(&later).await.len(), 1);
         assert!(mgr.meta(sid).unwrap().is_archived());
+        mgr.shutdown().await;
+    }
+
+    /// The last `SessionUpdated` for `sid` in `msgs`.
+    fn last_update(msgs: &[DaemonMsg], sid: SessionId) -> Option<&SessionMeta> {
+        msgs.iter().rev().find_map(|m| match &m.event {
+            Event::SessionUpdated(u) if u.id == sid => Some(u),
+            _ => None,
+        })
+    }
+
+    /// Race found on main (review of M4): the exit path's `transition`
+    /// clones the metadata under the lock (Dormant, not yet marked) and
+    /// writes it after the lock; `archive`, woken by that exit, marks the
+    /// session and writes first, so the exit's late write of its older clone
+    /// erased the mark in the store (and sent clients an unmarked session
+    /// last). Replayed without sleeps: `archive_as` reads its clock exactly
+    /// between the exit it waited for and the mark, so the clock takes the
+    /// exit path's clone there; written with `commit` (the exit path's own
+    /// write) once `archive` has returned, it must not undo the mark.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_write_of_an_older_clone_does_not_undo_the_archive_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        let events = Outbox::new();
+        let _conn = mgr.register_conn(ClientRole::Gui, events.clone());
+        let exit_clone = Mutex::new(None);
+        let clock = || {
+            *exit_clone.lock() = mgr.meta(sid);
+            now_ms()
+        };
+        let at = mgr
+            .archive_as(sid, "user", &clock)
+            .await
+            .unwrap()
+            .archived_at_ms;
+        assert!(at.is_some());
+        let stale = exit_clone.into_inner().expect("clock read after the exit");
+        assert!(!stale.is_live() && !stale.is_archived(), "{stale:?}");
+
+        mgr.commit(stale);
+        assert_eq!(mgr.meta(sid).unwrap().archived_at_ms, at);
+        assert_eq!(
+            mgr.store.get_session(sid).unwrap().unwrap().archived_at_ms,
+            at,
+            "the store keeps the mark"
+        );
+        let msgs = drain(&events).await;
+        assert_eq!(
+            last_update(&msgs, sid).map(|u| u.archived_at_ms),
+            Some(at),
+            "clients end with the mark"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// A write of a clone taken before a delete, landing after it, does not
+    /// bring the session back, in the store or for the clients.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_write_does_not_bring_a_deleted_session_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        let events = Outbox::new();
+        let _conn = mgr.register_conn(ClientRole::Gui, events.clone());
+        let stale = mgr.meta(sid).unwrap();
+        mgr.delete_session(sid).await.unwrap();
+
+        mgr.commit(stale);
+        assert!(mgr.meta(sid).is_none());
+        assert_eq!(
+            mgr.store.get_session(sid).unwrap(),
+            None,
+            "not written back"
+        );
+        let msgs = drain(&events).await;
+        let removed = msgs
+            .iter()
+            .position(|m| m.event == Event::SessionRemoved(sid))
+            .expect("SessionRemoved");
+        assert_eq!(last_update(&msgs[removed..], sid), None, "{msgs:?}");
+        mgr.shutdown().await;
+    }
+
+    /// The same for workspaces: a rename's late write (its clone) neither
+    /// undoes a later rename nor brings a deleted workspace back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_workspace_write_does_not_undo_a_rename_or_a_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let events = Outbox::new();
+        let _conn = mgr.register_conn(ClientRole::Gui, events.clone());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let first = mgr.rename_workspace(ws.id, "first".into()).unwrap();
+        mgr.rename_workspace(ws.id, "second".into()).unwrap();
+
+        assert_eq!(mgr.commit_workspace(first).unwrap().name, "second");
+        let names = |mgr: &Manager| -> Vec<String> {
+            let stored = mgr.store.list_workspaces().unwrap();
+            stored.into_iter().map(|w| w.name).collect()
+        };
+        assert_eq!(names(&mgr), ["second"], "the store keeps the later name");
+        let last_name = |msgs: &[DaemonMsg]| {
+            msgs.iter().rev().find_map(|m| match &m.event {
+                Event::WorkspaceUpdated(w) if w.id == ws.id => Some(w.name.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(last_name(&drain(&events).await).as_deref(), Some("second"));
+
+        let stale = mgr.list_workspaces().remove(0);
+        mgr.delete_workspace(ws.id).unwrap();
+        assert!(mgr.commit_workspace(stale).is_err());
+        assert!(names(&mgr).is_empty(), "not written back");
+        let msgs = drain(&events).await;
+        assert_eq!(
+            msgs.last().map(|m| &m.event),
+            Some(&Event::WorkspaceRemoved(ws.id))
+        );
         mgr.shutdown().await;
     }
 
