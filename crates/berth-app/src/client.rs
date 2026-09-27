@@ -329,7 +329,9 @@ impl SyncClient {
     }
 
     /// First message (queued ones first) matching `pred` before `deadline`;
-    /// `None` on timeout. Other messages are kept for later calls.
+    /// `None` on timeout. Other messages are kept for later calls, except
+    /// the one saying berthd could not decode what was sent: then nothing
+    /// is coming, and this fails at once.
     pub fn wait_for(
         &mut self,
         deadline: Instant,
@@ -342,6 +344,11 @@ impl SyncClient {
             match self.read_msg(deadline)? {
                 Some(msg) if pred(&msg) => return Ok(Some(msg)),
                 Some(msg) => {
+                    if let Some(message) = not_decoded(&msg) {
+                        bail!(
+                            "berthd 解不开这个请求（{message}）：它可能是旧版本的 berthd；运行 berth doctor 查看"
+                        );
+                    }
                     if self.backlog.len() >= SYNC_BACKLOG {
                         self.backlog.pop_front();
                     }
@@ -374,6 +381,24 @@ impl SyncClient {
                 Err(e) => return Err(e).context("reading from berthd"),
             }
         }
+    }
+}
+
+/// The error a berthd pushes (no `reply_to`: it has no id to answer) when
+/// it cannot decode a message; every version so far says "undecodable
+/// message: …", or "bad frame: …" and closes. A request of a newer
+/// protocol than the daemon's gets this and no answer. Other errors without
+/// `reply_to` (a session's actor stopped) concern no request.
+fn not_decoded(msg: &DaemonMsg) -> Option<&str> {
+    match &msg.event {
+        Event::Error { message }
+            if msg.reply_to.is_none()
+                && (message.starts_with("undecodable message")
+                    || message.starts_with("bad frame")) =>
+        {
+            Some(message)
+        }
+        _ => None,
     }
 }
 
@@ -829,7 +854,9 @@ fn run_probe(shell: &Path, timeout: Duration) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{fake_old_daemon, write_script, TestDaemon};
+    use crate::testutil::{
+        fake_old_daemon, read_client_msg, write_daemon_msg, write_script, TestDaemon,
+    };
     use berth_core::{Dims, SessionStatus};
     use std::os::unix::net::UnixListener;
 
@@ -1009,6 +1036,63 @@ mod tests {
         assert!(matches!(got[0].event, Event::Bell { .. }));
         assert_eq!(got[1].reply_to, Some(id));
         assert_eq!(got[1].event, Event::Ok);
+    }
+
+    /// Review medium: a berthd that cannot decode a request says so without
+    /// `reply_to` and never answers it (what one of M2 does with the M3
+    /// requests). The request fails at once, naming the likely cause. Other
+    /// errors without `reply_to` (a session's actor stopped) concern no
+    /// request: its answer still counts.
+    #[test]
+    fn a_request_berthd_cannot_decode_fails_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let listener = UnixListener::bind(&paths.socket).unwrap();
+        let fake = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut frames = FrameReader::new();
+            let hello = read_client_msg(&mut s, &mut frames);
+            let answer = Event::Hello {
+                daemon_version: "0.0.1".into(),
+                protocol: PROTOCOL_VERSION,
+            };
+            write_daemon_msg(&mut s, Some(hello.id), answer);
+            let first = read_client_msg(&mut s, &mut frames);
+            let crashed = "session 0 stopped after an internal error: panic";
+            write_daemon_msg(
+                &mut s,
+                None,
+                Event::Error {
+                    message: crashed.into(),
+                },
+            );
+            write_daemon_msg(&mut s, Some(first.id), Event::Ok);
+            read_client_msg(&mut s, &mut frames);
+            let message = "undecodable message: Found an enum discriminant that was out of range";
+            write_daemon_msg(
+                &mut s,
+                None,
+                Event::Error {
+                    message: message.into(),
+                },
+            );
+            // The connection stays open, as berthd waits for the next one.
+            let mut rest = Vec::new();
+            s.read_to_end(&mut rest).unwrap();
+        });
+        let mut c = SyncClient::connect(&paths, ClientRole::Cli).unwrap();
+        let t = Duration::from_secs(5);
+        assert_eq!(c.request(Request::DaemonStatus, t).unwrap(), Event::Ok);
+        let start = Instant::now();
+        let err = format!("{:#}", c.request(Request::ListSessions, t).unwrap_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "not at once: {err}"
+        );
+        assert!(err.contains("undecodable message"), "{err}");
+        assert!(err.contains("berth doctor"), "{err}");
+        drop(c);
+        fake.join().unwrap();
     }
 
     #[test]
