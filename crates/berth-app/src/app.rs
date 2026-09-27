@@ -880,7 +880,7 @@ impl App {
             return Some("正在读取 session 列表…".into());
         }
         match self.ctl.focused() {
-            None => Some("没有 session：按 ⌘N 新建".into()),
+            None => Some("没有 session：按 ⌘N / ⌘T 新建".into()),
             Some(_) if !self.ctl.view().is_some_and(|v| v.has_screen()) => {
                 Some("正在打开 session…".into())
             }

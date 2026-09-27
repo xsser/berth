@@ -14,6 +14,16 @@ use berth_core::{
 const BIN: &str = env!("CARGO_BIN_EXE_berth-hook");
 
 fn run(args: &[&str], socket: &Path, sid: Option<SessionId>, stdin: &[u8]) -> (Output, Duration) {
+    run_with_session_env(args, socket, sid.map(|s| s.to_string()).as_deref(), stdin)
+}
+
+/// `run` with `BERTH_SESSION_ID` set to `session_env` verbatim (`None`: unset).
+fn run_with_session_env(
+    args: &[&str],
+    socket: &Path,
+    session_env: Option<&str>,
+    stdin: &[u8],
+) -> (Output, Duration) {
     let mut cmd = Command::new(BIN);
     cmd.args(args)
         .env("BERTH_SOCKET", socket)
@@ -22,8 +32,8 @@ fn run(args: &[&str], socket: &Path, sid: Option<SessionId>, stdin: &[u8]) -> (O
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(sid) = sid {
-        cmd.env("BERTH_SESSION_ID", sid.to_string());
+    if let Some(value) = session_env {
+        cmd.env("BERTH_SESSION_ID", value);
     }
     let start = Instant::now();
     let mut child = cmd.spawn().unwrap();
@@ -81,11 +91,23 @@ fn envelope(msgs: &[ClientMsg]) -> HookEnvelope {
     }
 }
 
+/// The hook has exited: had it connected, the connection would be waiting
+/// in the backlog.
+fn assert_nothing_received(listener: &UnixListener) {
+    listener.set_nonblocking(true).unwrap();
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("the hook connected: {other:?}"),
+    }
+}
+
 const PRE_TOOL: &[u8] =
     br#"{"session_id":"abc123","cwd":"/w","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
 
 #[test]
 fn no_daemon_exits_zero_within_50ms() {
+    // In a berth session (the id is set), but berthd is not there.
+    let sid = SessionId::new();
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.sock");
     // A stale socket file with no listener behind it (ECONNREFUSED).
@@ -94,7 +116,7 @@ fn no_daemon_exits_zero_within_50ms() {
     for socket in [&missing, &stale] {
         let mut times = Vec::new();
         for _ in 0..5 {
-            let (out, took) = run(&["claude"], socket, None, PRE_TOOL);
+            let (out, took) = run(&["claude"], socket, Some(sid), PRE_TOOL);
             assert_eq!(out.status.code(), Some(0));
             assert!(
                 out.stdout.is_empty() && out.stderr.is_empty(),
@@ -167,6 +189,7 @@ fn stdin_that_never_closes_does_not_hang() {
 
 #[test]
 fn statusline_tees_and_passes_through() {
+    let sid = SessionId::new();
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("d.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -180,7 +203,7 @@ fn statusline_tees_and_passes_through() {
             "cat; printf ' <- original'; exit 3",
         ],
         &socket,
-        None,
+        Some(sid),
         json,
     );
     assert_eq!(out.status.code(), Some(3));
@@ -200,7 +223,7 @@ fn statusline_tees_and_passes_through() {
     let (out, _) = run(
         &["statusline", "--", "/bin/cat"],
         &dir.path().join("x.sock"),
-        None,
+        Some(sid),
         json,
     );
     assert_eq!(out.status.code(), Some(0));
@@ -209,6 +232,7 @@ fn statusline_tees_and_passes_through() {
 
 #[test]
 fn codex_chain_execs_original_with_same_argv() {
+    let sid = SessionId::new();
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("d.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -216,7 +240,7 @@ fn codex_chain_execs_original_with_same_argv() {
     let (out, _) = run(
         &["codex", "--chain", "/bin/echo", "orig-arg", json],
         &socket,
-        None,
+        Some(sid),
         b"",
     );
     assert_eq!(out.status.code(), Some(0));
@@ -236,6 +260,7 @@ fn codex_chain_execs_original_with_same_argv() {
 /// hook reports it like a shell (127) — still silently, still after sending.
 #[test]
 fn codex_chain_exec_failure_exits_127() {
+    let sid = SessionId::new();
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("d.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -243,7 +268,7 @@ fn codex_chain_exec_failure_exits_127() {
     let (out, _) = run(
         &["codex", "--chain", "/nonexistent/notifier", json],
         &socket,
-        None,
+        Some(sid),
         b"",
     );
     assert_eq!(out.status.code(), Some(127));
@@ -251,7 +276,7 @@ fn codex_chain_exec_failure_exits_127() {
     let env = envelope(&receive(&listener));
     assert!(matches!(env.signal, AgentSignal::Codex(_)));
     // Without --chain there is nothing to fail.
-    let (out, _) = run(&["codex", json], &dir.path().join("x.sock"), None, b"");
+    let (out, _) = run(&["codex", json], &dir.path().join("x.sock"), Some(sid), b"");
     assert_eq!(out.status.code(), Some(0));
 }
 
@@ -267,7 +292,8 @@ fn statusline_stdin_that_stays_open_still_runs_the_original() {
     let mut child = Command::new(BIN)
         .args(["statusline", "--", "/bin/cat"])
         .env("BERTH_SOCKET", &socket)
-        .env_remove("BERTH_SESSION_ID")
+        // In a berth session: only the deadline keeps the JSON from berthd.
+        .env("BERTH_SESSION_ID", SessionId::new().to_string())
         .env_remove("BERTH_HOOK_DEBUG")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -312,4 +338,101 @@ fn statusline_stdin_that_stays_open_still_runs_the_original() {
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
         other => panic!("statusline forwarded after the deadline: {other:?}"),
     }
+}
+
+/// The hooks are installed globally, so agents outside berth (another
+/// terminal) run them too. Without a valid `BERTH_SESSION_ID` nothing is
+/// sent — berthd's cwd fallback would pin the event on a berth session in
+/// the same directory — and the hook stays fast and silent.
+#[test]
+fn outside_a_berth_session_claude_sends_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing.sock");
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let (out, took) = run(&["claude"], &missing, None, PRE_TOOL);
+        assert_eq!(out.status.code(), Some(0));
+        assert!(
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            "must stay silent"
+        );
+        times.push(took);
+    }
+    times.sort();
+    assert!(
+        times[2] < Duration::from_millis(50),
+        "median {:?} ({times:?})",
+        times[2]
+    );
+    // A listening berthd gets no connection: unset, empty, blank or not an id.
+    let socket = dir.path().join("d.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    for session_env in [None, Some(""), Some("  "), Some("not-a-session-id")] {
+        let (out, _) = run_with_session_env(&["claude"], &socket, session_env, PRE_TOOL);
+        assert_eq!(out.status.code(), Some(0), "{session_env:?}");
+        assert!(
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            "{session_env:?}"
+        );
+        assert_nothing_received(&listener);
+    }
+}
+
+/// Outside a berth session the chained notify command still runs, with the
+/// same argv (the payload last) and its exit code passed through.
+#[test]
+fn outside_a_berth_session_codex_chain_still_execs() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let json = r#"{"type":"agent-turn-complete","thread-id":"t-1","cwd":"/w"}"#;
+    let script = r#"printf '%s|' "$@"; echo chained; exit 3"#;
+    let (out, _) = run(
+        &[
+            "codex", "--chain", "/bin/sh", "-c", script, "sh", "orig arg", json,
+        ],
+        &socket,
+        None,
+        b"",
+    );
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("orig arg|{json}|chained\n")
+    );
+    assert!(out.stderr.is_empty());
+    assert_nothing_received(&listener);
+    // Without --chain there is nothing to run.
+    let (out, _) = run(&["codex", json], &socket, None, b"");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty() && out.stderr.is_empty());
+    assert_nothing_received(&listener);
+}
+
+/// Outside a berth session the wrapped statusline command still gets the
+/// JSON, and its output and exit code pass through unchanged.
+#[test]
+fn outside_a_berth_session_statusline_still_runs_the_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("d.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let json = br#"{"session_id":"s1","model":{"id":"m"},"cwd":"/p"}"#;
+    let (out, _) = run(
+        &[
+            "statusline",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat; printf ' <- original'; exit 3",
+        ],
+        &socket,
+        None,
+        json,
+    );
+    assert_eq!(out.status.code(), Some(3));
+    let mut expected = json.to_vec();
+    expected.extend_from_slice(b" <- original");
+    assert_eq!(out.stdout, expected);
+    assert!(out.stderr.is_empty());
+    assert_nothing_received(&listener);
 }

@@ -14,6 +14,13 @@
 //! still open after the deadline: then the rest is passed through) — and
 //! passes its stdout and exit code through. No tokio, no clap: startup cost
 //! matters.
+//!
+//! Only a hook running inside a berth session forwards: without a valid
+//! `BERTH_SESSION_ID` (unset, empty or not a session id) nothing is sent and
+//! no socket is touched. The hooks are installed globally, so agents in other
+//! terminals run them too, and berthd's cwd fallback would pin their events
+//! on a berth session in the same directory. `codex --chain` and
+//! `statusline` still run the original command as above.
 
 mod map;
 mod send;
@@ -45,6 +52,10 @@ fn deliver(envelope: Option<berth_core::HookEnvelope>) {
         log("payload not recognised; nothing sent");
         return;
     };
+    if envelope.berth_session.is_none() {
+        log("not in a berth session (no valid BERTH_SESSION_ID); nothing sent");
+        return;
+    }
     let socket = berth_core::Paths::resolve().socket;
     if let Err(e) = send::send(envelope, &socket, send::BUDGET) {
         log(e);

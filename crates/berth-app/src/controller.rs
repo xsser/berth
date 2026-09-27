@@ -1270,7 +1270,7 @@ impl Controller {
         }
     }
 
-    /// ⌘N: a session in the focused session's workspace (else the first;
+    /// ⌘N / ⌘T: a session in the focused session's workspace (else the first;
     /// with no workspace at all, one rooted at $HOME is created first).
     pub fn new_session(&mut self, out: &mut dyn Outbound) {
         let ws = self
