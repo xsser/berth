@@ -184,7 +184,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 ```
 
 - `[theme]` 全部键可选，示例里写的就是默认值（`preset` 决定这些默认值来自哪套预设）：
-  - `preset = "light"`（默认）= 白底 + One Light 16 色，其中 green / yellow / white / bright magenta 已压暗，保证每一色对白底 ≥ 3:1；`"dark"` = 此前的 Ghostty 默认（`#282c34` + Tomorrow Night）。其他值 warn 后按 `light` 处理。
+  - `preset = "light"`（默认）= 白底 + One Light 16 色，压暗按槽位的用途分档：正常色 0..=7 承载正文（`ls`、diff、编译器输出），按 WCAG 1.4.3 的 4.5:1，red / green / yellow / cyan / white 已压暗；高亮色 8..=15 只标记正文，按 1.4.11 的 3:1，只有 bright magenta 不够。`"dark"` = 此前的 Ghostty 默认（`#282c34` + Tomorrow Night）。其他值 warn 后按 `light` 处理。
   - 其余键在预设之上逐键覆盖。`cursor` / `cursor_text` 不给时分别跟随生效后的 `foreground` / `background`（Ghostty 语义）；`accent` 不给时按背景的 WCAG 相对亮度取（浅底 `#b35c00`，深底 `#de935f`），所以只改 `background` 也会带着 accent 一起走。
   - `ansi` 覆盖 0..=15，必须正好 16 个，否则 warn + 整段忽略；16..=255 仍按 xterm 色立方与灰阶从新的 16 色重建。
   - 颜色写法 `#rgb` / `#rrggbb`，大小写不敏感，`#` 可省。单个值非法**只跳过该键**并 warn（写明键名与原值），同段其余键照常生效；`foreground` 对 `background` 对比度低于 4.5:1 只告警，不改用户的值。
