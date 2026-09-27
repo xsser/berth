@@ -2373,6 +2373,10 @@ mod tests {
             let on_sidebar = pal.bg.blend(trough);
             let low = contrast_ratio(rgb(on_sidebar), rgb(pal.bg));
             let high = contrast_ratio(rgb(peak), rgb(pal.bg));
+            println!(
+                "{name}: pulse {low:.2}:1 .. {high:.2}:1 on {:02x?} (floor {PULSE_FLOOR})",
+                rgb(pal.bg)
+            );
             assert!(
                 low >= ACCENT_CONTRAST,
                 "{name}: the pulse bottoms out at {low:.2}:1 on the sidebar"
