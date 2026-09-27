@@ -1192,7 +1192,8 @@ impl Controller {
         self.sync_panes(out, now);
     }
 
-    /// The layout part of [`Self::focus`].
+    /// The layout part of [`Self::focus`]. The focus moves to `sid` only
+    /// once it has a pane.
     fn show(&mut self, sid: SessionId) {
         match self.layout.as_mut() {
             Some(tree) if tree.contains(sid) => {}
@@ -1201,7 +1202,13 @@ impl Controller {
                     .focused
                     .filter(|f| tree.contains(*f))
                     .unwrap_or_else(|| tree.first_leaf());
-                tree.replace(target, sid);
+                // `target` is a leaf and `sid` has no pane: not refused.
+                let replaced = tree.replace(target, sid);
+                debug_assert!(replaced, "the pane of {target} refused {sid}");
+                if !replaced {
+                    tracing::warn!("the pane of {target} refused {sid}; the focus stays");
+                    return;
+                }
             }
             None => self.layout = Some(PaneTree::Leaf(sid)),
         }
@@ -1225,10 +1232,11 @@ impl Controller {
             (Some(tree), Some(target)) => tree.split(target, sid, dir).is_ok(),
             _ => false,
         };
-        if !placed {
+        if placed {
+            self.focused = Some(sid);
+        } else {
             self.show(sid);
         }
-        self.focused = Some(sid);
         self.sync_panes(out, now);
     }
 
@@ -3813,6 +3821,323 @@ mod tests {
         let hist = c.view().unwrap().history_len();
         assert!(hist > top, "history {hist} kept across revive");
         assert!(c.notices().is_empty(), "{:?}", c.notices());
+    }
+
+    // -- the real daemon, several panes on one connection -----------------
+
+    /// The real connection, keeping a copy of every request.
+    struct Tee {
+        client: Client,
+        sent: Vec<Request>,
+    }
+
+    impl Outbound for Tee {
+        fn send(&mut self, req: Request) -> Result<u32> {
+            let id = self.client.send(req.clone())?;
+            self.sent.push(req);
+            Ok(id)
+        }
+    }
+
+    /// A controller with a 60×10 terminal area on its own berthd.
+    struct Rig {
+        c: Controller,
+        out: Tee,
+        rx: crossbeam_channel::Receiver<crate::client::ClientEvent>,
+        /// Each screen update's session and row texts, as they came.
+        screens: Vec<(SessionId, Vec<String>)>,
+        root: tempfile::TempDir,
+        /// Dropped last: berthd outlives the connection.
+        daemon: crate::testutil::TestDaemon,
+    }
+
+    impl Rig {
+        /// Connected, and the (empty) lists loaded.
+        fn start() -> Rig {
+            let daemon = crate::testutil::TestDaemon::start();
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let stream = std::os::unix::net::UnixStream::connect(&daemon.paths.socket).unwrap();
+            let client = Client::start(stream, berth_core::ClientRole::Gui, move |ev| {
+                let _ = tx.send(ev);
+            })
+            .unwrap();
+            let mut c = Controller::new(vec![]);
+            c.auto_session = false;
+            c.set_grid(Dims { cols: 60, rows: 10 }, Instant::now());
+            let mut r = Rig {
+                c,
+                out: Tee {
+                    client,
+                    sent: Vec::new(),
+                },
+                rx,
+                screens: Vec::new(),
+                root: tempfile::tempdir().unwrap(),
+                daemon,
+            };
+            r.c.on_connected(&mut r.out);
+            r.pump(|c| c.is_loaded(), "listing");
+            r
+        }
+
+        /// Alpha in the one pane, then bravo beside it (⌘D). Each prints
+        /// its name, then echoes what it reads.
+        fn two_panes(&mut self) -> (SessionId, SessionId) {
+            let cat = |marker: &str| {
+                Some(vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    format!("printf '{marker}\\n'; exec cat"),
+                ])
+            };
+            self.c.new_session_command = cat("alpha-ready");
+            self.c
+                .new_workspace(&mut self.out, self.root.path().to_path_buf());
+            self.pump(
+                |c| c.focused().is_some_and(|a| pane_shows(c, a, "alpha-ready")),
+                "alpha's first screen",
+            );
+            let a = self.c.focused().unwrap();
+            self.c.new_session_command = cat("bravo-ready");
+            self.c.split(&mut self.out, SplitDir::Right);
+            self.pump(
+                |c| {
+                    c.focused()
+                        .is_some_and(|b| b != a && pane_shows(c, b, "bravo-ready"))
+                },
+                "bravo's first screen",
+            );
+            let b = self.c.focused().unwrap();
+            assert_eq!(self.c.layout().unwrap().leaves(), [a, b]);
+            (a, b)
+        }
+
+        /// Hand the next message (waiting 20 ms at most) to the
+        /// controller, except the reply to `own`, which is returned.
+        fn step(&mut self, own: Option<u32>) -> Option<Event> {
+            use crate::client::ClientEvent;
+            match self.rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(ClientEvent::Msg(m)) if own.is_some_and(|id| m.reply_to == Some(id)) => {
+                    return Some(m.event);
+                }
+                Ok(ClientEvent::Msg(m)) => {
+                    if let Event::Screen(u) = &m.event {
+                        let rows = u.lines.iter().map(|(_, l)| l.text()).collect();
+                        self.screens.push((u.session, rows));
+                    }
+                    self.c.handle(&mut self.out, *m, Instant::now());
+                }
+                Ok(ClientEvent::Closed(r)) => panic!("connection closed: {r}"),
+                Err(_) => {}
+            }
+            self.c.tick(&mut self.out, Instant::now());
+            None
+        }
+
+        fn pump(&mut self, until: impl Fn(&Controller) -> bool, what: &str) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !until(&self.c) {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {what}; notices: {:?}",
+                    self.c.notices()
+                );
+                self.step(None);
+            }
+        }
+
+        /// Every answer the controller waits for is in.
+        fn answered(&mut self) {
+            self.pump(|c| c.pending.is_empty(), "every answer");
+        }
+
+        /// Berthd's own copy of `session`'s lines. The session's actor
+        /// answers after every earlier command for it (a `Detach`
+        /// included), so this is also a barrier.
+        fn daemon_lines(&mut self, session: SessionId) -> Vec<String> {
+            let req = Request::FetchLines {
+                session,
+                start: 0,
+                count: 100,
+            };
+            let id = self.out.send(req).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                assert!(Instant::now() < deadline, "no answer to FetchLines");
+                match self.step(Some(id)) {
+                    Some(Event::Lines { lines, .. }) => {
+                        return lines.iter().map(LineSnapshot::text).collect();
+                    }
+                    Some(other) => panic!("FetchLines answered with {other:?}"),
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// The rows `sid`'s pane shows.
+    fn pane_rows(c: &Controller, sid: SessionId) -> Vec<String> {
+        let Some(v) = c.pane_view(sid).filter(|v| v.has_screen()) else {
+            return Vec::new();
+        };
+        (0..)
+            .map_while(|r| v.line(v.history_len() + r))
+            .map(LineSnapshot::text)
+            .collect()
+    }
+
+    fn pane_shows(c: &Controller, sid: SessionId, text: &str) -> bool {
+        pane_rows(c, sid).iter().any(|t| t.contains(text))
+    }
+
+    fn attaches(sent: &[Request]) -> Vec<SessionId> {
+        let of = |q: &Request| match q {
+            Request::Attach { session, .. } => Some(*session),
+            _ => None,
+        };
+        sent.iter().filter_map(of).collect()
+    }
+
+    fn detaches(sent: &[Request]) -> Vec<SessionId> {
+        let of = |q: &Request| match q {
+            Request::Detach { session } => Some(*session),
+            _ => None,
+        };
+        sent.iter().filter_map(of).collect()
+    }
+
+    /// Two sessions side by side: each pane attaches its own session and
+    /// shows only that session's screens; taking one pane out of the split
+    /// detaches just its session, which keeps running unseen, while the
+    /// other pane keeps getting updates.
+    #[test]
+    fn real_daemon_split_panes_attach_and_detach_their_own_sessions() {
+        let mut r = Rig::start();
+        let (a, b) = r.two_panes();
+        assert_eq!(attaches(&r.out.sent), [a, b], "one Attach per pane");
+        let half = r.c.pane_view(b).unwrap().dims();
+        assert!(half.cols < 60, "{half:?}");
+
+        // Typing goes to the focused pane's session, and each pane shows
+        // its own session only.
+        r.c.focus(&mut r.out, a, Instant::now());
+        r.c.input(&mut r.out, b"alpha-typed\n".to_vec(), Instant::now());
+        r.c.focus(&mut r.out, b, Instant::now());
+        r.c.input(&mut r.out, b"bravo-typed\n".to_vec(), Instant::now());
+        r.pump(
+            |c| pane_shows(c, a, "alpha-typed") && pane_shows(c, b, "bravo-typed"),
+            "the typing in both panes",
+        );
+        assert!(!pane_shows(&r.c, a, "bravo"), "{:?}", pane_rows(&r.c, a));
+        assert!(!pane_shows(&r.c, b, "alpha"), "{:?}", pane_rows(&r.c, b));
+
+        // 「从分屏移除」 alpha: its pane goes, bravo's takes the area.
+        let removed_at = r.out.sent.len();
+        assert!(r.c.remove_from_split(&mut r.out, a, Instant::now()));
+        assert_eq!(r.c.layout(), Some(&PaneTree::Leaf(b)));
+        assert_eq!(r.c.focused(), Some(b));
+        assert!(r.c.pane_view(a).is_none());
+        // Past the Detach in alpha's actor: no alpha screen is sent here
+        // from now on.
+        let lines = r.daemon_lines(a);
+        assert!(lines.iter().any(|l| l.contains("alpha-typed")), "{lines:?}");
+        let mark = r.screens.len();
+
+        // Alpha still runs: input straight to berthd (the GUI types into
+        // the focused pane only) reaches its terminal. Bravo keeps getting
+        // updates, now at the full width.
+        let input = Request::Input {
+            session: a,
+            data: b"alpha-after\n".to_vec(),
+        };
+        r.out.send(input).unwrap();
+        r.c.input(&mut r.out, b"bravo-after\n".to_vec(), Instant::now());
+        r.pump(
+            |c| {
+                pane_shows(c, b, "bravo-after")
+                    && c.pane_view(b).is_some_and(|v| v.dims().cols == 60)
+            },
+            "bravo's update at the full width",
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !r.daemon_lines(a).iter().any(|l| l.contains("alpha-after")) {
+            assert!(Instant::now() < deadline, "alpha never echoed its input");
+            r.step(None);
+        }
+        // Well past berthd's 4 ms output batch: an alpha screen would be here.
+        let settled = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < settled {
+            r.step(None);
+        }
+        let after = &r.screens[mark..];
+        assert!(after.iter().all(|(s, _)| *s == b), "{after:?}");
+        assert!(
+            after
+                .iter()
+                .any(|(_, rows)| rows.iter().any(|t| t.contains("bravo-after"))),
+            "{after:?}"
+        );
+        assert!(r.c.session(a).is_some_and(SessionMeta::is_live));
+
+        // The one Detach of the run is alpha's; nothing was attached again.
+        assert_eq!(detaches(&r.out.sent), [a]);
+        assert_eq!(attaches(&r.out.sent[removed_at..]), []);
+
+        // No screen of one session carried the other's text.
+        assert!(r.screens.iter().any(|(s, _)| *s == a));
+        for (s, rows) in &r.screens {
+            let other = match *s {
+                s if s == a => "bravo",
+                s if s == b => "alpha",
+                s => panic!("a screen of {s}"),
+            };
+            assert!(!rows.iter().any(|t| t.contains(other)), "{s}: {rows:?}");
+        }
+        let shown = pane_rows(&r.c, b);
+        for text in ["bravo-ready", "bravo-typed", "bravo-after"] {
+            assert!(shown.iter().any(|t| t.contains(text)), "{text}: {shown:?}");
+        }
+        assert!(!shown.iter().any(|t| t.contains("alpha")), "{shown:?}");
+        r.answered();
+        assert!(r.c.notices().is_empty(), "{:?}", r.c.notices());
+    }
+
+    /// A shown session archived elsewhere (`berth debug archive`; berthd
+    /// ends it first) leaves its pane: berthd takes the Detach of the
+    /// archived session, and the other pane keeps the area and its updates.
+    #[test]
+    fn real_daemon_a_session_archived_elsewhere_leaves_its_pane() {
+        let mut r = Rig::start();
+        let (a, b) = r.two_panes();
+        let mut cli =
+            crate::client::SyncClient::connect(&r.daemon.paths, berth_core::ClientRole::Cli)
+                .unwrap();
+        let answer = cli
+            .request(Request::Archive { session: b }, Duration::from_secs(20))
+            .unwrap();
+        assert!(
+            matches!(&answer, Event::SessionUpdated(m) if m.is_archived()),
+            "{answer:?}"
+        );
+        r.pump(
+            |c| c.layout() == Some(&PaneTree::Leaf(a)),
+            "bravo's pane to close",
+        );
+        assert_eq!(r.c.focused(), Some(a));
+        assert!(r.c.session(b).is_some_and(SessionMeta::is_archived));
+        assert_eq!(r.c.jump_order(), [a]);
+        assert_eq!(detaches(&r.out.sent), [b]);
+
+        r.c.input(&mut r.out, b"alpha-after\n".to_vec(), Instant::now());
+        r.pump(
+            |c| {
+                pane_shows(c, a, "alpha-after")
+                    && c.pane_view(a).is_some_and(|v| v.dims().cols == 60)
+            },
+            "alpha's update at the full width",
+        );
+        r.answered();
+        assert!(r.c.notices().is_empty(), "{:?}", r.c.notices());
     }
 
     /// Lines cached while scrolled up, then shifted by output at the

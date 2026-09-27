@@ -62,7 +62,8 @@ pub fn load(path: &Path) -> Result<Option<GuiState>, String> {
     Ok(Some(state))
 }
 
-/// Replace the file atomically.
+/// Replace the file atomically: a private temp file, flushed to disk, then
+/// renamed over it (a crash leaves the old layout or the new one).
 pub fn save(path: &Path, state: &GuiState) -> std::io::Result<()> {
     let dir = path
         .parent()
@@ -86,6 +87,7 @@ pub fn save(path: &Path, state: &GuiState) -> std::io::Result<()> {
             .open(&tmp)?;
         f.write_all(&json)?;
         f.write_all(b"\n")?;
+        f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, path)
     })();
