@@ -4,9 +4,17 @@
 //!
 //! Only the sections the GUI needs are parsed; unknown keys are ignored so
 //! the daemon's sections and later additions still load.
+//!
+//! `[theme]` picks a preset (`light`, the default, or `dark`) and overrides
+//! any of its colors. A value that is not a color costs that one key: it is
+//! skipped with a warning and the rest of the file still applies, because a
+//! typo in one of seventeen colors should not send the whole theme back to
+//! the preset.
 
 use serde::Deserialize;
 use std::path::Path;
+
+use crate::theme::{contrast_ratio, xterm_palette, Rgb, Theme};
 
 pub const DEFAULT_FONT_FAMILY: &str = "SF Mono";
 pub const DEFAULT_FONT_SIZE: f32 = 13.0;
@@ -31,6 +39,9 @@ impl Default for FontConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub font: FontConfig,
+    /// Terminal colors and the accent, the source every other color in the
+    /// window is derived from (`[theme]`).
+    pub theme: Theme,
     /// Sidebar width in logical points.
     pub sidebar_width: f32,
     /// Agent states (`AgentState::name`) that raise a desktop notification.
@@ -43,6 +54,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             font: FontConfig::default(),
+            theme: Theme::default(),
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             notify_on: crate::notify::DEFAULT_ON
                 .iter()
@@ -61,6 +73,106 @@ struct FileConfig {
     sidebar: FileSidebar,
     #[serde(default)]
     notify: FileNotify,
+    #[serde(default)]
+    theme: FileTheme,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileTheme {
+    preset: Option<String>,
+    background: Option<String>,
+    foreground: Option<String>,
+    cursor: Option<String>,
+    cursor_text: Option<String>,
+    accent: Option<String>,
+    ansi: Option<Vec<String>>,
+}
+
+/// `#rgb` or `#rrggbb`, case-insensitive, the `#` optional.
+fn parse_color(s: &str) -> Option<Rgb> {
+    let h = s.trim();
+    let h = h.strip_prefix('#').unwrap_or(h).as_bytes();
+    if !h.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let d = |b: u8| (b as char).to_digit(16).expect("checked above") as u8;
+    match h.len() {
+        3 => Some([d(h[0]) * 0x11, d(h[1]) * 0x11, d(h[2]) * 0x11]),
+        6 => Some([
+            d(h[0]) * 16 + d(h[1]),
+            d(h[2]) * 16 + d(h[3]),
+            d(h[4]) * 16 + d(h[5]),
+        ]),
+        _ => None,
+    }
+}
+
+/// One `[theme]` color key: `None` when unset, and `None` plus a warning
+/// naming the key and the value when it does not parse.
+fn color_key(key: &str, value: Option<String>) -> Option<Rgb> {
+    let raw = value?;
+    match parse_color(&raw) {
+        Some(c) => Some(c),
+        None => {
+            tracing::warn!("theme.{key} = {raw:?} 不是颜色（如 \"#ffffff\"），已跳过该键");
+            None
+        }
+    }
+}
+
+/// `[theme]` applied on top of a preset.
+fn theme_from_file(f: FileTheme) -> Theme {
+    let mut theme = match f.preset.as_deref().map(str::trim) {
+        None | Some("light") => Theme::light(),
+        Some("dark") => Theme::dark(),
+        Some(other) => {
+            tracing::warn!("theme.preset = {other:?} 不是 \"light\" 或 \"dark\"，已用 light");
+            Theme::light()
+        }
+    };
+    if let Some(list) = f.ansi {
+        if list.len() == 16 {
+            let mut named: [Rgb; 16] = theme.palette[..16].try_into().expect("16 entries");
+            for (i, raw) in list.iter().enumerate() {
+                match parse_color(raw) {
+                    Some(c) => named[i] = c,
+                    None => tracing::warn!("theme.ansi[{i}] = {raw:?} 不是颜色，保留预设色"),
+                }
+            }
+            theme.palette = xterm_palette(&named);
+        } else {
+            tracing::warn!(
+                "theme.ansi 有 {} 个颜色，需要正好 16 个，已整段忽略",
+                list.len()
+            );
+        }
+    }
+    if let Some(c) = color_key("background", f.background) {
+        theme.background = c;
+    }
+    if let Some(c) = color_key("foreground", f.foreground) {
+        theme.foreground = c;
+    }
+    // Ghostty semantics: an unset cursor color means the foreground and an
+    // unset cursor text means the background, so both follow an override of
+    // those rather than keeping the preset's.
+    theme.cursor = color_key("cursor", f.cursor).unwrap_or(theme.foreground);
+    theme.cursor_text = color_key("cursor_text", f.cursor_text).unwrap_or(theme.background);
+    // The accent follows the background that ended up in effect, so a dark
+    // `background` override gets the dark accent without naming a preset.
+    theme.accent = color_key("accent", f.accent).unwrap_or_else(|| theme.default_accent());
+    // Custom colors are the user's call, so this only warns: an override
+    // pair below WCAG AA is legal but is almost always a mistake, and it is
+    // far easier to explain here than from a screenshot.
+    let ratio = contrast_ratio(theme.foreground, theme.background);
+    if ratio < 4.5 {
+        tracing::warn!(
+            "theme.foreground {:02x?} 在 theme.background {:02x?} 上对比度只有 {ratio:.2}:1（低于 WCAG AA 的 4.5:1）",
+            theme.foreground,
+            theme.background
+        );
+    }
+    theme
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -130,6 +242,7 @@ impl Config {
             );
             cfg.notify_identity = identity;
         }
+        cfg.theme = theme_from_file(file.theme);
         Ok(cfg)
     }
 
@@ -219,6 +332,127 @@ mod tests {
         let (cfg, msg) = Config::load_from(&bad);
         assert_eq!(cfg, Config::default());
         assert!(msg.unwrap().contains("bad.toml"));
+    }
+
+    #[test]
+    fn colors_accept_three_and_six_digits_with_or_without_hash() {
+        assert_eq!(parse_color("#ffffff"), Some([255, 255, 255]));
+        assert_eq!(parse_color("FFFFFF"), Some([255, 255, 255]));
+        assert_eq!(parse_color("#DE935f"), Some([0xde, 0x93, 0x5f]));
+        assert_eq!(parse_color(" #f0a "), Some([0xff, 0x00, 0xaa]));
+        assert_eq!(parse_color("0a7d55"), Some([0x0a, 0x7d, 0x55]));
+        for bad in [
+            "",
+            "#",
+            "#ff",
+            "#fffff",
+            "#ggg",
+            "#1234567",
+            "rebeccapurple",
+        ] {
+            assert_eq!(parse_color(bad), None, "{bad:?} accepted");
+        }
+    }
+
+    #[test]
+    fn theme_defaults_to_light() {
+        let cfg = Config::from_toml_str("").unwrap();
+        assert_eq!(cfg.theme, Theme::light());
+        assert_eq!(cfg.theme.background, [0xff, 0xff, 0xff]);
+        assert!(cfg.theme.is_light());
+        assert_eq!(cfg.theme.accent, crate::theme::LIGHT_ACCENT);
+        // An empty table is the same as no table at all.
+        assert_eq!(Config::from_toml_str("[theme]\n").unwrap(), cfg);
+    }
+
+    #[test]
+    fn theme_preset_selects_dark() {
+        let cfg = Config::from_toml_str("[theme]\npreset = \"dark\"\n").unwrap();
+        assert_eq!(cfg.theme, Theme::dark());
+        assert!(!cfg.theme.is_light());
+        assert_eq!(cfg.theme.accent, crate::theme::DARK_ACCENT);
+        // An unknown preset warns and falls back to light.
+        let cfg = Config::from_toml_str("[theme]\npreset = \"solarized\"\n").unwrap();
+        assert_eq!(cfg.theme, Theme::light());
+    }
+
+    #[test]
+    fn theme_keys_override_the_preset_one_by_one() {
+        let src = "[theme]\npreset = \"dark\"\nbackground = \"#fffdf6\"\naccent = \"#0a7d55\"\n";
+        let cfg = Config::from_toml_str(src).unwrap();
+        assert_eq!(cfg.theme.background, [0xff, 0xfd, 0xf6]);
+        assert_eq!(cfg.theme.foreground, Theme::dark().foreground, "kept");
+        assert_eq!(cfg.theme.accent, [0x0a, 0x7d, 0x55]);
+        // cursor / cursor_text follow the overridden background by default
+        // and take an explicit value when given.
+        assert_eq!(cfg.theme.cursor_text, [0xff, 0xfd, 0xf6]);
+        assert_eq!(cfg.theme.cursor, cfg.theme.foreground);
+        let src = "[theme]\ncursor = \"#f00\"\ncursor_text = \"#00f\"\nforeground = \"#111\"\n";
+        let cfg = Config::from_toml_str(src).unwrap();
+        assert_eq!(cfg.theme.cursor, [0xff, 0, 0]);
+        assert_eq!(cfg.theme.cursor_text, [0, 0, 0xff]);
+        assert_eq!(cfg.theme.foreground, [0x11, 0x11, 0x11]);
+        // No accent given, and the background is still light.
+        assert_eq!(cfg.theme.accent, crate::theme::LIGHT_ACCENT);
+        // A dark background override alone moves the accent with it.
+        let cfg = Config::from_toml_str("[theme]\nbackground = \"#101418\"\n").unwrap();
+        assert_eq!(cfg.theme.accent, crate::theme::DARK_ACCENT);
+    }
+
+    #[test]
+    fn theme_ansi_replaces_the_named_colors_and_rebuilds_the_cube() {
+        let mut list: Vec<String> = (0..16).map(|i| format!("#{i:02x}0000")).collect();
+        let src = format!("[theme]\nansi = {list:?}\n");
+        let cfg = Config::from_toml_str(&src).unwrap();
+        assert_eq!(cfg.theme.palette[1], [0x01, 0, 0]);
+        assert_eq!(cfg.theme.palette[15], [0x0f, 0, 0]);
+        assert_eq!(cfg.theme.palette[16..], Theme::light().palette[16..]);
+        // Not exactly sixteen: the whole key is ignored.
+        list.pop();
+        let src = format!("[theme]\nansi = {list:?}\n");
+        let cfg = Config::from_toml_str(&src).unwrap();
+        assert_eq!(cfg.theme.palette, Theme::light().palette);
+        // One bad entry keeps the preset color at that index only.
+        let mut list: Vec<String> = (0..16).map(|i| format!("#{i:02x}0000")).collect();
+        list[2] = "chartreuse".into();
+        let src = format!("[theme]\nansi = {list:?}\n");
+        let cfg = Config::from_toml_str(&src).unwrap();
+        assert_eq!(cfg.theme.palette[2], Theme::light().palette[2]);
+        assert_eq!(cfg.theme.palette[3], [0x03, 0, 0]);
+    }
+
+    #[test]
+    fn a_bad_theme_color_is_skipped_and_the_other_keys_still_apply() {
+        let src = "[theme]\npreset = \"dark\"\nbackground = \"not a color\"\nforeground = \"#abcdef\"\naccent = \"#12\"\ncursor = \"\"\n";
+        let cfg = Config::from_toml_str(src).expect("a bad color is not a parse error");
+        assert_eq!(cfg.theme.background, Theme::dark().background, "skipped");
+        assert_eq!(cfg.theme.foreground, [0xab, 0xcd, 0xef], "applied");
+        assert_eq!(
+            cfg.theme.accent,
+            crate::theme::DARK_ACCENT,
+            "back to the preset"
+        );
+        assert_eq!(cfg.theme.cursor, [0xab, 0xcd, 0xef], "= foreground");
+    }
+
+    #[test]
+    fn an_unreadable_custom_pair_warns_but_still_loads() {
+        let src = "[theme]\nbackground = \"#ffffff\"\nforeground = \"#eeeeee\"\n";
+        let cfg = Config::from_toml_str(src).expect("the user's colors are the user's call");
+        assert_eq!(cfg.theme.foreground, [0xee, 0xee, 0xee]);
+        assert!(contrast_ratio(cfg.theme.foreground, cfg.theme.background) < 4.5);
+        // Both presets are well clear of the line the warning draws.
+        for t in [Theme::light(), Theme::dark()] {
+            assert!(contrast_ratio(t.foreground, t.background) >= 4.5);
+        }
+    }
+
+    #[test]
+    fn theme_ignores_unknown_keys_and_leaves_other_sections_alone() {
+        let src = "[theme]\npreset = \"dark\"\nselection = \"#123456\"\n[font]\nsize = 15\n";
+        let cfg = Config::from_toml_str(src).unwrap();
+        assert_eq!(cfg.theme, Theme::dark());
+        assert_eq!(cfg.font.size, 15.0);
     }
 
     #[test]
