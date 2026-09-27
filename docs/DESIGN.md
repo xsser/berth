@@ -172,7 +172,8 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 [persist]        snapshot_interval_s = 5   journal = false   max_restored_lines = 50000
 [sidebar]        width = 280   preview_rows = 3   preview_hz = 4
 [notify]         on = ["waiting_permission", "waiting_input", "done", "error"]
-                 identity = "com.apple.Terminal"   # 未打包成 .app 前借用的通知身份；打包后改为自身 bundle id
+                 identity = "com.apple.Terminal"   # 通知身份的默认值：未打包的程序不能自报身份，只能借用
+                                                   # 装了 Berth.app 之后改成 "io.github.xsser.berth"（§8.5）
 [theme]          preset = "light"          # "light"（默认，白底）| "dark"
                  background = "#ffffff"    foreground = "#1f2328"
                  cursor = "#1f2328"        cursor_text = "#ffffff"
@@ -189,6 +190,27 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
   - `ansi` 覆盖 0..=15，必须正好 16 个，否则 warn + 整段忽略；16..=255 仍按 xterm 色立方与灰阶从新的 16 色重建。
   - 颜色写法 `#rgb` / `#rrggbb`，大小写不敏感，`#` 可省。单个值非法**只跳过该键**并 warn（写明键名与原值），同段其余键照常生效；`foreground` 对 `background` 对比度低于 4.5:1 只告警，不改用户的值。
   - 窗口内其他颜色没有第二套配色：侧栏、预览块、分隔线与 pane 边框、通知条、egui 菜单/对话框全部由 `[theme]` 推导，按 `Theme::is_light()`（背景相对亮度 > 0.5）选深/浅两套混色系数。
+
+### 8.5 macOS 应用打包
+
+`packaging/make-app.sh` 由 `target/release` 产出 `dist/Berth.app`，不安装也不启动。
+
+- **自包含**：`berth`、`berthd`、`berth-hook` 三个二进制都放进 `Contents/MacOS`。`client.rs`
+  的 `find_berthd` 先找可执行文件旁边的同名文件，再找 `PATH`，所以 bundle 不依赖 PATH 就能
+  拉起自己的 daemon。从 Finder 启动时 PATH 只有系统默认值，这一点是打包能成立的前提。
+- **bundle id** `io.github.xsser.berth`，`CFBundleIconFile` 指向 `Resources/berth.icns`。
+- **签名**：Apple Silicon 上二进制必须带签名才能运行。脚本先逐个签嵌套的可执行文件、再签
+  bundle 本身（`--deep` 已废弃，不用），用 ad-hoc 签名（`--sign -`），最后 `codesign --verify
+  --strict` 自检。本地构建的应用不带隔离属性，不经 Gatekeeper。
+- **图标**：`assets/icon/make_icon.py` 按 macOS 图标网格（1024 画布内 824 超椭圆方块居中）
+  画两份图稿——完整稿给 64px 及以上，简化稿（去掉提示符与分隔线、点和光标放大）给 16/32px，
+  由 `build_icns.sh` 合成 `.icns`。单一图稿在 16px 下会糊成一团，这是分两份的原因。
+  `assets/icon/make_logo.py` 用同一套几何生成 README 的 `assets/logo.svg`。
+- **通知身份**：未打包的程序不能自报身份，所以 `[notify].identity` 默认借用
+  `com.apple.Terminal`。装好 Berth.app 并 `lsregister` 之后改成自身 bundle id，通知才会显示
+  为「berth」。这是 LaunchServices 层面的解析，不要求应用正在运行。
+- **不打包的用法不受影响**：直接跑 `target/release/berth` 一切照旧，只是通知仍借用 Terminal
+  的身份（除非 Berth.app 已装，此时该 bundle id 对两种跑法都解析得到）。
 
 ## 9. Agent 状态机（daemon）
 
@@ -255,7 +277,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 | M2 GUI 终端 | 可日常使用的单 session 终端 | vttest 子集；vim / htop / claude TUI 手工清单；resize 无错位 |
 | M3 侧栏 + workspace + agent 状态 | hooks CLI、`setup-hooks`、zsh 集成、进程树回退、通知 | 3 个 claude 并行，状态转移与实际一致；hook 未装时启发式标注为推断 |
 | M4 持久化 L2 | 快照 / 恢复 / revive / resume | `kill -9 berthd` → 重启 → 历史可见 → revive 续写在下方；`claude --resume` 成功 |
-| M5 打磨 | 配置热重载、搜索、URL、`.app` 打包、launchd 可选（主题已提前随 §8.4 `[theme]` 落地） | 冷启动 <300ms；30 session 预览 CPU <5% |
+| M5 打磨 | 配置热重载、搜索、URL、launchd 可选（主题已随 §8.4 `[theme]` 落地，`.app` 打包已随 §8.5 落地） | 冷启动 <300ms；30 session 预览 CPU <5% |
 
 分工（按既有约定）：Fable 5 设计 / 验收 / 审核；opus（effort max）或 codex 在各自 worktree 按 crate 所有权并发实现（`berth-vt` / `berth-daemon` / `berth-app` 三条线，`berth-core` 先冻结接口）。
 

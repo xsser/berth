@@ -59,3 +59,8 @@
 - 深色预设回归确认：`GHOSTTY_16` 与 main 逐字节相同，背景 `#282c34`、前景 `#ffffff` 未变，设 `preset = "dark"` 的用户拿到的仍是原来那套，唯一差别是上面那条聚焦边框。
 - 流程与门禁：独立审查给出 1 high + 7 medium + 7 low，裁决为 10 条必修（其中审查的 M5 经我查 egui 源码撤回），分两批发回实现，每条新测试都做变异验证（必修 7 的变异触发 3 红、必修 10 触发 1 红、对话框断言加强后触发 1 红）。合并前在「合并后的实际树」上跑三道门：`cargo fmt --all -- --check` 0、`cargo clippy --workspace --all-targets -- -D warnings` 0（0 条告警）、`cargo test --workspace` 0（498 通过 / 0 失败）。`berth-daemon` 的 `exit_is_detected_while_a_background_job_holds_the_tty` 在实现侧出现过一次负载下偶发（重跑 7/7 通过），本分支未触碰 daemon 代码。
 - 文档与代码不符这一轮出现四处（三处我点名 + 实现者通读后自查出第四处：README 两段 `[theme]` 示例里 accent 的用途清单不全）。共性是改代码时改了最近的注释、漏了远处的用户文档。已把门槛做成常量并让自检表打印每行适用的门槛，但散文里的数字仍只能靠通读。
+- 应用图标与 `.app` 打包（`packaging/make-app.sh`，DESIGN §8.5）：`Berth.app` 把三个二进制放进 `Contents/MacOS`，靠 `find_berthd` 先查可执行文件旁边这一条自包含，不依赖 PATH——从 Finder 启动时 PATH 只有系统默认值，这是打包能成立的前提。bundle id `io.github.xsser.berth`，ad-hoc 签名（先签嵌套二进制再签 bundle，`--deep` 已废弃），`codesign --verify --strict` 自检。
+- 图标分两份图稿：完整稿（侧栏 + 三个状态点 + 提示符 + 块光标）给 64px 及以上，简化稿（去掉提示符与分隔线，点和光标放大）给 16/32px。单一图稿在 16px 下会糊成一团，三个候选方案的 16px 实际像素对比后选了「细边框 + 点 + 光标」这版：只留三个点最清楚但失去辨识内容，像通用状态图标。`assets/icon/make_icon.py` 用 Pillow 按 macOS 网格（1024 画布内 824 超椭圆方块）绘制，4x 超采样后 LANCZOS 缩小；`make_logo.py` 用同一套几何生成 README 的 `logo.svg`，两边共用参数而不是共用产物。
+- 踩到的坑：侧栏若按「圆角矩形」单独绘制，它的右侧圆角会溢出到分隔线外侧，必须整窗一次成形再统一上超椭圆掩码；超椭圆掩码不要自己写抗锯齿衰减（会鼓包），用硬边掩码交给超采样缩小。
+- 通知身份：打包前借用 `com.apple.Terminal`（未打包的程序不能自报身份）。装好并 `lsregister` 后 `io.github.xsser.berth` 可被 LaunchServices 解析（`osascript -e 'POSIX path of (path to application id ...)'` 返回 `/Applications/Berth.app/`），此时该身份对打包与不打包两种跑法都有效。注意 `dist/` 下的副本也会被注册，同一 bundle id 两份会让解析有歧义，`dist/` 已进 `.gitignore`。
+- 验收注记：`--screenshot` 不触发通知，所以通知身份不能用它验证（身份是首次发通知前才设置的）。改用 LaunchServices 解析作为前置条件的证据，并单独说明「身份已设置」未做端到端验证。

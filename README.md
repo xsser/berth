@@ -78,6 +78,22 @@ cp target/release/{berth,berthd,berth-hook} ~/.local/bin/   # anywhere on your P
 berth                                                       # starts berthd if needed
 ```
 
+Or build a proper macOS app and drop it in `/Applications`:
+
+```sh
+./packaging/make-app.sh                  # dist/Berth.app, ad-hoc signed
+ditto dist/Berth.app /Applications/Berth.app
+```
+
+The bundle carries all three binaries in `Contents/MacOS`, and `berth` looks for `berthd` next to
+itself before it looks at `PATH`, so the app is self-contained. With it installed, point
+notifications at berth's own identity instead of borrowing Terminal's:
+
+```toml
+[notify]
+identity = "io.github.xsser.berth"
+```
+
 To let berth see Claude Code's state, install the hooks — read the diff first, then confirm:
 
 ```sh
@@ -143,7 +159,7 @@ Design notes live in [docs/DESIGN.md](docs/DESIGN.md), progress and known gaps i
 ### Status · 路线
 
 Working today on macOS: the four goals above, `berth list` / `doctor` / `setup-hooks`, zsh shell
-integration, splits and archive. Not there yet: Linux, a packaged `.app`, bash/fish integration,
+integration, splits, archive and a packaged `.app`. Not there yet: Linux, bash/fish integration,
 search in scrollback. The protocol is versioned, so a stale daemon is detected and can be restarted
 from the GUI.
 
@@ -198,6 +214,21 @@ cp target/release/{berth,berthd,berth-hook} ~/.local/bin/   # 放到 PATH 上任
 berth                                                       # 需要时会自己拉起 berthd
 ```
 
+也可以打包成正经的 macOS 应用放进 `/Applications`：
+
+```sh
+./packaging/make-app.sh                  # 产出 dist/Berth.app，带 ad-hoc 签名
+ditto dist/Berth.app /Applications/Berth.app
+```
+
+三个二进制都在 `Contents/MacOS` 里，而 `berth` 找 `berthd` 时先看自己旁边、再看 `PATH`，
+所以这个 bundle 是自包含的。装好之后可以让通知用 berth 自己的身份，不再借用 Terminal 的：
+
+```toml
+[notify]
+identity = "io.github.xsser.berth"
+```
+
 要让 berth 看到 Claude Code 的状态，安装 hooks——先看 diff，再确认：
 
 ```sh
@@ -247,8 +278,8 @@ background = "#fffdf6"    # foreground、cursor、cursor_text、ansi = [16 色] 
 
 ### 现状
 
-macOS 上已经可用：上面这四件事、`berth list` / `doctor` / `setup-hooks`、zsh 集成、分屏与归档。
-还没有：Linux、打包成 `.app`、bash/fish 集成、滚动历史内搜索。协议带版本号，所以旧 daemon 会被识别出来，
+macOS 上已经可用：上面这四件事、`berth list` / `doctor` / `setup-hooks`、zsh 集成、分屏、归档与 `.app` 打包。
+还没有：Linux、bash/fish 集成、滚动历史内搜索。协议带版本号，所以旧 daemon 会被识别出来，
 可以从 GUI 里直接重启。
 
 ---
