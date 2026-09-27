@@ -106,35 +106,123 @@ struct Palette {
     light: bool,
 }
 
+/// How far each surface steps away from the theme's own colors. Named
+/// per mode so the two sets read side by side and the checks can state
+/// which color a surface is a step from: `sidebar` and `preview` step the
+/// terminal background toward black, `select` / `hover` / `border` step
+/// [`Palette::tint_base`] (resp. the sidebar fill) toward the foreground,
+/// `raised` and `danger` step the terminal background toward the
+/// foreground and toward `ansi[1]`, and `dim` / `faint` / `preview_fg`
+/// fade the foreground back toward the terminal background.
+struct Steps {
+    sidebar: f32,
+    preview: f32,
+    select: f32,
+    hover: f32,
+    border: f32,
+    raised: f32,
+    danger: f32,
+    dim: f32,
+    faint: f32,
+    preview_fg: f32,
+}
+
+/// A dark theme has room to step far toward black.
+const DARK_STEPS: Steps = Steps {
+    sidebar: 0.22,
+    preview: 0.40,
+    select: 0.12,
+    hover: 0.05,
+    border: 0.10,
+    raised: 0.06,
+    danger: 0.34,
+    dim: 0.45,
+    faint: 0.62,
+    preview_fg: 0.25,
+};
+
+/// White goes dirty long before 0.22, so a light theme steps about a
+/// twentieth of that toward black. The amounts that run toward the
+/// foreground are not scaled the same way: `border` has to clear `select`
+/// (they are a step from the same fill, and at equal amounts a widget's
+/// stroke vanishes into its own fill), and `raised` has to lift a panel
+/// off a white terminal, where a 0.06 step is 1.12:1.
+const LIGHT_STEPS: Steps = Steps {
+    sidebar: 0.045,
+    preview: 0.075,
+    select: 0.14,
+    hover: 0.06,
+    border: 0.26,
+    raised: 0.10,
+    danger: 0.16,
+    dim: 0.34,
+    faint: 0.42,
+    preview_fg: 0.20,
+};
+
+/// The line the sidebar draws along its own edge. The pane dividers take
+/// it from here rather than deriving it a second time
+/// (`app::pane_chrome`): they are the same line to the eye, and a light
+/// theme's amounts are not a scaled copy of a dark theme's, so a copy
+/// would drift the moment either is tuned.
+pub fn border(t: &Theme) -> Rgb {
+    mix(
+        Palette::sidebar_fill(t),
+        t.foreground,
+        Palette::steps(t).border,
+    )
+}
+
 impl Palette {
-    /// Both presets want the sidebar one step away from the terminal
-    /// background and the preview block one step further, but only a dark
-    /// theme gets there by mixing toward black: on white the same 0.22
-    /// lands on a dirty gray, so a light theme steps by a twentieth of
-    /// that. Selection and hover tints follow: a light sidebar is *darker*
-    /// than its terminal, so tinting the terminal background toward the
-    /// foreground (what the dark theme does) would land back on the
-    /// sidebar color and disappear — a light theme tints its own
-    /// background instead.
+    fn steps(t: &Theme) -> &'static Steps {
+        if t.is_light() {
+            &LIGHT_STEPS
+        } else {
+            &DARK_STEPS
+        }
+    }
+
+    /// The sidebar sits one step below the terminal background, and the
+    /// preview block one step further.
+    fn sidebar_fill(t: &Theme) -> Rgb {
+        mix(t.background, [0, 0, 0], Self::steps(t).sidebar)
+    }
+
+    /// What the selection, hover and border tints are a step away from. A
+    /// light sidebar is *darker* than its terminal, so tinting the
+    /// terminal background toward the foreground (what a dark theme does)
+    /// lands back on the sidebar fill and disappears: at the hover amount
+    /// it came out 1.01:1 against the fill it was drawn on. A light theme
+    /// tints that fill instead.
+    fn tint_base(t: &Theme) -> Rgb {
+        if t.is_light() {
+            Self::sidebar_fill(t)
+        } else {
+            t.background
+        }
+    }
+
     fn from_theme(t: &Theme) -> Self {
         let (fg, bg, black) = (t.foreground, t.background, [0, 0, 0]);
         let light = t.is_light();
-        let sidebar = mix(bg, black, if light { 0.045 } else { 0.22 });
-        let tint = |amount: f32| c32(mix(if light { sidebar } else { bg }, fg, amount));
+        let s = Self::steps(t);
+        let sidebar = Self::sidebar_fill(t);
+        let base = Self::tint_base(t);
+        let tint = |amount: f32| c32(mix(base, fg, amount));
         let fade = |amount: f32| c32(mix(fg, bg, amount));
         let text = mix(fg, bg, 0.08);
-        let danger = mix(bg, t.palette[1], if light { 0.16 } else { 0.34 });
+        let danger = mix(bg, t.palette[1], s.danger);
         Self {
             bg: c32(sidebar),
             fg: c32(text),
-            dim: fade(if light { 0.34 } else { 0.45 }),
-            faint: fade(if light { 0.42 } else { 0.62 }),
-            select: tint(if light { 0.14 } else { 0.12 }),
-            hover: tint(if light { 0.06 } else { 0.05 }),
-            preview_bg: c32(mix(bg, black, if light { 0.075 } else { 0.40 })),
-            preview_fg: fade(if light { 0.20 } else { 0.25 }),
-            border: c32(mix(sidebar, fg, if light { 0.14 } else { 0.10 })),
-            raised: c32(mix(bg, fg, 0.06)),
+            dim: fade(s.dim),
+            faint: fade(s.faint),
+            select: tint(s.select),
+            hover: tint(s.hover),
+            preview_bg: c32(mix(bg, black, s.preview)),
+            preview_fg: fade(s.preview_fg),
+            border: c32(border(t)),
+            raised: c32(mix(bg, fg, s.raised)),
             danger: c32(danger),
             // A custom `ansi[1]` can be any red, so the error notice takes
             // whichever of the theme's two ends reads better on it rather
@@ -159,6 +247,32 @@ impl Palette {
             accent: c32(t.accent),
             light,
         }
+    }
+}
+
+/// How far the 「等授权」 pulse may dim the accent: at the trough it is
+/// drawn at this fraction of full strength over the sidebar fill, which
+/// is a plain `mix(bg, accent, PULSE_FLOOR)`. Below 0.80 the badge drops
+/// under 3:1 in both presets (0.55 gave 2.14:1 on the light sidebar), and
+/// this is the state asking the user to come and confirm something — it
+/// has to stay legible through the whole cycle, not only at the peak.
+const PULSE_FLOOR: f32 = 0.80;
+
+/// Badge color of an agent state. 「等授权」 breathes between
+/// [`PULSE_FLOOR`] and full strength; every other state is a flat palette
+/// entry.
+fn state_color(pal: Palette, state: &AgentState, now_ms: i64) -> Color32 {
+    let wave = (now_ms as f64 / 1000.0 * std::f64::consts::PI).sin().abs() as f32;
+    let pulse = PULSE_FLOOR + (1.0 - PULSE_FLOOR) * wave;
+    match state {
+        AgentState::Idle | AgentState::Exited { .. } => pal.dim,
+        AgentState::Thinking => pal.blue,
+        AgentState::Compacting => pal.magenta,
+        AgentState::ToolRunning { .. } => pal.yellow,
+        AgentState::WaitingPermission { .. } => pal.accent.gamma_multiply(pulse),
+        AgentState::WaitingInput => pal.cyan,
+        AgentState::Done => pal.green,
+        AgentState::Error { .. } => pal.red,
     }
 }
 
@@ -1208,19 +1322,7 @@ impl Sidebar {
     }
 
     fn state_color(&self, state: &AgentState, now_ms: i64) -> Color32 {
-        let pal = self.palette;
-        let pulse =
-            0.55 + 0.45 * ((now_ms as f64 / 1000.0 * std::f64::consts::PI).sin().abs() as f32);
-        match state {
-            AgentState::Idle | AgentState::Exited { .. } => pal.dim,
-            AgentState::Thinking => pal.blue,
-            AgentState::Compacting => pal.magenta,
-            AgentState::ToolRunning { .. } => pal.yellow,
-            AgentState::WaitingPermission { .. } => pal.accent.gamma_multiply(pulse),
-            AgentState::WaitingInput => pal.cyan,
-            AgentState::Done => pal.green,
-            AgentState::Error { .. } => pal.red,
-        }
+        state_color(self.palette, state, now_ms)
     }
 
     /// Preview line with the session's colors.
@@ -2108,6 +2210,13 @@ impl Sidebar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ACCENT_CONTRAST;
+
+    /// A painted color back as the theme's own `[u8; 3]`.
+    fn rgb(c: Color32) -> Rgb {
+        let [r, g, b, _] = c.to_srgba_unmultiplied();
+        [r, g, b]
+    }
 
     #[test]
     fn reverse_video_previews_keep_a_readable_background() {
@@ -2174,6 +2283,104 @@ mod tests {
         assert_eq!(badge(&AgentState::Thinking, 1), "◓", "spinner advances");
     }
 
+    /// Two surfaces that land on the same color are invisible against
+    /// each other, and a check that only compares each one to the
+    /// background cannot see it: the light theme's `select` and `border`
+    /// were both `#d6d7d7`, so every widget's stroke disappeared into its
+    /// own fill.
+    #[test]
+    fn no_two_sidebar_surfaces_share_a_color() {
+        for theme in [Theme::light(), Theme::dark()] {
+            let name = if theme.is_light() { "light" } else { "dark" };
+            let p = Palette::from_theme(&theme);
+            let named = [
+                ("bg", p.bg),
+                ("hover", p.hover),
+                ("select", p.select),
+                ("border", p.border),
+                ("preview_bg", p.preview_bg),
+                ("raised", p.raised),
+                ("popup", p.popup),
+            ];
+            for (i, (a_name, a)) in named.iter().enumerate() {
+                for (b_name, b) in &named[i + 1..] {
+                    assert_ne!(a, b, "{name}: {a_name} and {b_name} are one color");
+                }
+            }
+        }
+    }
+
+    /// The light theme's tints come off its own sidebar fill, the dark
+    /// theme's off the terminal background. Deriving both from the
+    /// terminal background is the bug this guards: a light sidebar is
+    /// darker than its terminal, so those tints land back on the sidebar
+    /// fill and vanish.
+    #[test]
+    fn a_light_theme_tints_its_own_fill_not_the_terminal_background() {
+        let light = Theme::light();
+        let dark = Theme::dark();
+        let sidebar = Palette::sidebar_fill(&light);
+        assert_eq!(Palette::tint_base(&light), sidebar);
+        assert_eq!(Palette::tint_base(&dark), dark.background);
+
+        let fg = light.foreground;
+        let p = Palette::from_theme(&light);
+        assert_eq!(rgb(p.select), mix(sidebar, fg, LIGHT_STEPS.select));
+        assert_eq!(rgb(p.hover), mix(sidebar, fg, LIGHT_STEPS.hover));
+        assert_ne!(rgb(p.select), mix(light.background, fg, LIGHT_STEPS.select));
+        assert_ne!(rgb(p.hover), mix(light.background, fg, LIGHT_STEPS.hover));
+
+        // Why it matters: at the hover amount the terminal-derived tint
+        // is indistinguishable from the fill it is drawn on, and at both
+        // amounts it is a weaker step away from that fill than ours.
+        let vanished = mix(light.background, fg, LIGHT_STEPS.hover);
+        assert!(
+            contrast_ratio(vanished, sidebar) < 1.05,
+            "{vanished:02x?} on {sidebar:02x?} would have been visible after all"
+        );
+        for amount in [LIGHT_STEPS.hover, LIGHT_STEPS.select] {
+            let theirs = contrast_ratio(mix(light.background, fg, amount), sidebar);
+            let ours = contrast_ratio(mix(sidebar, fg, amount), sidebar);
+            assert!(
+                ours > theirs,
+                "at {amount}: {ours:.2} is no better than {theirs:.2}"
+            );
+        }
+
+        // The dark theme is unchanged: its tints stay on the terminal.
+        let d = Palette::from_theme(&dark);
+        let dfg = dark.foreground;
+        assert_eq!(rgb(d.select), mix(dark.background, dfg, DARK_STEPS.select));
+        assert_eq!(rgb(d.hover), mix(dark.background, dfg, DARK_STEPS.hover));
+    }
+
+    /// 「等授权」 breathes, and the trough is the part nobody looks at
+    /// when picking the colors: at the old floor of 0.55 the badge sank to
+    /// 2.14:1 on the light sidebar. This is the one state that is asking
+    /// the user to come and act on it.
+    #[test]
+    fn the_waiting_permission_pulse_stays_readable_at_its_trough() {
+        let waiting = AgentState::WaitingPermission { tool: None };
+        for theme in [Theme::light(), Theme::dark()] {
+            let name = if theme.is_light() { "light" } else { "dark" };
+            let pal = Palette::from_theme(&theme);
+            // now_ms 0 is sin(0), the trough; 500 is sin(pi/2), the peak.
+            let trough = state_color(pal, &waiting, 0);
+            assert_eq!(trough, pal.accent.gamma_multiply(PULSE_FLOOR));
+            let peak = state_color(pal, &waiting, 500);
+            assert_eq!(peak, pal.accent, "{name}: the peak is the accent");
+
+            let on_sidebar = pal.bg.blend(trough);
+            let low = contrast_ratio(rgb(on_sidebar), rgb(pal.bg));
+            let high = contrast_ratio(rgb(peak), rgb(pal.bg));
+            assert!(
+                low >= ACCENT_CONTRAST,
+                "{name}: the pulse bottoms out at {low:.2}:1 on the sidebar"
+            );
+            assert!(high > low, "{name}: the badge no longer breathes");
+        }
+    }
+
     /// The sidebar's surfaces are one step away from the terminal
     /// background in both directions, and every color it puts on them
     /// stays legible. The light preset is the case that used to break: its
@@ -2181,10 +2388,6 @@ mod tests {
     /// the terminal background would land on the sidebar color and vanish.
     #[test]
     fn both_presets_keep_the_sidebar_readable_and_its_surfaces_apart() {
-        let rgb = |c: Color32| {
-            let [r, g, b, _] = c.to_srgba_unmultiplied();
-            [r, g, b]
-        };
         for theme in [Theme::light(), Theme::dark()] {
             let name = if theme.is_light() { "light" } else { "dark" };
             let p = Palette::from_theme(&theme);

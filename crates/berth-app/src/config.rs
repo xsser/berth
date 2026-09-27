@@ -14,7 +14,9 @@
 use serde::Deserialize;
 use std::path::Path;
 
-use crate::theme::{contrast_ratio, xterm_palette, Rgb, Theme};
+use crate::theme::{
+    contrast_ratio, xterm_palette, Rgb, Theme, ACCENT_CONTRAST, BODY_TEXT_CONTRAST,
+};
 
 pub const DEFAULT_FONT_FAMILY: &str = "SF Mono";
 pub const DEFAULT_FONT_SIZE: f32 = 13.0;
@@ -161,14 +163,24 @@ fn theme_from_file(f: FileTheme) -> Theme {
     // The accent follows the background that ended up in effect, so a dark
     // `background` override gets the dark accent without naming a preset.
     theme.accent = color_key("accent", f.accent).unwrap_or_else(|| theme.default_accent());
-    // Custom colors are the user's call, so this only warns: an override
-    // pair below WCAG AA is legal but is almost always a mistake, and it is
-    // far easier to explain here than from a screenshot.
+    // Custom colors are the user's call, so these only warn: a pair below
+    // the floor is legal but is almost always a mistake, and it is far
+    // easier to explain here than from a screenshot. The two floors are
+    // the ones the presets are held to — body text against the background,
+    // and the accent as a marker on it.
     let ratio = contrast_ratio(theme.foreground, theme.background);
-    if ratio < 4.5 {
+    if ratio < BODY_TEXT_CONTRAST {
         tracing::warn!(
-            "theme.foreground {:02x?} 在 theme.background {:02x?} 上对比度只有 {ratio:.2}:1（低于 WCAG AA 的 4.5:1）",
+            "theme.foreground {:02x?} 在 theme.background {:02x?} 上对比度只有 {ratio:.2}:1（正文需要 {BODY_TEXT_CONTRAST}:1）",
             theme.foreground,
+            theme.background
+        );
+    }
+    let ratio = contrast_ratio(theme.accent, theme.background);
+    if ratio < ACCENT_CONTRAST {
+        tracing::warn!(
+            "theme.accent {:02x?} 在 theme.background {:02x?} 上对比度只有 {ratio:.2}:1（强调色需要 {ACCENT_CONTRAST}:1）",
+            theme.accent,
             theme.background
         );
     }
@@ -437,13 +449,18 @@ mod tests {
 
     #[test]
     fn an_unreadable_custom_pair_warns_but_still_loads() {
-        let src = "[theme]\nbackground = \"#ffffff\"\nforeground = \"#eeeeee\"\n";
+        let src =
+            "[theme]\nbackground = \"#ffffff\"\nforeground = \"#eeeeee\"\naccent = \"#f5f5f5\"\n";
         let cfg = Config::from_toml_str(src).expect("the user's colors are the user's call");
         assert_eq!(cfg.theme.foreground, [0xee, 0xee, 0xee]);
-        assert!(contrast_ratio(cfg.theme.foreground, cfg.theme.background) < 4.5);
-        // Both presets are well clear of the line the warning draws.
+        assert_eq!(cfg.theme.accent, [0xf5, 0xf5, 0xf5]);
+        let bg = cfg.theme.background;
+        assert!(contrast_ratio(cfg.theme.foreground, bg) < BODY_TEXT_CONTRAST);
+        assert!(contrast_ratio(cfg.theme.accent, bg) < ACCENT_CONTRAST);
+        // Both presets are well clear of the lines the warnings draw.
         for t in [Theme::light(), Theme::dark()] {
-            assert!(contrast_ratio(t.foreground, t.background) >= 4.5);
+            assert!(contrast_ratio(t.foreground, t.background) >= BODY_TEXT_CONTRAST);
+            assert!(contrast_ratio(t.accent, t.background) >= ACCENT_CONTRAST);
         }
     }
 

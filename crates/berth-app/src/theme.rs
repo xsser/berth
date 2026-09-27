@@ -22,6 +22,13 @@ pub type Rgb = [u8; 3];
 /// Ghostty `faint-opacity` default: DIM text is drawn at half strength.
 pub const DIM_FACTOR: f32 = 0.5;
 
+/// WCAG 1.4.3: the floor for anything a program writes text in — the
+/// foreground, the cursor and the normal colors 0..=7.
+pub const BODY_TEXT_CONTRAST: f32 = 4.5;
+/// WCAG 1.4.11: the floor for colors that mark text rather than carry it
+/// — the accent and the bright colors 8..=15.
+pub const ACCENT_CONTRAST: f32 = 3.0;
+
 /// Accent of the dark preset (「等授权」 pulse, focused pane border).
 pub const DARK_ACCENT: Rgb = [0xde, 0x93, 0x5f];
 /// Accent of the light preset: the dark one reads at 2.5:1 on white, this
@@ -62,20 +69,26 @@ const GHOSTTY_16: [Rgb; 16] = [
     [0xea, 0xea, 0xea],
 ];
 
-/// One Light's 16 colors, with green (`#98c379` → `#3f8a3e`), yellow
-/// (`#e5c07b` → `#9a6a00`), white (`#a0a1a7` → `#8e9096`) and bright
-/// magenta (`#c678dd` → `#b45ccd`) darkened: upstream's are meant for
-/// syntax highlighting on a slightly gray editor background and fall under
-/// 3:1 on pure white.
+/// One Light's 16 colors, darkened where upstream's (meant for syntax
+/// highlighting on a gray editor background) miss the floor their slot
+/// has to clear on pure white.
+///
+/// Normal 0..=7 carry body text — `ls`, diffs, compiler output — so they
+/// are held to [`BODY_TEXT_CONTRAST`] (WCAG 1.4.3), not to the 3:1 of a
+/// non-text element: red `#e45649` → `#c84c40`, green `#98c379` →
+/// `#3c843c`, yellow `#e5c07b` → `#9a6a00`, cyan `#0184bc` → `#017cb1`,
+/// white `#a0a1a7` → `#73757a`. Bright 8..=15 mark that text rather than
+/// carry it and keep [`ACCENT_CONTRAST`], where only bright magenta
+/// `#c678dd` → `#b45ccd` fell short.
 const ONE_LIGHT_16: [Rgb; 16] = [
     [0x38, 0x3a, 0x42],
-    [0xe4, 0x56, 0x49],
-    [0x3f, 0x8a, 0x3e],
+    [0xc8, 0x4c, 0x40],
+    [0x3c, 0x84, 0x3c],
     [0x9a, 0x6a, 0x00],
     [0x3a, 0x67, 0xd8],
     [0xa6, 0x26, 0xa4],
-    [0x01, 0x84, 0xbc],
-    [0x8e, 0x90, 0x96],
+    [0x01, 0x7c, 0xb1],
+    [0x73, 0x75, 0x7a],
     [0x4f, 0x52, 0x5e],
     [0xe0, 0x6c, 0x75],
     [0x50, 0xa1, 0x4f],
@@ -335,15 +348,16 @@ mod tests {
         assert!(relative_luminance([0x28, 0x2c, 0x34]) < 0.5);
     }
 
-    /// Every color the light preset can put on its own background stays
-    /// above the 3:1 non-text contrast floor (WCAG 1.4.11). Bright colors
-    /// sit between 3:1 and 4.5:1 by design: they are accents, not body
-    /// text, and darkening them further loses the "bright" reading.
+    /// Each half of the light preset clears the floor its slot has to
+    /// meet on the theme's own background: normal 0..=7 are what a program
+    /// writes body text in, so [`BODY_TEXT_CONTRAST`]; bright 8..=15 mark
+    /// that text rather than carry it, so [`ACCENT_CONTRAST`] — darkening
+    /// them to 4.5:1 too would lose the "bright" reading.
     ///
     /// `cargo test -p berth-app light_preset -- --nocapture` prints the
     /// whole table, which is how a change to the palette is reviewed.
     #[test]
-    fn light_preset_clears_three_to_one_on_its_background() {
+    fn light_preset_clears_the_floor_of_each_half_of_the_palette() {
         const NAMES: [&str; 16] = [
             "black",
             "red",
@@ -364,28 +378,36 @@ mod tests {
         ];
         let t = Theme::light();
         let bg = t.background;
-        println!("light preset on {bg:02x?} (WCAG contrast)");
+        println!("light preset on {bg:02x?}: WCAG contrast / floor");
         for (i, c) in t.palette[..16].iter().enumerate() {
+            let floor = if i < 8 {
+                BODY_TEXT_CONTRAST
+            } else {
+                ACCENT_CONTRAST
+            };
             let r = contrast_ratio(*c, bg);
             println!(
-                "  {i:>2} {:<11} #{:02x}{:02x}{:02x}  {r:5.2}:1",
+                "  {i:>2} {:<11} #{:02x}{:02x}{:02x}  {r:5.2}:1  >= {floor:.1}",
                 NAMES[i], c[0], c[1], c[2]
             );
-            assert!(r >= 3.0, "ansi {i} {c:02x?} is {r:.2}:1 on {bg:02x?}");
+            assert!(r >= floor, "ansi {i} {c:02x?} is {r:.2}:1 on {bg:02x?}");
         }
-        for (name, c) in [
-            ("foreground", t.foreground),
-            ("accent", LIGHT_ACCENT),
-            ("cursor", t.cursor),
+        for (name, c, floor) in [
+            ("foreground", t.foreground, BODY_TEXT_CONTRAST),
+            ("cursor", t.cursor, BODY_TEXT_CONTRAST),
+            ("accent", t.accent, ACCENT_CONTRAST),
         ] {
             let r = contrast_ratio(c, bg);
             println!(
-                "     {name:<11} #{:02x}{:02x}{:02x}  {r:5.2}:1",
+                "     {name:<11} #{:02x}{:02x}{:02x}  {r:5.2}:1  >= {floor:.1}",
                 c[0], c[1], c[2]
             );
+            assert!(r >= floor, "{name} {c:02x?} is {r:.2}:1 on {bg:02x?}");
         }
-        assert!(contrast_ratio(t.foreground, bg) >= 7.0);
-        assert!(contrast_ratio(LIGHT_ACCENT, bg) >= 4.5);
-        assert!(contrast_ratio(DARK_ACCENT, Theme::dark().background) >= 4.5);
+        assert_eq!(t.accent, LIGHT_ACCENT);
+        // The dark preset's accent, on its own background.
+        let d = Theme::dark();
+        assert_eq!(d.accent, DARK_ACCENT);
+        assert!(contrast_ratio(d.accent, d.background) >= ACCENT_CONTRAST);
     }
 }

@@ -54,7 +54,7 @@ use crate::renderer::{
 use crate::selection::{Point, Selection, SelectionKind, SelectionSpans};
 use crate::sidebar::{Chrome, Sidebar, UiAction};
 use crate::stats::{FrameStats, FrameTiming, PaneSample};
-use crate::theme::{mix, rgba, Theme};
+use crate::theme::{rgba, Theme};
 
 /// Padding around the grid (Ghostty's default `window-padding-x/y = 2`).
 pub const PADDING_PT: f32 = 2.0;
@@ -289,22 +289,8 @@ fn pane_chrome(
     if layout.panes.len() < 2 {
         return Vec::new();
     }
-    // The sidebar's border, by the same two steps
-    // (`sidebar::Palette::from_theme`): away from the background, then back
-    // toward the foreground. A dark theme's line lands below its
-    // background, a light theme's just above it; mixing toward black by a
-    // dark theme's 0.22 would turn a white background muddy gray.
-    let light = theme.is_light();
     let accent = theme.accent;
-    let quiet = mix(
-        mix(
-            theme.background,
-            [0, 0, 0],
-            if light { 0.045 } else { 0.22 },
-        ),
-        theme.foreground,
-        if light { 0.14 } else { 0.10 },
-    );
+    let quiet = crate::sidebar::border(theme);
     let t = (BORDER_PT * scale).round().max(1.0);
     let r = |r: PxRect| [r.x, r.y, r.w, r.h];
     let mut quads: Vec<QuadInstance> = layout
