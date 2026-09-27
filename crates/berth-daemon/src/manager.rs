@@ -568,22 +568,18 @@ impl Manager {
         Ok(ws)
     }
 
-    /// Refuses while sessions that are not archived still belong to the
-    /// workspace (deleting them would purge history; the client must do
-    /// that explicitly). Archived ones do not count — archiving the sessions
-    /// is enough (DESIGN §17.2) — and keep the id of the deleted workspace:
-    /// restored, they are orphans until moved.
+    /// Refuses while sessions still belong to the workspace, archived ones
+    /// included (DESIGN §17.2): deleting them would purge history, and the
+    /// client must do that explicitly.
     pub fn delete_workspace(&self, id: WorkspaceId) -> Result<()> {
         {
             let mut reg = self.reg.lock();
             if !reg.workspaces.contains_key(&id) {
                 return Err("unknown workspace".into());
             }
-            if reg
-                .sessions
-                .values()
-                .any(|e| e.meta.workspace == id && !e.meta.is_archived())
-            {
+            // Archived sessions count too (DESIGN §17.2): deleting the
+            // workspace with them would leave orphans nowhere to go.
+            if reg.sessions.values().any(|e| e.meta.workspace == id) {
                 return Err("workspace still has sessions".into());
             }
             reg.workspaces.remove(&id);
@@ -996,10 +992,10 @@ impl Manager {
     }
 
     /// Clear the archive mark: the session is back in its workspace, still
-    /// dormant / restored (Revive as before). Restoring counts as activity
-    /// (`last_active_ms`): otherwise the next scan would archive a session
-    /// that was archived for being idle right away again. Not archived:
-    /// nothing changes.
+    /// dormant / restored (Revive as before). `last_active_ms` becomes now
+    /// (DESIGN §17.1): otherwise the next scan would archive a session that
+    /// was archived for being idle right away again. Not archived: nothing
+    /// changes.
     pub fn unarchive(&self, sid: SessionId) -> Result<SessionMeta> {
         let now = now_ms();
         let meta = {
@@ -1009,7 +1005,7 @@ impl Manager {
                 return Ok(e.meta.clone());
             }
             e.meta.archived_at_ms = None;
-            e.meta.last_active_ms = e.meta.last_active_ms.max(now);
+            e.meta.last_active_ms = now;
             e.meta.clone()
         };
         self.record(sid, now, "unarchive".into(), &meta.agent.state, None);
@@ -1273,11 +1269,9 @@ impl Manager {
             pid: std::process::id(),
             uptime_ms: now_ms() - self.started_ms,
             sessions_live: reg.sessions.values().filter(|e| e.meta.is_live()).count() as u32,
-            sessions_total: reg
-                .sessions
-                .values()
-                .filter(|e| !e.meta.is_archived())
-                .count() as u32,
+            // Every session the daemon knows, archived ones included
+            // (DESIGN §17.1); archived sessions are never live.
+            sessions_total: reg.sessions.len() as u32,
         }
     }
 
@@ -1862,8 +1856,9 @@ mod tests {
     /// persisted and broadcast; archiving again changes nothing. Archived,
     /// the session refuses Attach / Input / Resize / Subscribe (both modes)
     /// / Revive (both modes) but serves history, events and metadata
-    /// requests, and `DaemonStatus` leaves it out. Unarchive clears the mark,
-    /// counts as activity, and Revive works again.
+    /// requests; `DaemonStatus` still counts it in `sessions_total`.
+    /// Unarchive clears the mark, sets `last_active_ms` to now, and Revive
+    /// works again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn archive_kills_marks_refuses_and_unarchive_restores() {
         let dir = tempfile::tempdir().unwrap();
@@ -1937,8 +1932,9 @@ mod tests {
             mgr.move_session(sid, other.id, 3).unwrap().workspace,
             other.id
         );
+        // sessions_total still counts it (DESIGN §17.1).
         let status = mgr.status();
-        assert_eq!((status.sessions_live, status.sessions_total), (0, 0));
+        assert_eq!((status.sessions_live, status.sessions_total), (0, 1));
 
         // Idle for long, as the scan would have found it.
         mgr.reg
@@ -1952,8 +1948,8 @@ mod tests {
         let restored = mgr.unarchive(sid).unwrap();
         assert_eq!(restored.archived_at_ms, None);
         assert!(
-            restored.last_active_ms >= t1,
-            "restoring counts as activity"
+            (t1..=now_ms()).contains(&restored.last_active_ms),
+            "last_active_ms becomes now"
         );
         assert!(matches!(restored.status, SessionStatus::Dormant { .. }));
         assert_eq!(restored.workspace, other.id);
@@ -1970,32 +1966,37 @@ mod tests {
         mgr.shutdown().await;
     }
 
-    /// DESIGN §17.2: a workspace whose sessions are all archived can be
-    /// deleted; the archived session keeps its workspace id and, restored,
-    /// is an orphan (revived in its own cwd). Any other session still
-    /// blocks the delete.
+    /// DESIGN §17.2: archived sessions keep their workspace like any other
+    /// session. It is deleted only once none is left, moved away or purged.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn only_archived_sessions_do_not_keep_a_workspace() {
+    async fn archived_sessions_keep_their_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = test_manager(dir.path(), Config::default());
         let ws = mgr
             .create_workspace("w".into(), dir.path().to_path_buf())
             .unwrap();
-        let archived = shell(&mgr, ws.id).await;
-        let kept = shell(&mgr, ws.id).await;
-        mgr.archive(archived).await.unwrap();
+        let other = mgr
+            .create_workspace("other".into(), dir.path().to_path_buf())
+            .unwrap();
+        let moved = shell(&mgr, ws.id).await;
+        let purged = shell(&mgr, ws.id).await;
+        mgr.archive(moved).await.unwrap();
+        mgr.archive(purged).await.unwrap();
         assert_eq!(
             mgr.delete_workspace(ws.id).unwrap_err(),
             "workspace still has sessions"
         );
-        mgr.archive(kept).await.unwrap();
+        mgr.move_session(moved, other.id, 0).unwrap();
+        assert_eq!(
+            mgr.delete_workspace(ws.id).unwrap_err(),
+            "workspace still has sessions"
+        );
+        mgr.delete_session(purged).await.unwrap();
         mgr.delete_workspace(ws.id).unwrap();
-        assert!(mgr.list_workspaces().is_empty());
-        let meta = mgr.unarchive(archived).unwrap();
-        assert_eq!(meta.workspace, ws.id, "keeps the deleted workspace's id");
-        let revived = mgr.revive(archived, ReviveMode::Shell).await.unwrap();
-        assert!(revived.is_live());
-        assert_eq!(revived.cwd, dir.path());
+        let left: Vec<_> = mgr.list_workspaces().iter().map(|w| w.id).collect();
+        assert_eq!(left, vec![other.id]);
+        let m = mgr.meta(moved).unwrap();
+        assert!(m.is_archived() && m.workspace == other.id, "{m:?}");
         mgr.shutdown().await;
     }
 

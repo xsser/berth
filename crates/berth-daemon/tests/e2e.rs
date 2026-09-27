@@ -1586,8 +1586,8 @@ fn is_refusal(e: &Event) -> bool {
 /// Archiving a live session kills it before the reply, which carries the
 /// mark; other clients get it as `SessionUpdated`. Archived, the session
 /// refuses Attach / Input / Resize / Subscribe / Revive, serves history,
-/// events and metadata requests, and is left out of `DaemonStatus`. The
-/// mark survives a restart (registry); Unarchive clears it and Revive,
+/// events and metadata requests, and still counts in `sessions_total`.
+/// The mark survives a restart (registry); Unarchive clears it and Revive,
 /// Attach and Input work again below the old history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn archive_and_unarchive_over_the_protocol() {
@@ -1706,8 +1706,9 @@ async fn archive_and_unarchive_over_the_protocol() {
         Event::SessionUpdated(m) => assert_eq!(m.archived_at_ms, Some(at), "idempotent"),
         other => panic!("Archive answered {other:?}"),
     }
+    // sessions_total counts archived sessions too (DESIGN §17.1).
     match c.request(Request::DaemonStatus).await {
-        Event::Status(s) => assert_eq!((s.sessions_live, s.sessions_total), (0, 0)),
+        Event::Status(s) => assert_eq!((s.sessions_live, s.sessions_total), (0, 1)),
         other => panic!("{other:?}"),
     }
 
