@@ -158,7 +158,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 ```
 
 - 徽标：○ Idle / ◐ Thinking（旋转）/ ⚙ ToolRunning(name + 秒)/ ⏳ WaitingPermission（橙色脉冲）/ ✎ WaitingInput / ✓ Done（未读高亮）/ ✗ Error / ⏹ Exited；启发式来源用虚线图标。
-- 交互：单击切换；⌘1..9 跳转；⌘N 当前 workspace 新 session；⌘⇧N 新 workspace（目录选择器）；⌘W 关闭（有 agent 运行时二次确认）；⌘K 命令面板；⌘F 搜索（v1.1）；拖拽排序（v2）。
+- 交互：单击切换；⌘1..9 跳转；⌘N / ⌘T 当前 workspace 新 session；⌘⇧N 新 workspace（目录选择器）；⌘W 关闭（有 agent 运行时二次确认）；⌘K 命令面板；⌘F 搜索（v1.1）；拖拽排序（v2）。
 - 通知：未聚焦 session 进入 WaitingPermission / WaitingInput / Done / Error 时 macOS 通知 + Dock 角标（数量 = 需要关注的 session），可按 workspace 关闭。
 
 ### 8.4 配置

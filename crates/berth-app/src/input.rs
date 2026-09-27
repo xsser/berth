@@ -271,7 +271,8 @@ pub struct ImeGate {
 pub enum Shortcut {
     /// ⌘Q.
     Quit,
-    /// ⌘N: new session in the current workspace.
+    /// ⌘N, or ⌘T (new tab in Ghostty / Terminal.app): new session in the
+    /// current workspace.
     NewSession,
     /// ⌘⇧N: new workspace (folder picker).
     NewWorkspace,
@@ -372,6 +373,7 @@ fn shortcut_for(logical: &WinitKey, mods: ModifiersState) -> Shortcut {
     match key.as_str() {
         "q" if plain => Shortcut::Quit,
         "n" if plain => Shortcut::NewSession,
+        "t" if plain => Shortcut::NewSession,
         "n" if shift_only => Shortcut::NewWorkspace,
         "w" if plain => Shortcut::Close,
         "k" if plain => Shortcut::Palette,
@@ -831,6 +833,7 @@ mod tests {
         let cmd_shift = ModifiersState::SUPER | ModifiersState::SHIFT;
         let cases: Vec<(&str, ModifiersState, Shortcut)> = vec![
             ("n", cmd, Shortcut::NewSession),
+            ("t", cmd, Shortcut::NewSession),
             ("N", cmd_shift, Shortcut::NewWorkspace),
             ("w", cmd, Shortcut::Close),
             ("c", cmd, Shortcut::Copy),
@@ -839,6 +842,7 @@ mod tests {
             ("9", cmd, Shortcut::Jump(9)),
             ("0", cmd, Shortcut::Unbound("⌘0".into())),
             ("W", cmd_shift, Shortcut::Unbound("⌘⇧W".into())),
+            ("T", cmd_shift, Shortcut::Unbound("⌘⇧T".into())),
         ];
         for (key, mods, want) in cases {
             let k = WinitKey::Character(SmolStr::new(key));

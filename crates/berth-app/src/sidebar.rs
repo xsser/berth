@@ -951,7 +951,7 @@ impl Sidebar {
             let plus = Rect::from_center_size(Pos2::new(rect.right() - 7.0, y), Vec2::splat(18.0));
             let resp = ui
                 .interact(plus, Id::new(("ws-new", ws.id)), Sense::click())
-                .on_hover_text("在这个 workspace 新建 session（⌘N）");
+                .on_hover_text("在这个 workspace 新建 session（⌘N / ⌘T）");
             if resp.hovered() {
                 ui.painter().rect_filled(plus, 4.0, pal.hover);
             }
@@ -1016,7 +1016,7 @@ impl Sidebar {
                 painted,
                 rect.left_center(),
                 Align2::LEFT_CENTER,
-                "没有 session：⌘N 新建",
+                "没有 session：⌘N / ⌘T 新建",
                 prop(12.0),
                 pal.dim,
                 rect.width(),
@@ -1462,7 +1462,7 @@ impl Sidebar {
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::hover());
         let mut x = rect.left();
         for (label, action, tip) in [
-            ("+ session", UiAction::NewSession, "⌘N"),
+            ("+ session", UiAction::NewSession, "⌘N / ⌘T"),
             ("+ workspace", UiAction::NewWorkspace, "⌘⇧N"),
         ] {
             let w = 10.0 + label.len() as f32 * 6.5;
@@ -1601,7 +1601,7 @@ impl Sidebar {
                 );
                 ui.add_space(6.0);
                 for (keys, what) in [
-                    ("⌘N", "当前 workspace 新建 session"),
+                    ("⌘N / ⌘T", "当前 workspace 新建 session"),
                     ("⌘⇧N", "新建 workspace（选择目录）"),
                     ("⌘W", "关闭 session（agent 运行时二次确认）"),
                     ("⌘1…⌘9", "跳到第 n 个 session"),
