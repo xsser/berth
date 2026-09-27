@@ -155,6 +155,17 @@ pub enum Request {
     ResumeCommand {
         session: SessionId,
     },
+
+    // Added in M4 (appended, see `ListEvents`).
+    /// Kill (if live), then mark the session archived; replies `SessionUpdated`
+    /// (DESIGN §17.1). Archived sessions refuse Attach/Input/Resize/Revive/Subscribe.
+    Archive {
+        session: SessionId,
+    },
+    /// Clear the archived mark; replies `SessionUpdated`.
+    Unarchive {
+        session: SessionId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -543,5 +554,63 @@ mod tests {
             "request {tag} is beyond protocol 1 but sent as protocol {}",
             crate::PROTOCOL_VERSION
         );
+    }
+
+    #[test]
+    fn m4_messages_roundtrip() {
+        let session = SessionId::new();
+        for req in [Request::Archive { session }, Request::Unarchive { session }] {
+            let msg = ClientMsg { id: 4, req };
+            let back: ClientMsg = decode_payload(&encode_frame(&msg).unwrap()[4..]).unwrap();
+            assert_eq!(msg, back);
+        }
+        // Their answer carries the field M4 added to `SessionMeta`.
+        let msg = DaemonMsg {
+            reply_to: Some(4),
+            event: Event::SessionUpdated(SessionMeta {
+                id: session,
+                archived_at_ms: Some(1_700_000_000_123),
+                ..SessionMeta::default()
+            }),
+        };
+        let back: DaemonMsg = decode_payload(&encode_frame(&msg).unwrap()[4..]).unwrap();
+        assert_eq!(msg, back);
+    }
+
+    /// The M4 variants are appended after the M3 ones: every protocol 2
+    /// request keeps its postcard discriminant.
+    #[test]
+    fn m4_variants_do_not_renumber_existing_ones() {
+        let first_byte = |r: Request| postcard::to_stdvec(&r).unwrap()[0];
+        let session = SessionId::new();
+        assert_eq!(first_byte(Request::ResumeCommand { session }), 25);
+        assert_eq!(first_byte(Request::Archive { session }), 26);
+        assert_eq!(first_byte(Request::Unarchive { session }), 27);
+    }
+
+    /// Likewise a protocol 2 berthd (M3) decodes requests up to
+    /// `ResumeCommand`, and `SessionMeta` without `archived_at_ms`: the M4
+    /// messages must be sent as a newer protocol, never as protocol 2.
+    #[test]
+    fn m4_messages_are_not_sent_as_protocol_2() {
+        const PROTOCOL_2_LAST_REQUEST: u8 = 25;
+        let first_byte = |r: Request| postcard::to_stdvec(&r).unwrap()[0];
+        let session = SessionId::new();
+        assert_eq!(
+            first_byte(Request::ResumeCommand { session }),
+            PROTOCOL_2_LAST_REQUEST
+        );
+        for req in [Request::Archive { session }, Request::Unarchive { session }] {
+            let tag = first_byte(req);
+            assert!(
+                tag > PROTOCOL_2_LAST_REQUEST,
+                "request {tag} takes the place of a protocol 2 one"
+            );
+            assert!(
+                tag <= PROTOCOL_2_LAST_REQUEST || crate::PROTOCOL_VERSION > 2,
+                "request {tag} is beyond protocol 2 but sent as protocol {}",
+                crate::PROTOCOL_VERSION
+            );
+        }
     }
 }

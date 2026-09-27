@@ -193,7 +193,8 @@ pub struct SessionSnapshotFile {
 /// `SessionSnapshotFile` as postcard, which is positional, so the added
 /// field moved everything after it. These are the layouts of then (fields
 /// in the same order), for berth-store to read such files into the current
-/// types (`last_agent: None`), and for tests to write them.
+/// types (`last_agent: None`, `archived_at_ms: None`), and for tests to write
+/// them.
 pub mod v1 {
     use std::path::PathBuf;
 
@@ -281,6 +282,7 @@ pub mod v1 {
                 order: m.order,
                 cols: m.cols,
                 rows: m.rows,
+                archived_at_ms: None,
             }
         }
     }
@@ -353,6 +355,7 @@ mod tests {
                 order: 7,
                 cols: 100,
                 rows: 30,
+                archived_at_ms: None,
             },
             styles: StyleTable::default(),
             history: vec![line],
@@ -360,7 +363,16 @@ mod tests {
         };
         // Format 1 is this layout without `last_agent`, the last field of
         // `AgentInfo` (`None`: one zero byte), independent of `v1`'s types.
+        // Nor has it `archived_at_ms` (M4), the last field of `SessionMeta`
+        // (`None` too), dropped first: it comes after the agent.
         let mut raw = postcard::to_stdvec(&want).unwrap();
+        let session = postcard::to_stdvec(&want.session).unwrap();
+        assert_eq!(session.last(), Some(&0));
+        let at = raw
+            .windows(session.len())
+            .position(|w| w == session)
+            .unwrap();
+        raw.remove(at + session.len() - 1);
         let agent = postcard::to_stdvec(&want.session.agent).unwrap();
         assert_eq!(agent.last(), Some(&0));
         let at = raw.windows(agent.len()).position(|w| w == agent).unwrap();
