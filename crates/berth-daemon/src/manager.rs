@@ -1,5 +1,7 @@
 //! Registry of workspaces and sessions, persistence orchestration, restore
-//! on start, hook routing, fan-out of session-level events to clients.
+//! on start, hook routing, fan-out of session-level events to clients,
+//! archiving (DESIGN §17.1: `archive` / `unarchive`, the refusals for
+//! archived sessions, `scan_archive` applying `archive.rs`).
 //!
 //! Locking: `reg` and `conns` are never held while waiting on an actor or
 //! doing slow I/O; store writes happen after the registry lock is released.
@@ -46,6 +48,11 @@ const ACTOR_REPLY_TIMEOUT: Duration = if cfg!(test) {
 };
 /// Most rows one `ListEvents` returns.
 const MAX_EVENT_LIST: u32 = 200;
+/// Answer to Attach / Input / Resize / Revive / Subscribe for an archived
+/// session (DESIGN §17.1).
+pub const ARCHIVED_REFUSAL: &str = "已归档，先恢复";
+/// Poll interval while `archive` waits for a killed session to exit.
+const EXIT_POLL: Duration = Duration::from_millis(10);
 const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "elvish", "xonsh",
 ];
@@ -433,6 +440,16 @@ impl Manager {
         Ok(entry.actor.as_ref().map(|a| a.tx.clone()))
     }
 
+    /// `ARCHIVED_REFUSAL` for an archived session (DESIGN §17.1).
+    fn refuse_archived(&self, sid: SessionId) -> Result<()> {
+        let reg = self.reg.lock();
+        let entry = reg.sessions.get(&sid).ok_or_else(|| unknown(sid))?;
+        if entry.meta.is_archived() {
+            return Err(ARCHIVED_REFUSAL.into());
+        }
+        Ok(())
+    }
+
     fn pty_spawn(&self, meta: &SessionMeta, command: Vec<String>, cwd: PathBuf) -> PtySpawn {
         let mut env = meta.env.clone();
         env.push(("BERTH_SESSION_ID".into(), meta.id.to_string()));
@@ -535,15 +552,22 @@ impl Manager {
         Ok(ws)
     }
 
-    /// Refuses while sessions still belong to the workspace (deleting them
-    /// would purge history; the client must do that explicitly).
+    /// Refuses while sessions that are not archived still belong to the
+    /// workspace (deleting them would purge history; the client must do
+    /// that explicitly). Archived ones do not count — archiving the sessions
+    /// is enough (DESIGN §17.2) — and keep the id of the deleted workspace:
+    /// restored, they are orphans until moved.
     pub fn delete_workspace(&self, id: WorkspaceId) -> Result<()> {
         {
             let mut reg = self.reg.lock();
             if !reg.workspaces.contains_key(&id) {
                 return Err("unknown workspace".into());
             }
-            if reg.sessions.values().any(|e| e.meta.workspace == id) {
+            if reg
+                .sessions
+                .values()
+                .any(|e| e.meta.workspace == id && !e.meta.is_archived())
+            {
                 return Err("workspace still has sessions".into());
             }
             reg.workspaces.remove(&id);
@@ -652,6 +676,7 @@ impl Manager {
         dims: Dims,
         reply_to: u32,
     ) -> Result<()> {
+        self.refuse_archived(sid)?;
         let tx = self.actor_tx(sid)?;
         if let Some(e) = self.reg.lock().sessions.get_mut(&sid) {
             e.attached.insert(conn);
@@ -677,6 +702,7 @@ impl Manager {
     }
 
     pub fn resize(&self, conn: ConnId, sid: SessionId, dims: Dims) -> Result<()> {
+        self.refuse_archived(sid)?;
         if let Some(tx) = self.existing_tx(sid)? {
             tx.send(SessionCmd::Resize { conn, dims })
                 .map_err(|_| stopped())?;
@@ -692,6 +718,9 @@ impl Manager {
         let (tx, budget) = {
             let reg = self.reg.lock();
             let e = reg.sessions.get(&sid).ok_or_else(|| unknown(sid))?;
+            if e.meta.is_archived() {
+                return Err(ARCHIVED_REFUSAL.into());
+            }
             if !e.meta.is_live() {
                 return Err("session is not live".into());
             }
@@ -739,6 +768,7 @@ impl Manager {
         mode: SubscribeMode,
         reply_to: u32,
     ) -> Result<()> {
+        self.refuse_archived(sid)?;
         let tx = self.actor_tx(sid)?;
         tx.send(SessionCmd::Subscribe {
             conn,
@@ -782,6 +812,9 @@ impl Manager {
     /// Dormant; `Revive { Shell }` then continues in a shell.
     pub async fn revive(self: &Arc<Self>, sid: SessionId, mode: ReviveMode) -> Result<SessionMeta> {
         let meta = self.meta(sid).ok_or_else(|| unknown(sid))?;
+        if meta.is_archived() {
+            return Err(ARCHIVED_REFUSAL.into());
+        }
         if meta.is_live() {
             return Err("session is live".into());
         }
@@ -797,6 +830,11 @@ impl Manager {
         let revived = {
             let mut reg = self.reg.lock();
             let e = reg.sessions.get_mut(&sid).ok_or_else(|| unknown(sid))?;
+            // Checked with the status under one lock, like `archive` does:
+            // an archived session is never live.
+            if e.meta.is_archived() {
+                return Err(ARCHIVED_REFUSAL.into());
+            }
             if e.meta.is_live() {
                 return Err("session is live".into());
             }
@@ -859,6 +897,106 @@ impl Manager {
             agent: meta.agent.clone(),
         });
         Ok(meta)
+    }
+
+    /// Archive the session (DESIGN §17.1): a live one is killed first
+    /// through the kill path of `Request::Kill` and its exit awaited (at
+    /// most `ACTOR_REPLY_TIMEOUT`, like every wait on an actor), then the
+    /// mark is set, persisted and broadcast. History, snapshot, events and
+    /// agent info stay. Already archived: nothing changes.
+    pub async fn archive(&self, sid: SessionId) -> Result<SessionMeta> {
+        self.archive_as(sid, "user", &now_ms).await
+    }
+
+    /// `archive` noted as `by` (`user` / `auto`) in the session's events,
+    /// with the mark set to `clock()` read once the session is no longer
+    /// live (after its exit).
+    async fn archive_as(
+        &self,
+        sid: SessionId,
+        by: &str,
+        clock: &(impl Fn() -> i64 + Sync),
+    ) -> Result<SessionMeta> {
+        let meta = self.meta(sid).ok_or_else(|| unknown(sid))?;
+        if meta.is_archived() {
+            return Ok(meta);
+        }
+        if meta.is_live() {
+            if let Err(e) = self.kill(sid) {
+                // Unless it exited on its own in the meantime.
+                if self.meta(sid).is_some_and(|m| m.is_live()) {
+                    return Err(e);
+                }
+            }
+            self.wait_until_not_live(sid, ACTOR_REPLY_TIMEOUT).await?;
+        }
+        let at_ms = clock();
+        let meta = {
+            let mut reg = self.reg.lock();
+            let e = reg.sessions.get_mut(&sid).ok_or_else(|| unknown(sid))?;
+            if e.meta.is_archived() {
+                return Ok(e.meta.clone());
+            }
+            // Checked with the mark under one lock, like `revive` does: an
+            // archived session is never live.
+            if e.meta.is_live() {
+                return Err(format!(
+                    "session {sid} was revived while being archived; not archived"
+                ));
+            }
+            e.meta.archived_at_ms = Some(at_ms);
+            e.meta.clone()
+        };
+        self.record(
+            sid,
+            at_ms,
+            "archive".into(),
+            &meta.agent.state,
+            Some(by.into()),
+        );
+        Ok(self.commit(meta))
+    }
+
+    /// Poll (`EXIT_POLL`) until a killed session has left `Live`: its actor
+    /// reports the exit (`session_exited`) once the PTY is gone.
+    async fn wait_until_not_live(&self, sid: SessionId, max: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + max;
+        loop {
+            let live = self.reg.lock().sessions.get(&sid).map(|e| e.meta.is_live());
+            match live {
+                None => return Err(unknown(sid)),
+                Some(false) => return Ok(()),
+                Some(true) if tokio::time::Instant::now() >= deadline => {
+                    tracing::warn!(session = %sid, "session did not exit in time after kill; not archived");
+                    return Err(format!(
+                        "session {sid} did not exit within {} s; not archived",
+                        max.as_secs()
+                    ));
+                }
+                Some(true) => tokio::time::sleep(EXIT_POLL).await,
+            }
+        }
+    }
+
+    /// Clear the archive mark: the session is back in its workspace, still
+    /// dormant / restored (Revive as before). Restoring counts as activity
+    /// (`last_active_ms`): otherwise the next scan would archive a session
+    /// that was archived for being idle right away again. Not archived:
+    /// nothing changes.
+    pub fn unarchive(&self, sid: SessionId) -> Result<SessionMeta> {
+        let now = now_ms();
+        let meta = {
+            let mut reg = self.reg.lock();
+            let e = reg.sessions.get_mut(&sid).ok_or_else(|| unknown(sid))?;
+            if !e.meta.is_archived() {
+                return Ok(e.meta.clone());
+            }
+            e.meta.archived_at_ms = None;
+            e.meta.last_active_ms = e.meta.last_active_ms.max(now);
+            e.meta.clone()
+        };
+        self.record(sid, now, "unarchive".into(), &meta.agent.state, None);
+        Ok(self.commit(meta))
     }
 
     /// Stop the actor (no snapshot), purge metadata/events/snapshot/journal.
@@ -1051,6 +1189,8 @@ impl Manager {
         })
     }
 
+    /// Archived sessions are not counted (DESIGN §17.1); never live, they
+    /// are not in `sessions_live` either.
     pub fn status(&self) -> DaemonStatus {
         let reg = self.reg.lock();
         DaemonStatus {
@@ -1058,7 +1198,11 @@ impl Manager {
             pid: std::process::id(),
             uptime_ms: now_ms() - self.started_ms,
             sessions_live: reg.sessions.values().filter(|e| e.meta.is_live()).count() as u32,
-            sessions_total: reg.sessions.len() as u32,
+            sessions_total: reg
+                .sessions
+                .values()
+                .filter(|e| !e.meta.is_archived())
+                .count() as u32,
         }
     }
 
@@ -1603,6 +1747,176 @@ mod tests {
             .await;
         mgr.delete_session(sid).await.unwrap();
         assert!(mgr.meta(sid).is_none());
+        mgr.shutdown().await;
+    }
+
+    fn test_manager(dir: &Path, config: Config) -> Arc<Manager> {
+        let paths = Paths::in_dir(dir);
+        paths.ensure_dirs().unwrap();
+        let store = Store::open(&paths).unwrap();
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        Manager::start(paths, config, store, stop_tx).unwrap()
+    }
+
+    const DIMS: Dims = Dims { cols: 80, rows: 24 };
+
+    async fn shell(mgr: &Arc<Manager>, ws: WorkspaceId) -> SessionId {
+        mgr.create_session(ws, None, Some(vec!["/bin/sh".into()]), None, DIMS)
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// Every message queued on `outbox` so far (waits briefly for the first).
+    async fn drain(outbox: &Arc<Outbox>) -> Vec<DaemonMsg> {
+        let mut out = Vec::new();
+        while let Ok(Some(batch)) =
+            tokio::time::timeout(Duration::from_millis(200), outbox.next_batch()).await
+        {
+            out.extend(batch);
+        }
+        out
+    }
+
+    /// M4 (DESIGN §17.1): archiving a live session kills it through the
+    /// kill path and waits for the exit before marking it; the mark is
+    /// persisted and broadcast; archiving again changes nothing. Archived,
+    /// the session refuses Attach / Input / Resize / Subscribe (both modes)
+    /// / Revive (both modes) but serves history, events and metadata
+    /// requests, and `DaemonStatus` leaves it out. Unarchive clears the mark,
+    /// counts as activity, and Revive works again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archive_kills_marks_refuses_and_unarchive_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let sid = shell(&mgr, ws.id).await;
+        let events = Outbox::new();
+        let conn = mgr.register_conn(ClientRole::Gui, events.clone());
+
+        let t0 = now_ms();
+        let archived = mgr.archive(sid).await.unwrap();
+        let at = archived.archived_at_ms.expect("marked");
+        assert!(at >= t0);
+        assert!(
+            matches!(archived.status, SessionStatus::Dormant { .. }),
+            "killed and exited before being marked: {:?}",
+            archived.status
+        );
+        assert!(matches!(archived.agent.state, AgentState::Exited { .. }));
+        let stored = mgr.store.get_session(sid).unwrap().unwrap();
+        assert_eq!(stored.archived_at_ms, Some(at), "persisted");
+        let broadcast = drain(&events).await;
+        assert!(
+            broadcast.iter().any(|m| m.reply_to.is_none()
+                && matches!(&m.event, Event::SessionUpdated(u) if u.id == sid && u.archived_at_ms == Some(at))),
+            "SessionUpdated broadcast"
+        );
+        assert_eq!(mgr.archive(sid).await.unwrap(), archived, "idempotent");
+
+        let refused = |r: Result<()>, what: &str| {
+            assert_eq!(r.unwrap_err(), ARCHIVED_REFUSAL, "{what}");
+        };
+        refused(mgr.attach(conn, Outbox::new(), sid, DIMS, 1), "attach");
+        refused(mgr.input(sid, b"echo\n".to_vec()), "input");
+        refused(mgr.resize(conn, sid, DIMS), "resize");
+        refused(
+            mgr.subscribe(conn, Outbox::new(), sid, SubscribeMode::Full, 2),
+            "subscribe full",
+        );
+        let preview = SubscribeMode::Preview { rows: 3, max_hz: 4 };
+        refused(
+            mgr.subscribe(conn, Outbox::new(), sid, preview, 3),
+            "subscribe preview",
+        );
+        for mode in [ReviveMode::Shell, ReviveMode::ResumeAgent] {
+            let err = mgr.revive(sid, mode).await.unwrap_err();
+            assert_eq!(err, ARCHIVED_REFUSAL, "{mode:?}");
+        }
+        assert!(!mgr.meta(sid).unwrap().is_live(), "nothing revived");
+        assert!(!mgr.reg.lock().sessions[&sid].attached.contains(&conn));
+
+        assert!(matches!(
+            mgr.fetch_lines(sid, 0, 10).await.unwrap(),
+            Event::Lines { .. }
+        ));
+        let log = mgr.list_events(sid, 10).unwrap();
+        assert_eq!(
+            (log[0].kind.as_str(), log[0].detail.as_deref()),
+            ("archive", Some("user"))
+        );
+        assert!(log.iter().any(|e| e.kind == "pty:exit"), "{log:?}");
+        let renamed = mgr.rename_session(sid, Some("old".into())).unwrap();
+        assert_eq!(renamed.archived_at_ms, Some(at));
+        assert!(mgr.mark_read(sid).unwrap().is_archived());
+        let other = mgr
+            .create_workspace("other".into(), dir.path().to_path_buf())
+            .unwrap();
+        assert_eq!(
+            mgr.move_session(sid, other.id, 3).unwrap().workspace,
+            other.id
+        );
+        let status = mgr.status();
+        assert_eq!((status.sessions_live, status.sessions_total), (0, 0));
+
+        // Idle for long, as the scan would have found it.
+        mgr.reg
+            .lock()
+            .sessions
+            .get_mut(&sid)
+            .unwrap()
+            .meta
+            .last_active_ms = 1;
+        let t1 = now_ms();
+        let restored = mgr.unarchive(sid).unwrap();
+        assert_eq!(restored.archived_at_ms, None);
+        assert!(
+            restored.last_active_ms >= t1,
+            "restoring counts as activity"
+        );
+        assert!(matches!(restored.status, SessionStatus::Dormant { .. }));
+        assert_eq!(restored.workspace, other.id);
+        assert_eq!(
+            mgr.store.get_session(sid).unwrap().unwrap().archived_at_ms,
+            None
+        );
+        assert_eq!(mgr.unarchive(sid).unwrap(), restored, "idempotent");
+        assert_eq!(mgr.list_events(sid, 1).unwrap()[0].kind, "unarchive");
+        assert_eq!(mgr.status().sessions_total, 1);
+        assert!(mgr.revive(sid, ReviveMode::Shell).await.unwrap().is_live());
+        mgr.attach(conn, Outbox::new(), sid, DIMS, 4).unwrap();
+        mgr.input(sid, b"true\n".to_vec()).unwrap();
+        mgr.shutdown().await;
+    }
+
+    /// DESIGN §17.2: a workspace whose sessions are all archived can be
+    /// deleted; the archived session keeps its workspace id and, restored,
+    /// is an orphan (revived in its own cwd). Any other session still
+    /// blocks the delete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_archived_sessions_do_not_keep_a_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = test_manager(dir.path(), Config::default());
+        let ws = mgr
+            .create_workspace("w".into(), dir.path().to_path_buf())
+            .unwrap();
+        let archived = shell(&mgr, ws.id).await;
+        let kept = shell(&mgr, ws.id).await;
+        mgr.archive(archived).await.unwrap();
+        assert_eq!(
+            mgr.delete_workspace(ws.id).unwrap_err(),
+            "workspace still has sessions"
+        );
+        mgr.archive(kept).await.unwrap();
+        mgr.delete_workspace(ws.id).unwrap();
+        assert!(mgr.list_workspaces().is_empty());
+        let meta = mgr.unarchive(archived).unwrap();
+        assert_eq!(meta.workspace, ws.id, "keeps the deleted workspace's id");
+        let revived = mgr.revive(archived, ReviveMode::Shell).await.unwrap();
+        assert!(revived.is_live());
+        assert_eq!(revived.cwd, dir.path());
         mgr.shutdown().await;
     }
 
