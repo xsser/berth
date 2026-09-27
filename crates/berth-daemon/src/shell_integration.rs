@@ -8,7 +8,10 @@
 //!
 //! Only zsh is covered: bash (`--rcfile`) and fish (`XDG_DATA_DIRS`) are not
 //! implemented. A shell started later inside the session (`exec zsh`, a
-//! nested `zsh`) sees the user's own `ZDOTDIR` and runs without it.
+//! nested `zsh`) sees the user's own `ZDOTDIR` and runs without it (no OSC
+//! 133 from its commands: their state is inferred). `.zshenv` exports
+//! `BERTH_SHELL_INTEGRATION`, the path of `berth-integration.zsh`, for the
+//! user to load it there from their `.zshrc` (`berth doctor` shows how).
 
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};

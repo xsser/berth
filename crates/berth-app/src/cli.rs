@@ -662,6 +662,9 @@ fn shell_integration_check(input: &DoctorInput, sessions: Option<&[SessionMeta]>
                 dir.display()
             );
         }
+        detail.push_str(
+            "；session 里再启动的 zsh（zsh、exec zsh）不带集成，状态靠推断；要它也报告命令，在自己的 .zshrc 加一行：[[ -n $BERTH_SHELL_INTEGRATION ]] && source \"$BERTH_SHELL_INTEGRATION\"",
+        );
     }
     match sessions {
         Some(ss) => {
@@ -1573,6 +1576,13 @@ mod tests {
         let check = shell_integration_check(&input, None);
         assert_eq!(check.level, Level::Ok, "{}", check.detail);
         assert!(check.detail.contains("已写入"), "{}", check.detail);
+        assert!(
+            check.detail.contains(
+                "[[ -n $BERTH_SHELL_INTEGRATION ]] && source \"$BERTH_SHELL_INTEGRATION\""
+            ),
+            "{}",
+            check.detail
+        );
         assert!(check.detail.contains("berthd 未连上"));
         let bash = LoginEnv {
             shell: PathBuf::from("/bin/bash"),

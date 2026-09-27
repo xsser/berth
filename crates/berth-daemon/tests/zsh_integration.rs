@@ -418,3 +418,84 @@ fn zsh_integration_honours_the_users_zdotdir() {
     assert!(read(&s, "functions").contains("__berth_precmd"));
     daemon.stop(&mut c);
 }
+
+/// Review medium: a zsh started inside the session (here `zsh -i`) sees the
+/// user's ZDOTDIR and starts without berth. `BERTH_SHELL_INTEGRATION` names
+/// the integration script: with the documented line in the user's
+/// `.zshrc` the nested shell loads it and its commands report OSC 133
+/// again, while the session's own shell, which has it already, still runs
+/// its hooks once.
+#[test]
+fn a_nested_zsh_loads_the_integration_from_the_users_zshrc() {
+    if !Path::new(ZSH).exists() {
+        eprintln!("skipped: {ZSH} not found");
+        return;
+    }
+    let data = tempfile::tempdir().unwrap();
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = home_dir.path();
+    fixture_home(home);
+    let mut rc = std::fs::OpenOptions::new()
+        .append(true)
+        .open(home.join(".zshrc"))
+        .unwrap();
+    rc.write_all(
+        b"[[ -n $BERTH_SHELL_INTEGRATION ]] && source \"$BERTH_SHELL_INTEGRATION\"\n\
+          [[ -n $NESTED_MARK ]] && : > $NESTED_MARK\n",
+    )
+    .unwrap();
+    let daemon = Berthd::start(data.path(), home, "");
+    let mut c = Client::connect(&daemon.socket);
+    let sid = new_session(&mut c, &home.join("proj"), None);
+    let out = home.join("out-nested");
+    std::fs::create_dir_all(&out).unwrap();
+    let o = out.display();
+    c.type_line(
+        sid,
+        &format!(
+            "print -r -- \"$BERTH_SHELL_INTEGRATION\" > {o}/var; \
+             print -l $precmd_functions > {o}/outer; touch {o}/outer-done"
+        ),
+    );
+    wait_file(&out.join("outer-done"));
+    let script = data
+        .path()
+        .join("shell-integration/zsh/berth-integration.zsh");
+    let script = std::fs::canonicalize(script).unwrap();
+    assert_eq!(read(&out, "var"), format!("{}\n", script.display()));
+    assert_eq!(read(&out, "outer"), "fx_precmd\n__berth_precmd\n");
+
+    c.type_line(sid, &format!("NESTED_MARK={o}/nested-up {ZSH} -i"));
+    wait_file(&out.join("nested-up"));
+    c.type_line(
+        sid,
+        &format!("print -l $precmd_functions > {o}/inner; touch {o}/inner-done"),
+    );
+    wait_file(&out.join("inner-done"));
+    assert_eq!(read(&out, "inner"), "fx_precmd\n__berth_precmd\n");
+
+    // A command of the nested shell reports OSC 133 again: `false` is the
+    // only command here ending with status 1 (the session's own shell is
+    // still running `zsh -i`).
+    c.type_line(sid, "sleep 1; false");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let events = match c.request(Request::ListEvents {
+            session: sid,
+            limit: 20,
+        }) {
+            Event::Events { events, .. } => events,
+            other => panic!("{other:?}"),
+        };
+        if events
+            .iter()
+            .any(|e| e.kind == "osc:133D" && e.detail.as_deref() == Some("1"))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no 133;D;1: {events:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    c.type_line(sid, "exit");
+    daemon.stop(&mut c);
+}

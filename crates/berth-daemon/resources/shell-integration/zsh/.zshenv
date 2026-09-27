@@ -8,6 +8,12 @@
 #
 # BERTH_ORIG_ZDOTDIR is the user's ZDOTDIR; empty means it was not set.
 # Command words are quoted so that no alias can replace them.
+#
+# A zsh started later inside the session (`zsh`, `exec zsh`) sees the
+# user's ZDOTDIR, so it starts without berth. BERTH_SHELL_INTEGRATION names
+# berth-integration.zsh for it: a line in the user's .zshrc loads it there
+#   [[ -n $BERTH_SHELL_INTEGRATION ]] && source "$BERTH_SHELL_INTEGRATION"
+# (in this shell, which already has it, sourcing it again does nothing).
 
 if [[ -n "${BERTH_ORIG_ZDOTDIR-}" ]]; then
   'builtin' 'export' ZDOTDIR="$BERTH_ORIG_ZDOTDIR"
@@ -15,6 +21,7 @@ else
   'builtin' 'unset' ZDOTDIR
 fi
 'builtin' 'unset' BERTH_ORIG_ZDOTDIR
+'builtin' 'export' BERTH_SHELL_INTEGRATION="${${(%):-%x}:A:h}/berth-integration.zsh"
 
 {
   # At top level, as zsh would read it: the user's typesets stay global.
