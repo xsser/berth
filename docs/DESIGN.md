@@ -198,7 +198,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 
 ## 10. 与 Claude Code / Codex 集成
 
-- **关联**：daemon 向 PTY 注入 `BERTH_SESSION_ID`；`berth-hook` 从自身 env 读取（claude / codex 继承 shell 环境），随事件上报；缺失时按 `cwd` + 进程树回退匹配。
+- **关联**：daemon 向 PTY 注入 `BERTH_SESSION_ID`；`berth-hook` 从自身 env 读取（claude / codex 继承 shell 环境），随事件上报；带 id 但 daemon 不认识时按 `cwd` + 进程树回退匹配。hook 进程环境里没有 `BERTH_SESSION_ID`（未设置、为空或不是合法 id）就不转发：hooks 装在全局配置里，berth 之外的 agent 也会触发，按 cwd 回退会把它们的事件错记到同目录的 berth 会话上；`codex --chain` 与 `statusline` 包住的原命令照常执行。
 - **Claude hooks 安装**（显式）：`berth setup-hooks claude` 读取 `~/.claude/settings.json`，对每个事件在数组**末尾追加** `{ "type": "command", "command": "berth-hook claude" }`，先打印 JSON diff，确认后写入并备份原文件；`--undo` 按备份恢复。已有的 Notification / PreToolUse / SessionStart 条目原样保留。
 - **statusline tee**（可选）：把现有 `bash ~/.claude/scripts/statusline.sh` 包成 `berth-hook statusline -- bash ~/.claude/scripts/statusline.sh`：stdin JSON 复制一份发 daemon（`session_id`、`model`、`context_window.used_percentage`、`cost.total_cost_usd`、`workspace.project_dir`），原样透传给原脚本，输出不变。
 - **Codex**：`notify` 是单命令，当前已指向 Computer Use 客户端；`berth setup-hooks codex` 改为 `berth-hook codex --chain "<原命令>"`，我们收到事件后再 exec 原命令并透传 stdin / argv。若 2026 版 Codex 已有多 hook 机制，则用原生机制追加（待调研结论）。
