@@ -525,4 +525,23 @@ mod tests {
         let status_tag = postcard::to_stdvec(&status).unwrap()[0];
         assert_eq!(postcard::to_stdvec(&events).unwrap()[0], status_tag + 1);
     }
+
+    /// A protocol 1 berthd (M1 / M2) decodes requests up to `Shutdown`, and
+    /// `AgentInfo` without `last_agent`. Sent as protocol 1, the M3 messages
+    /// would pass its `Hello` check and fail on first use; sent as a newer
+    /// one, they are refused up front (`Incompatible`: the GUI's restart
+    /// banner, `berth doctor`). Catches a merge that takes the bump back.
+    #[test]
+    fn m3_messages_are_not_sent_as_protocol_1() {
+        const PROTOCOL_1_LAST_REQUEST: u8 = 23;
+        let resume = Request::ResumeCommand {
+            session: SessionId::new(),
+        };
+        let tag = postcard::to_stdvec(&resume).unwrap()[0];
+        assert!(
+            tag <= PROTOCOL_1_LAST_REQUEST || crate::PROTOCOL_VERSION > 1,
+            "request {tag} is beyond protocol 1 but sent as protocol {}",
+            crate::PROTOCOL_VERSION
+        );
+    }
 }
