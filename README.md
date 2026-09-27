@@ -1,22 +1,225 @@
+<div align="center">
+
+<img src="assets/logo.svg" alt="berth" width="120" height="120">
+
 # berth
 
-面向 AI coding agent 的 GPU 原生终端（Rust，macOS 优先）。
+**A GPU terminal that never loses your agent's work.**
 
-- 关闭窗口不杀 session：`berthd` 常驻 daemon 持有 PTY 与终端状态，GUI 只是客户端。
-- 内容持久化：定期快照 + 重启后作为只读历史前缀恢复，一键 revive / `claude --resume`。
-- Agent 感知：识别 pane 里的 claude / codex / shell，状态机 + 未聚焦通知。
-- 左侧栏：workspace → sessions 树、末尾几行实时预览、状态徽标。
+[![CI](https://github.com/xsser/berth/actions/workflows/ci.yml/badge.svg)](https://github.com/xsser/berth/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue)](https://github.com/xsser/berth/releases)
+[![Platforms](https://img.shields.io/badge/platform-macOS-lightgrey?logo=apple)](#status--路线)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license--许可证)
 
-设计文档：[docs/DESIGN.md](docs/DESIGN.md)。进度：[docs/progress.md](docs/progress.md)。
+[English](#english) · [中文](#中文)
 
-## 构建
+</div>
+
+---
+
+## English
+
+Close the window, reopen it tomorrow, and every session is exactly where you left it — same
+scrollback, same screen, same agent. berth is a terminal built around one idea: **the terminal
+window is a view, not the owner of your work.**
+
+It is made for people who run [Claude Code](https://www.anthropic.com/claude-code), Codex CLI and
+other coding agents all day, in many sessions at once, and keep losing track of which one is
+waiting for them.
+
+### Why
+
+A normal terminal ties a session's life to a window. Quit the app and the PTY dies with it: the
+scrollback is gone, the agent is gone, and an agent that was waiting for your approval simply
+disappears. Multiplexers fix the lifetime but give you nothing about *what the agent is doing*.
+
+berth splits the two. A background daemon (`berthd`) owns every PTY, terminal state and snapshot.
+The GUI is a client that attaches to it. Nothing you close kills anything you care about.
+
+### Features
+
+- **Sessions outlive the window.** `berthd` keeps the PTY and the terminal state; closing the
+  window detaches, it does not kill. Snapshots go to disk periodically, so even a daemon restart
+  returns the scrollback and the last screen as a read-only prefix you can revive from.
+- **Agent-aware sidebar.** Every session shows what its agent is doing: idle, thinking, running a
+  tool, **waiting for permission**, waiting for input, done, failed. States come from official
+  Claude Code hooks and Codex notifications, with shell integration (OSC 133/7) and process
+  heuristics as fallbacks — never guessing over a fact.
+- **Notifications that respect your attention.** A session that needs you raises a macOS
+  notification and a Dock badge — unless it is already on screen in front of you.
+- **Splits.** `⌘D` right, `⌘⇧D` down, `⌥⌘←→↑↓` to move, draggable dividers. The layout is saved and
+  restored with the window. Four 120×40 panes render in ~2 ms p99 on an M-series Mac.
+- **Archive instead of delete.** `⌘W` archives a session: the process ends, everything else stays.
+  Find it under **归档 / Archive** in the sidebar, restore it, or delete it for good. Sessions idle
+  for more than a week archive themselves (configurable, off with `0`).
+- **GPU rendering.** wgpu + a custom cell grid, egui for the sidebar. Ligature-free monospace
+  shaping via cosmic-text, a shared glyph atlas across panes.
+- **Nothing installed behind your back.** `berth setup-hooks claude` prints a JSON diff and writes
+  only with `--yes`, after a backup; `--undo` restores it byte for byte. `berth doctor` is
+  read-only.
+
+### Install
+
+Requires Rust 1.85+ and macOS.
 
 ```sh
-export PATH="$HOME/.cargo/bin:$PATH"
-cargo build --workspace
-cargo test --workspace
+git clone git@github.com:xsser/berth.git
+cd berth
+cargo build --release --workspace
+cp target/release/{berth,berthd,berth-hook} ~/.local/bin/   # anywhere on your PATH
+berth                                                       # starts berthd if needed
 ```
 
-## 许可证
+To let berth see Claude Code's state, install the hooks — read the diff first, then confirm:
 
-MIT OR Apache-2.0
+```sh
+berth setup-hooks claude          # prints the diff, writes nothing
+berth setup-hooks claude --yes    # backs up ~/.claude/settings.json, then writes
+berth setup-hooks claude --undo   # restores the backup byte for byte
+berth setup-hooks codex --yes     # chains Codex's notify through berth-hook
+```
+
+### Keys
+
+| Key | Action |
+|---|---|
+| `⌘N` / `⌘T` | New session in the current workspace |
+| `⌘⇧N` | New workspace (folder picker) |
+| `⌘1`–`⌘9` | Jump to a session |
+| `⌘D` / `⌘⇧D` | Split right / down |
+| `⌥⌘` + arrows | Move focus between panes |
+| `⌘W` | Close the pane and archive its session |
+| `⌘K` | Command panel |
+
+Right-click a session row, a workspace header or the terminal for the rest: split, rename, archive,
+restore, delete for good, copy, paste.
+
+### How it works
+
+```
+┌────────────┐   unix socket, postcard frames   ┌─────────────────────────────┐
+│ berth (GUI)│ ───────────────────────────────▶ │ berthd                      │
+│ winit+wgpu │ ◀─────────────────────────────── │  PTYs · VT state · snapshots│
+└────────────┘   screens, agent state, events   │  SQLite registry            │
+                                                └─────────────────────────────┘
+      ▲                                                       ▲
+      │ desktop notifications, Dock badge                     │ hook events
+      │                                              ┌────────────────────┐
+      └──────────────────────────────────────────────│ berth-hook         │
+                                                     │ claude · codex     │
+                                                     └────────────────────┘
+```
+
+- `berth-core` — frozen wire types, protocol, snapshot formats.
+- `berth-vt` — PTY + VT parsing (portable-pty, alacritty_terminal) and an OSC prescanner.
+- `berth-store` — SQLite (WAL) registry and zstd snapshots.
+- `berth-daemon` — session actors, agent state machine, hook routing, auto-archive.
+- `berth-hook` — the tiny binary your agent's hooks call; it forwards nothing outside a berth session.
+- `berth-app` — the GUI, the CLI (`list`, `doctor`, `setup-hooks`) and the renderer.
+
+Design notes live in [docs/DESIGN.md](docs/DESIGN.md), progress and known gaps in
+[docs/progress.md](docs/progress.md).
+
+### Status · 路线
+
+Working today on macOS: the four goals above, `berth list` / `doctor` / `setup-hooks`, zsh shell
+integration, splits and archive. Not there yet: Linux, a packaged `.app`, bash/fish integration,
+search in scrollback. The protocol is versioned, so a stale daemon is detected and can be restarted
+from the GUI.
+
+---
+
+## 中文
+
+关掉窗口，明天再打开，每个 session 还停在你离开时的样子：同样的滚动历史、同样的屏幕、同样的 agent。
+berth 只围绕一件事设计：**终端窗口是一个视图，不是你工作的所有者。**
+
+它是给那些整天开着一堆 [Claude Code](https://www.anthropic.com/claude-code)、Codex CLI 的人用的
+——会话一多就分不清哪个在跑、哪个卡住了在等你点确认。
+
+### 为什么
+
+普通终端把 session 的生命绑在窗口上。退出应用，PTY 跟着死：滚动历史没了，agent 没了，正在等你
+授权的那个也就这么消失了。多路复用器解决了生命周期，却完全不知道 *agent 在干什么*。
+
+berth 把这两件事拆开：常驻守护进程 `berthd` 持有所有 PTY、终端状态和快照，GUI 只是连上去的客户端。
+你关掉的东西，不会带走你在乎的东西。
+
+### 特性
+
+- **session 活得比窗口久。** `berthd` 持有 PTY 与终端状态，关窗口只是断开，不是杀掉。快照定期落盘，
+  即使 daemon 重启，滚动历史和最后一屏也会作为只读前缀回来，随时可以 revive。
+- **能看懂 agent 的侧栏。** 每个 session 都显示它的 agent 在做什么：空闲、思考中、跑工具、**等待授权**、
+  等待输入、完成、出错。状态来自 Claude Code 官方 hooks 与 Codex 通知，shell 集成（OSC 133/7）和前台
+  进程识别只作兜底——推断永远不会覆盖事实。
+- **不打扰的通知。** 需要你处理的 session 会发 macOS 通知并更新 Dock 角标，除非它正显示在你眼前。
+- **分屏。** `⌘D` 向右、`⌘⇧D` 向下、`⌥⌘` 方向键切焦点，分隔条可拖。布局随窗口保存与恢复。四个 120×40
+  的 pane 在 M 系列 Mac 上帧耗时 p99 约 2 ms。
+- **用归档代替删除。** `⌘W` 归档一个 session：进程结束，其余全部保留。在侧栏「归档」区里找回、恢复，
+  或者彻底删除。超过一周没动的会自动归档（可配置，设 `0` 关闭）。
+- **GPU 渲染。** wgpu 自研单元格网格 + egui 侧栏，cosmic-text 做等宽排版，多个 pane 共享同一份字形图集。
+- **不背着你改任何配置。** `berth setup-hooks claude` 先打印 JSON diff，只有 `--yes` 才写入，并先备份；
+  `--undo` 按字节还原。`berth doctor` 全程只读。
+
+### 安装
+
+需要 Rust 1.85+ 与 macOS。
+
+```sh
+git clone git@github.com:xsser/berth.git
+cd berth
+cargo build --release --workspace
+cp target/release/{berth,berthd,berth-hook} ~/.local/bin/   # 放到 PATH 上任意位置
+berth                                                       # 需要时会自己拉起 berthd
+```
+
+要让 berth 看到 Claude Code 的状态，安装 hooks——先看 diff，再确认：
+
+```sh
+berth setup-hooks claude          # 只打印 diff，不写入
+berth setup-hooks claude --yes    # 先备份 ~/.claude/settings.json，再写入
+berth setup-hooks claude --undo   # 按备份逐字节还原
+berth setup-hooks codex --yes     # 把 Codex 的 notify 串到 berth-hook 上
+```
+
+### 快捷键
+
+| 按键 | 作用 |
+|---|---|
+| `⌘N` / `⌘T` | 在当前 workspace 新建 session |
+| `⌘⇧N` | 新建 workspace（目录选择器） |
+| `⌘1`–`⌘9` | 跳到第 N 个 session |
+| `⌘D` / `⌘⇧D` | 向右 / 向下分屏 |
+| `⌥⌘` + 方向键 | 在 pane 之间移动焦点 |
+| `⌘W` | 关闭 pane 并归档它的 session |
+| `⌘K` | 命令面板 |
+
+其余操作在右键菜单里：侧栏 session 行、workspace 标题、终端区域各有一份，包含分屏、重命名、归档、
+恢复、彻底删除、复制粘贴。
+
+### 架构
+
+- `berth-core` — 冻结的线格式类型、协议、快照格式。
+- `berth-vt` — PTY 与 VT 解析（portable-pty、alacritty_terminal），以及 OSC 预扫描器。
+- `berth-store` — SQLite（WAL）注册表与 zstd 快照。
+- `berth-daemon` — session actor、agent 状态机、hook 路由、自动归档。
+- `berth-hook` — agent 的 hooks 实际调用的小程序；不在 berth session 里就什么都不转发。
+- `berth-app` — GUI、CLI（`list`、`doctor`、`setup-hooks`）与渲染器。
+
+设计文档见 [docs/DESIGN.md](docs/DESIGN.md)，进度与已知缺口见 [docs/progress.md](docs/progress.md)。
+
+### 现状
+
+macOS 上已经可用：上面这四件事、`berth list` / `doctor` / `setup-hooks`、zsh 集成、分屏与归档。
+还没有：Linux、打包成 `.app`、bash/fish 集成、滚动历史内搜索。协议带版本号，所以旧 daemon 会被识别出来，
+可以从 GUI 里直接重启。
+
+---
+
+## License · 许可证
+
+MIT OR Apache-2.0 — see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+<!-- Discord badge (add once the server exists):
+[![Discord](https://img.shields.io/discord/<server-id>?label=discord&logo=discord&color=5865F2)](https://discord.gg/<invite>)
+-->
