@@ -38,8 +38,8 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <dict>
     <key>CFBundleInfoDictionaryVersion</key>   <string>6.0</string>
     <key>CFBundlePackageType</key>             <string>APPL</string>
-    <key>CFBundleName</key>                    <string>berth</string>
-    <key>CFBundleDisplayName</key>             <string>berth</string>
+    <key>CFBundleName</key>                    <string>Berth</string>
+    <key>CFBundleDisplayName</key>             <string>Berth</string>
     <key>CFBundleIdentifier</key>              <string>$id</string>
     <key>CFBundleExecutable</key>              <string>berth</string>
     <key>CFBundleIconFile</key>                <string>berth</string>
