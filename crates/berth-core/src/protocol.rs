@@ -13,7 +13,7 @@ use crate::agent::{AgentInfo, HookEnvelope};
 use crate::ids::{SessionId, WorkspaceId};
 use crate::session::{PersistPolicy, SessionMeta, Workspace};
 use crate::snapshot::{CursorState, LineSnapshot, TermModes};
-use crate::style::{Style, StyleId};
+use crate::style::{Style, StyleId, TermColors};
 
 /// Refuse frames larger than this (defensive; a full 100k-line screen fetch is
 /// far below it).
@@ -166,6 +166,13 @@ pub enum Request {
     Unarchive {
         session: SessionId,
     },
+
+    // Added in protocol 4 (appended, see `ListEvents`).
+    /// The colors the GUI paints the grid with. From then on every session
+    /// answers the programs' color queries with them instead of berth-vt's
+    /// built-in scheme (DESIGN §5); the GUI sends them first on every
+    /// connection. Replies `Ok`.
+    SetTermColors(TermColors),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -612,5 +619,45 @@ mod tests {
                 crate::PROTOCOL_VERSION
             );
         }
+    }
+
+    fn light_colors() -> TermColors {
+        TermColors {
+            foreground: [0x1f, 0x23, 0x28],
+            background: [0xff, 0xff, 0xff],
+            cursor: [0x1f, 0x23, 0x28],
+            palette: vec![[0x38, 0x3a, 0x42], [0xc8, 0x4c, 0x40]],
+        }
+    }
+
+    #[test]
+    fn set_term_colors_roundtrips() {
+        let msg = ClientMsg {
+            id: 5,
+            req: Request::SetTermColors(light_colors()),
+        };
+        let back: ClientMsg = decode_payload(&encode_frame(&msg).unwrap()[4..]).unwrap();
+        assert_eq!(msg, back);
+    }
+
+    /// `SetTermColors` comes after the M4 requests, and a protocol 3 berthd
+    /// (M4) decodes requests up to `Unarchive` only: it must be sent as a
+    /// newer protocol, never as protocol 3.
+    #[test]
+    fn set_term_colors_is_appended_and_not_sent_as_protocol_3() {
+        const PROTOCOL_3_LAST_REQUEST: u8 = 27;
+        let first_byte = |r: Request| postcard::to_stdvec(&r).unwrap()[0];
+        let session = SessionId::new();
+        assert_eq!(
+            first_byte(Request::Unarchive { session }),
+            PROTOCOL_3_LAST_REQUEST
+        );
+        let tag = first_byte(Request::SetTermColors(light_colors()));
+        assert_eq!(tag, PROTOCOL_3_LAST_REQUEST + 1);
+        assert!(
+            tag <= PROTOCOL_3_LAST_REQUEST || crate::PROTOCOL_VERSION > 3,
+            "request {tag} is beyond protocol 3 but sent as protocol {}",
+            crate::PROTOCOL_VERSION
+        );
     }
 }

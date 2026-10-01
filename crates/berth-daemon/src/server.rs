@@ -285,5 +285,9 @@ async fn handle_request(mgr: &Arc<Manager>, conn: ConnId, outbox: &Arc<Outbox>, 
         Request::ResumeCommand { session } => done(mgr.resume_command(session)),
         Request::Archive { session } => done(mgr.archive(session).await.map(Event::SessionUpdated)),
         Request::Unarchive { session } => done(mgr.unarchive(session).map(Event::SessionUpdated)),
+        Request::SetTermColors(colors) => {
+            mgr.set_term_colors(colors);
+            send(Event::Ok);
+        }
     }
 }

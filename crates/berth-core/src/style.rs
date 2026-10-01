@@ -19,6 +19,21 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// What a GUI paints the colors a cell does not spell out with
+/// (`Color::Default`, `Color::Indexed`): the theme it draws the grid in.
+/// berthd answers the programs' color queries (OSC 10 / 11 / 12 / 4) with
+/// it, so a program that picks its colors from the terminal's background
+/// sees the window's (`Request::SetTermColors`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TermColors {
+    pub foreground: [u8; 3],
+    pub background: [u8; 3],
+    pub cursor: [u8; 3],
+    /// Palette 0..=255 (0..=15 are the named ANSI colors). Indexes past the
+    /// end keep berth-vt's defaults; entries past 255 are never asked for.
+    pub palette: Vec<[u8; 3]>,
+}
+
 bitflags! {
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
     pub struct CellFlags: u16 {

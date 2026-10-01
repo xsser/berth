@@ -212,6 +212,9 @@ pub(crate) struct Actor {
     persist: PersistPolicy,
     live: Option<Live>,
     term: Option<Terminal>,
+    /// Generation of the GUI's colors `term` answers color queries with
+    /// (`Manager::term_colors_since`; 0: none, a new terminal's state).
+    term_colors_seen: u64,
     prefix: Vec<LineSnapshot>,
     /// Style table of the restored prefix while no terminal exists.
     restored_styles: StyleInterner,
@@ -319,6 +322,7 @@ impl Actor {
             persist: meta.persist,
             live: None,
             term: None,
+            term_colors_seen: 0,
             prefix: Vec::new(),
             restored_styles: StyleInterner::new(),
             subs: Vec::new(),
@@ -403,6 +407,7 @@ impl Actor {
         *term.interner() = interner;
         term.set_clipboard_store_allowed(self.cfg.osc52_store);
         self.term = Some(term);
+        self.term_colors_seen = 0;
         self.live = Some(Live {
             pty,
             pid,
@@ -599,6 +604,7 @@ impl Actor {
                 self.journal = None;
             }
         }
+        self.sync_term_colors();
         let Some(term) = self.term.as_mut() else {
             return;
         };
@@ -619,6 +625,18 @@ impl Actor {
             self.last_activity_signal = Some(now);
             self.mgr.apply_signal(self.id, Signal::OutputActivity);
             self.mgr.touch(self.id);
+        }
+    }
+
+    /// Hand the terminal the GUI's latest colors (`Manager::set_term_colors`)
+    /// before it parses output, which may query them.
+    fn sync_term_colors(&mut self) {
+        let Some(term) = self.term.as_mut() else {
+            return;
+        };
+        if let Some((generation, colors)) = self.mgr.term_colors_since(self.term_colors_seen) {
+            term.set_default_colors(colors);
+            self.term_colors_seen = generation;
         }
     }
 
@@ -1243,8 +1261,15 @@ impl Actor {
     // -- timers ---------------------------------------------------------------
 
     fn on_timers(&mut self, now: Instant) {
-        if let Some(term) = self.term.as_mut() {
-            if term.sync_deadline().is_some_and(|d| d <= now) {
+        let sync_expired = self
+            .term
+            .as_ref()
+            .and_then(Terminal::sync_deadline)
+            .is_some_and(|d| d <= now);
+        if sync_expired {
+            // The output held back is parsed now.
+            self.sync_term_colors();
+            if let Some(term) = self.term.as_mut() {
                 let outcome = term.flush_expired_sync();
                 self.handle_outcome(outcome);
                 self.mark_screen_dirty(now);

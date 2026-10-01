@@ -28,7 +28,8 @@ use alacritty_terminal::term::{
 };
 use alacritty_terminal::vte::ansi::{CursorShape as AnsiCursorShape, Processor, Rgb};
 use berth_core::{
-    CursorShape, CursorState, Dims, LineSnapshot, ScreenSnapshot, StyleInterner, TermModes,
+    CursorShape, CursorState, Dims, LineSnapshot, ScreenSnapshot, StyleInterner, TermColors,
+    TermModes,
 };
 use parking_lot::Mutex;
 
@@ -116,6 +117,9 @@ pub struct Terminal {
     damage_lines: BTreeSet<u16>,
     title: Option<String>,
     allow_clipboard_store: bool,
+    /// The GUI's colors, for color queries the application has not
+    /// answered for itself (see [`Terminal::set_default_colors`]).
+    default_colors: Option<Arc<TermColors>>,
 }
 
 impl fmt::Debug for Terminal {
@@ -162,6 +166,7 @@ impl Terminal {
             damage_lines: BTreeSet::new(),
             title: None,
             allow_clipboard_store: false,
+            default_colors: None,
         }
     }
 
@@ -358,6 +363,14 @@ impl Terminal {
         self.allow_clipboard_store = allowed;
     }
 
+    /// Answer color queries (OSC 4 / 10 / 11 / 12) the application has not
+    /// set a color for with `colors`, the ones the GUI paints the grid
+    /// with. `None` (the default) answers with Alacritty's default scheme,
+    /// which is also what entries missing from `colors.palette` get.
+    pub fn set_default_colors(&mut self, colors: Option<Arc<TermColors>>) {
+        self.default_colors = colors;
+    }
+
     fn end_sync_if_expired(&mut self, now: Instant) -> bool {
         match self.sync_deadline() {
             Some(deadline) if deadline <= now => {
@@ -439,12 +452,18 @@ impl Terminal {
     }
 
     /// Palette entry for a color query: the application's own override if it
-    /// set one (OSC 4/10/11/12), otherwise the default scheme.
+    /// set one (OSC 4/10/11/12), otherwise the GUI's color, otherwise the
+    /// default scheme.
     fn color_for(&self, index: usize) -> Option<Rgb> {
         if index >= COLOR_COUNT {
             return None;
         }
-        self.term.colors()[index].or_else(|| palette::default_color(index))
+        self.term.colors()[index]
+            .or_else(|| {
+                let gui = self.default_colors.as_deref()?;
+                palette::gui_color(gui, index)
+            })
+            .or_else(|| palette::default_color(index))
     }
 }
 
@@ -699,6 +718,53 @@ mod tests {
         assert_eq!(
             pty_writes(&outcome),
             vec!["\x1b]11;rgb:1010/2020/3030\x07".to_string()]
+        );
+    }
+
+    /// With the GUI's colors set, queries are answered from them: here the
+    /// light theme's white background, which is what Codex reads to pick
+    /// its input box. The application's own colors still come first, and
+    /// palette entries the GUI left out keep the default scheme.
+    #[test]
+    fn color_queries_answer_with_the_gui_colors() {
+        let mut t = term(80, 24);
+        t.set_default_colors(Some(Arc::new(TermColors {
+            foreground: [0x1f, 0x23, 0x28],
+            background: [0xff, 0xff, 0xff],
+            cursor: [0x0a, 0x0b, 0x0c],
+            palette: vec![[0x38, 0x3a, 0x42], [0xc8, 0x4c, 0x40]],
+        })));
+        let outcome =
+            t.process(b"\x1b]10;?\x07\x1b]11;?\x07\x1b]12;?\x07\x1b]4;1;?\x07\x1b]4;2;?\x07");
+        assert_eq!(
+            pty_writes(&outcome),
+            vec![
+                "\x1b]10;rgb:1f1f/2323/2828\x07".to_string(),
+                "\x1b]11;rgb:ffff/ffff/ffff\x07".to_string(),
+                "\x1b]12;rgb:0a0a/0b0b/0c0c\x07".to_string(),
+                "\x1b]4;1;rgb:c8c8/4c4c/4040\x07".to_string(),
+                // Past the end of the GUI's palette: Alacritty's green.
+                "\x1b]4;2;rgb:9090/a9a9/5959\x07".to_string(),
+            ]
+        );
+        // The application's own background wins; once it resets it
+        // (OSC 111), the GUI's is back. (Separate chunks: queries are
+        // answered after the chunk that holds them, with its final state.)
+        let outcome = t.process(b"\x1b]11;#102030\x07\x1b]11;?\x07");
+        assert_eq!(
+            pty_writes(&outcome),
+            vec!["\x1b]11;rgb:1010/2020/3030\x07".to_string()]
+        );
+        let outcome = t.process(b"\x1b]111\x07\x1b]11;?\x07");
+        assert_eq!(
+            pty_writes(&outcome),
+            vec!["\x1b]11;rgb:ffff/ffff/ffff\x07".to_string()]
+        );
+        t.set_default_colors(None);
+        let outcome = t.process(b"\x1b]11;?\x07");
+        assert_eq!(
+            pty_writes(&outcome),
+            vec!["\x1b]11;rgb:1818/1818/1818\x07".to_string()]
         );
     }
 

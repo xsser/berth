@@ -16,7 +16,8 @@ use std::time::Duration;
 use berth_core::{
     now_ms, AgentInfo, AgentKind, AgentSignal, AgentState, ClaudeHookEvent, ClientRole, DaemonMsg,
     DaemonStatus, Dims, Event, EventEntry, HookEnvelope, Paths, PersistPolicy, ReviveMode,
-    SessionId, SessionMeta, SessionStatus, StateSource, SubscribeMode, Workspace, WorkspaceId,
+    SessionId, SessionMeta, SessionStatus, StateSource, SubscribeMode, TermColors, Workspace,
+    WorkspaceId,
 };
 use berth_store::{EventRecord, Store};
 use berth_vt::PtySpawn;
@@ -72,6 +73,14 @@ pub struct Manager {
     conns: Mutex<HashMap<ConnId, ConnEntry>>,
     next_conn: AtomicU64,
     stop_tx: watch::Sender<bool>,
+    /// The GUI's colors (`Request::SetTermColors`), which the sessions
+    /// answer the programs' color queries with; `None` until a GUI has sent
+    /// them. `term_colors_gen` counts the changes: a session compares it
+    /// with the one it applied before it parses output
+    /// (`term_colors_since`), so one that starts while they change cannot
+    /// miss the change.
+    term_colors: Mutex<Option<Arc<TermColors>>>,
+    term_colors_gen: AtomicU64,
 }
 
 struct ConnEntry {
@@ -194,6 +203,8 @@ impl Manager {
             conns: Mutex::new(HashMap::new()),
             next_conn: AtomicU64::new(1),
             stop_tx,
+            term_colors: Mutex::new(None),
+            term_colors_gen: AtomicU64::new(0),
         }))
     }
 
@@ -241,6 +252,29 @@ impl Manager {
                 event: event.clone(),
             });
         }
+    }
+
+    // -- terminal colors ------------------------------------------------------
+
+    /// `Request::SetTermColors`: every session answers color queries with
+    /// `colors` from its next output on. The GUI that sent them last wins.
+    pub fn set_term_colors(&self, mut colors: TermColors) {
+        // No query asks for an index past 255.
+        colors.palette.truncate(256);
+        tracing::info!(
+            background = ?colors.background,
+            foreground = ?colors.foreground,
+            "color queries are answered with the GUI's colors"
+        );
+        *self.term_colors.lock() = Some(Arc::new(colors));
+        self.term_colors_gen.fetch_add(1, Ordering::Release);
+    }
+
+    /// The colors to answer with and their generation, when that is not
+    /// `seen` (0: none applied yet).
+    pub(crate) fn term_colors_since(&self, seen: u64) -> Option<(u64, Option<Arc<TermColors>>)> {
+        let generation = self.term_colors_gen.load(Ordering::Acquire);
+        (generation != seen).then(|| (generation, self.term_colors.lock().clone()))
     }
 
     // -- persistence helpers ------------------------------------------------

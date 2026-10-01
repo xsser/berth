@@ -2,12 +2,16 @@
 //! has not overridden itself.
 //!
 //! `alacritty_terminal` leaves unset palette entries to the embedding UI
-//! (`Event::ColorRequest`). The daemon has no theme, so it answers with
-//! Alacritty's built-in default scheme (the `alacritty` crate's
+//! (`Event::ColorRequest`). That UI is the GUI, in another process: it sends
+//! the colors it paints the grid with (`TermColors`, see
+//! `Terminal::set_default_colors`), and [`gui_color`] answers from them.
+//! Until it has, and for any entry it left out, the answer is Alacritty's
+//! built-in default scheme ([`default_color`], the `alacritty` crate's
 //! `config::color` defaults): the 16 ANSI colors below, the xterm 6×6×6 cube
 //! and gray ramp, `#d8d8d8` on `#181818`, and dim colors at 2/3 brightness.
 
 use alacritty_terminal::vte::ansi::{NamedColor, Rgb};
+use berth_core::TermColors;
 
 const fn rgb(r: u8, g: u8, b: u8) -> Rgb {
     Rgb { r, g, b }
@@ -46,6 +50,21 @@ const DIM_BLACK: usize = NamedColor::DimBlack as usize;
 const DIM_WHITE: usize = NamedColor::DimWhite as usize;
 const BRIGHT_FG: usize = NamedColor::BrightForeground as usize;
 const DIM_FG: usize = NamedColor::DimForeground as usize;
+
+/// The GUI's color for an index of `alacritty_terminal::term::color::Colors`,
+/// if it sent one. Programs can ask for the palette (OSC 4) and for the
+/// foreground, background and cursor (OSC 10 / 11 / 12); no other index
+/// reaches a query.
+pub(crate) fn gui_color(colors: &TermColors, index: usize) -> Option<Rgb> {
+    let [r, g, b] = match index {
+        0..=255 => *colors.palette.get(index)?,
+        FG => colors.foreground,
+        BG => colors.background,
+        CURSOR => colors.cursor,
+        _ => return None,
+    };
+    Some(rgb(r, g, b))
+}
 
 /// Default color for an index of `alacritty_terminal::term::color::Colors`
 /// (0..=255 palette, then the named dynamic colors).

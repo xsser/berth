@@ -10,7 +10,7 @@ use berth_core::{
     decode_payload, encode_frame, now_ms, AgentKind, AgentSignal, AgentState, ClaudeHook,
     ClaudeHookEvent, ClientMsg, ClientRole, DaemonMsg, Dims, Event, FrameReader, HookEnvelope,
     LineSnapshot, Paths, Request, ReviveMode, ScreenUpdate, SessionId, SessionMeta, SessionStatus,
-    StateSource, SubscribeMode, Workspace, WorkspaceId, PROTOCOL_VERSION,
+    StateSource, SubscribeMode, TermColors, Workspace, WorkspaceId, PROTOCOL_VERSION,
 };
 use berth_daemon::manager::ARCHIVED_REFUSAL;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -757,6 +757,96 @@ async fn unterminated_synchronized_update_does_not_freeze_the_screen() {
     .await;
     c.screen_until(sid, &mut screen, "after-2", |s| s.has("after-"))
         .await;
+    assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
+    daemon.join().await;
+}
+
+/// Typed into `/bin/sh`: ask the terminal for its foreground and background
+/// (OSC 10 / 11). The answers arrive as input; `dd` reads them raw (two of
+/// 25 bytes) and `tr` prints them with ESC as `E`.
+const COLOR_QUERY: &[u8] = b"old=$(stty -g); stty raw -echo; \
+    printf '\\033]10;?\\033\\\\\\033]11;?\\033\\\\'; \
+    dd bs=1 count=50 2>/dev/null | tr '\\033' E; stty \"$old\"; echo\n";
+
+/// Run `COLOR_QUERY` in `sid` and wait for the answers `fg` and `bg`
+/// (`rrrr/gggg/bbbb`).
+async fn query_colors(
+    c: &mut Client,
+    sid: SessionId,
+    screen: &mut ScreenModel,
+    fg: &str,
+    bg: &str,
+) {
+    c.send(Request::Input {
+        session: sid,
+        data: COLOR_QUERY.to_vec(),
+    })
+    .await;
+    let want = format!("E]10;rgb:{fg}E\\E]11;rgb:{bg}E\\");
+    c.screen_until(sid, screen, &want, |s| {
+        s.rows.values().any(|t| t.contains(&want))
+    })
+    .await;
+}
+
+/// Color queries are answered with the colors the GUI paints the grid with
+/// (`SetTermColors`), not berth-vt's built-in dark scheme. Codex picks its
+/// input box from the OSC 11 answer: told `#181818` under the white light
+/// theme, it drew a dark gray box behind dark text. A shell that was
+/// already running gets the GUI's colors on its next query, a session
+/// started afterwards on its first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn color_queries_are_answered_with_the_guis_colors() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = Paths::in_dir(dir.path());
+    let daemon = start_daemon(&paths);
+    let mut c = Client::connect(&paths.socket).await;
+    let (ws, early) = workspace_and_shell(&mut c, root.path()).await;
+    let mut early_screen = attach(&mut c, early.id).await;
+    let (dark_fg, dark_bg) = ("d8d8/d8d8/d8d8", "1818/1818/1818");
+    query_colors(&mut c, early.id, &mut early_screen, dark_fg, dark_bg).await;
+
+    let light = TermColors {
+        foreground: [0x1f, 0x23, 0x28],
+        background: [0xff, 0xff, 0xff],
+        cursor: [0x1f, 0x23, 0x28],
+        palette: Vec::new(),
+    };
+    assert_eq!(c.request(Request::SetTermColors(light)).await, Event::Ok);
+    let (light_fg, light_bg) = ("1f1f/2323/2828", "ffff/ffff/ffff");
+    query_colors(&mut c, early.id, &mut early_screen, light_fg, light_bg).await;
+
+    let req = Request::CreateSession {
+        workspace: ws,
+        cwd: None,
+        command: Some(vec!["/bin/sh".into()]),
+        title: None,
+        dims: DIMS,
+    };
+    let Event::SessionUpdated(late) = c.request(req).await else {
+        panic!("CreateSession must be answered by SessionUpdated");
+    };
+    let mut late_screen = attach(&mut c, late.id).await;
+    query_colors(&mut c, late.id, &mut late_screen, light_fg, light_bg).await;
+
+    // Reviving gives the session a new terminal, with the same colors
+    // (unchanged since: nothing new for the session to pick up).
+    assert_eq!(
+        c.request(Request::Kill { session: early.id }).await,
+        Event::Ok
+    );
+    exited(&mut c, early.id).await;
+    let revive = Request::Revive {
+        session: early.id,
+        mode: ReviveMode::Shell,
+    };
+    match c.request(revive).await {
+        Event::SessionUpdated(m) => assert_eq!(m.status, SessionStatus::Live),
+        other => panic!("{other:?}"),
+    }
+    let mut revived_screen = attach(&mut c, early.id).await;
+    query_colors(&mut c, early.id, &mut revived_screen, light_fg, light_bg).await;
     assert_eq!(c.request(Request::Shutdown).await, Event::Ok);
     daemon.join().await;
 }

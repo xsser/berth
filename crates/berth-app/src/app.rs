@@ -383,6 +383,7 @@ impl App {
         t0: Instant,
     ) -> Self {
         let mut ctl = Controller::new(config.notify_on.clone());
+        ctl.term_colors = Some(config.theme.term_colors());
         if let Some(want) = &opts.session {
             ctl.want_session(want.clone());
             for (dir, spec) in &opts.splits {
