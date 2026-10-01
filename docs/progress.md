@@ -64,3 +64,15 @@
 - 踩到的坑：侧栏若按「圆角矩形」单独绘制，它的右侧圆角会溢出到分隔线外侧，必须整窗一次成形再统一上超椭圆掩码；超椭圆掩码不要自己写抗锯齿衰减（会鼓包），用硬边掩码交给超采样缩小。
 - 通知身份：打包前借用 `com.apple.Terminal`（未打包的程序不能自报身份）。装好并 `lsregister` 后 `io.github.xsser.berth` 可被 LaunchServices 解析（`osascript -e 'POSIX path of (path to application id ...)'` 返回 `/Applications/Berth.app/`），此时该身份对打包与不打包两种跑法都有效。注意 `dist/` 下的副本也会被注册，同一 bundle id 两份会让解析有歧义，`dist/` 已进 `.gitignore`。
 - 验收注记：`--screenshot` 不触发通知，所以通知身份不能用它验证（身份是首次发通知前才设置的）。改用 LaunchServices 解析作为前置条件的证据，并单独说明「身份已设置」未做端到端验证。
+
+## 2026-10-01
+- 用户报告：berth 里跑 `codex --profile grok`，输入框的底色和字色几乎一样，看不清。
+- 根因在 berthd，不在 Codex 或 grok profile（去掉 profile 里的 `[tui] theme = "ansi"` 对比度不变）：daemon 没有主题，OSC 10/11 一直按 Alacritty 的深色默认值回答（`#d8d8d8` 字 / `#181818` 底，`berth-vt/palette.rs`），而 GUI 默认是白底浅色主题。Codex 0.159.3 启动时以 250 ms 超时查一次 OSC 10/11 并缓存到进程结束，按 `0.299R + 0.587G + 0.114B > 128` 判深浅；判成深色时输入框 = 12% 白叠在背景上 → `#333333`，而输入的字是默认前景，GUI 画成 `#1f2328`：1.25:1。9-27 记下「已知缺口（vt）：OSC 10/11 用默认调色板回答」时默认主题还是深色，9-28 改成浅色默认后它成了真 bug。
+- `fix/osc-theme-colors` 合并到 main：`TermColors` + `Request::SetTermColors`（协议 v4，只追加）；GUI 每次连上 berthd 的第一条请求就是 `[theme]` 生效后的颜色（重连、重启 daemon 后也一样）；daemon 存一份并带代号，session 在解析输出前（含同步更新超时后的 flush）比对代号取用，新 Terminal（create / revive）代号归零；`color_for` = 程序自设 → GUI 颜色 → Alacritty 默认。
+- 测试：e2e 用真实 `/bin/sh`（`stty raw` + `dd` 读回应答）查 OSC 10/11：发颜色前是 `1818`，同一个 shell 发颜色后是 `ffff`，之后新建的 session、Kill + Revive 后的新 Terminal 也是 `ffff`；vt 单测（程序自设优先、OSC 111 复位后回到 GUI 色、调色板缺项回落默认）；协议编号与「不以 v3 发送」；controller「每次连接的第一条」；theme「发出去的就是网格画的」。变异验证 6 条全红（去掉解析前的同步、revive 不归零代号、`color_for` 跳过 GUI 色、不 bump 代号、连接时不发、发错前景）。三道门：fmt 0、`clippy -D warnings` 0、`cargo test --workspace` 连跑 3 轮 504/504。
+- 隔离 A/B（同一 Codex 0.159.3、同一份 grok 配置副本、同样步骤，只换 berth 构建，截图取像素）：旧版输入框 `#333333` 配字 `#1f2328`，1.25:1；修复版 `#f4f4f4` 配 `#1f2328`，14.36:1。
+- 教训：新测试先在正确的代码上跑绿，再做变异。vt 单测第一版把「设色、查询、复位、再查询」写在同一个 chunk 里，两次查询都按 chunk 末尾的状态回答（事件在 `advance` 之后统一 drain，是既有行为），而它在变异轮次里本来就该红，于是没发现它在正确代码上也红，直到全量跑。
+- 验收注记：`--screenshot` 会弹出窗口并抢键盘焦点；用户当时正在别处打字，有字符落进了测试会话（修复版截图末尾多一个 `i`）。不影响颜色结论；用户在场时截图要先说。
+- 已知缺口：GUI 连上之前创建的 session（只有 CLI 做得到）按 Alacritty 默认回答；多个 GUI 以最后发来的为准；daemon 只在内存里记 GUI 的颜色，daemon 重启后要等 GUI 连上；程序用 OSC 10/11 自设的颜色只影响回答，GUI 不画（既有行为）。
+- 部署时发现的既有问题：hooks（`~/.claude/settings.json` 的 18 条、`~/.codex/config.toml` 的 notify 链）调用的是 `~/.local/bin/berth-hook`，那是 9-27 的构建，讲协议 v2；而 9-28 起在跑的是 Berth.app 里 v3 的 berthd，`Hello` 版本不符一律 `Incompatible`。所以从那时起 hook 事件全被拒（三个 claude 会话最近 200 条事件里没有一条 `hook:`，状态全靠 osc133 和启发式），berth-hook 按设计静默失败，不影响 agent 本身。教训：打包成 .app 之后有两处安装位置，协议一升就得两处一起换；`berth doctor` 只查 hook 配置、不查 hook 能否连上，v1.1 可以让它以 hook 的协议版本握手一次。
+- 部署：main 打包为 Berth.app，旧包另存为 zip；`~/.local/bin` 的 berth / berthd / berth-hook 换成同一构建（同目录写临时文件再 `mv`）。berthd 重启后才生效，各 session 里运行的程序会结束，会话以「已恢复」回来。重启由脱离会话的脚本执行（倒计时可取消，失败自动回滚到旧包，报告写 `/tmp/berth-deploy/report.txt`）：退出 GUI，SIGTERM 旧 berthd（先存快照再退出），换包，经 LaunchServices 打开 Berth.app，由它按正常路径拉起新 berthd，再核查 berthd 的 HOME、GUI 发来的颜色和一次 OSC 10/11 探针。不能从 agent 的会话里拉起 berthd：那里的 HOME 与环境变量不是用户的，会话会全部继承下去。
