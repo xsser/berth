@@ -59,7 +59,8 @@ The GUI is a client that attaches to it. Nothing you close kills anything you ca
   keep 3:1, where bright magenta alone fell short. One line of config switches to the old
   dark theme, and any single color — background, foreground, cursor, accent, the sixteen ANSI
   colors — can be replaced on top of either preset. The sidebar, dividers, notices and menus are
-  all derived from it, so nothing is left behind in the other theme.
+  all derived from it, so nothing is left behind in the other theme — and programs that ask the
+  terminal for its colors (OSC 10/11/4; Codex picks its input box that way) are told the same.
 - **GPU rendering.** wgpu + a custom cell grid, egui for the sidebar. Ligature-free monospace
   shaping via cosmic-text, a shared glyph atlas across panes.
 - **Nothing installed behind your back.** `berth setup-hooks claude` prints a JSON diff and writes
@@ -197,7 +198,8 @@ berth 把这两件事拆开：常驻守护进程 `berthd` 持有所有 PTY、终
   不够用，压暗按槽位的用途分两档：正常色 0-7 要承载 `ls`、diff、编译器输出这类正文，按 4.5:1 压暗了
   红、绿、黄、青、白；高亮色 8-15 只用来标记正文，保持 3:1，其中只有亮品红不够。一行配置切回原来的
   深色主题；背景、前景、光标、强调色、16 色 ANSI 也都能在任一预设之上逐键覆盖。侧栏、分隔线、通知条
-  与菜单全部由主题推导，不会有一处还留在另一套配色里。
+  与菜单全部由主题推导，不会有一处还留在另一套配色里；程序向终端查询颜色（OSC 10/11/4，Codex 就靠它
+  给输入框配色）得到的也是同一套。
 - **GPU 渲染。** wgpu 自研单元格网格 + egui 侧栏，cosmic-text 做等宽排版，多个 pane 共享同一份字形图集。
 - **不背着你改任何配置。** `berth setup-hooks claude` 先打印 JSON diff，只有 `--yes` 才写入，并先备份；
   `--undo` 按字节还原。`berth doctor` 全程只读。
