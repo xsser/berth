@@ -28,7 +28,8 @@ pub use style::*;
 /// - 2: M3: `ListEvents` / `ResumeCommand` and their answers,
 ///   `AgentInfo::last_agent`.
 /// - 3: M4: `Archive` / `Unarchive`, `SessionMeta::archived_at_ms`.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// - 4: `SetTermColors` (the GUI's colors, for the programs' color queries).
+pub const PROTOCOL_VERSION: u32 = 4;
 /// On-disk snapshot format version (berth-store's `snapshots/<sid>.bin.zst`,
 /// zstd over postcard). postcard is positional: a field added to a type it
 /// encodes changes the layout.

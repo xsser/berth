@@ -99,6 +99,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
   - 若核实 `vte::ansi::Handler` 已提供未处理 OSC 回调，则改为回调路径，删掉预扫描。
 - **Shell 集成**：仿 Ghostty，zsh 通过 `ZDOTDIR` 垫片注入（bash 用 `--rcfile`，fish 用 `XDG_DATA_DIRS`），只发 OSC 7 / 133。用户可 `shell-integration = none` 关闭。
 - 环境注入：`BERTH_SESSION_ID`、`BERTH_SOCKET`、`TERM=xterm-256color`（terminfo 先复用 xterm，自有 terminfo 放 v2）、`COLORTERM=truecolor`。
+- **颜色查询**（OSC 4 / 10 / 11 / 12）：程序没有自设的颜色，按 GUI 实际绘制的颜色回答。GUI 每次连上 daemon 的第一条请求是 `SetTermColors`（`[theme]` 生效后的前景、背景、光标与 256 色，§8.4）；daemon 存一份并带代号，每个 session 在解析输出前比对代号取用，所以已在运行的、之后新建或 Revive 的 session 都拿得到，恰在此时启动的也不会漏。GUI 发来之前（以及调色板里没给的项）用 Alacritty 的默认配色；多个 GUI 以最后发来的为准。答错的代价：Codex 启动时查一次 OSC 11 判断深浅并据此给输入框配底色，窗口是白底而回答是 `#181818` 时，输入框成了 `#333333` 深灰配 `#1f2328` 深色字（1.25:1）。
 
 ## 6. 持久化（三层）
 
@@ -117,6 +118,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
 
 - 传输：unix socket，帧 = `u32 len` + `postcard(Msg)`；`Hello { role: Gui | Hook | Cli, version }` 版本握手，不兼容即拒绝。
 - 客户端 → daemon：`ListWorkspaces`、`ListSessions`、`CreateWorkspace`、`CreateSession { ws, cwd, cmd }`、`Attach { sid, cols, rows }`、`Detach`、`Resize`、`Input { sid, bytes }`、`FetchLines { sid, range }`、`Subscribe { sid, mode: Full | Preview { rows: 4, hz: 4 } }`、`Kill`、`Revive { sid, mode: Shell | ResumeAgent }`、`MarkRead`、`Rename`、`Move`。
+- 协议 v4（只追加）：`Request::SetTermColors(TermColors)`，GUI 握手后的第一条请求，回 `Ok`（§5 颜色查询）。`PROTOCOL_VERSION = 4`；旧 daemon 照例在 `Hello` 处回 `Incompatible`，走横幅 / `berth debug restart-daemon`。
 - daemon → 客户端：`Sessions(Vec<SessionSummary>)`、`Screen { sid, seq, dirty: Full | Lines(Vec<(row, LineSnapshot)>), cursor, display_offset, modes }`、`Lines { sid, start, lines }`、`AgentChanged { sid, agent }`、`Exited { sid, code }`、`Title`、`Cwd`、`Bell`、`Notify { sid, text }`。
 - hook → daemon：`AgentEvent { berth_sid（来自 env）, kind, event: ClaudeHook(json) | CodexNotify(json) | Statusline(json) }`。
 - 带宽控制：聚焦 session 全分辨率增量（合批 ≤120Hz）；侧栏预览只订阅末尾 N 行、≤4Hz；30 个 session 时总流量 < 200KB/s。
@@ -190,6 +192,7 @@ struct StyleTable { styles: Vec<Style> }        // fg/bg/underline color、flags
   - `ansi` 覆盖 0..=15，必须正好 16 个，否则 warn + 整段忽略；16..=255 仍按 xterm 色立方与灰阶从新的 16 色重建。
   - 颜色写法 `#rgb` / `#rrggbb`，大小写不敏感，`#` 可省。单个值非法**只跳过该键**并 warn（写明键名与原值），同段其余键照常生效；`foreground` 对 `background` 对比度低于 4.5:1 只告警，不改用户的值。
   - 窗口内其他颜色没有第二套配色：侧栏、预览块、分隔线与 pane 边框、通知条、egui 菜单/对话框全部由 `[theme]` 推导，按 `Theme::is_light()`（背景相对亮度 > 0.5）选深/浅两套混色系数。
+  - 程序向终端查询颜色（OSC 4 / 10 / 11 / 12）得到的也是这套 `[theme]`：GUI 每次连上 berthd 都把它发过去（§5）。改了 `[theme]` 重启 GUI 即对之后的查询生效；已在运行、只在启动时查一次的程序（如 Codex）要重开。
 
 ### 8.5 macOS 应用打包
 

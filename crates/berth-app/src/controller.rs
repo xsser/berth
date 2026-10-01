@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use berth_core::{
     AgentKind, DaemonMsg, Dims, Event, EventEntry, LineSnapshot, Request, ReviveMode, ScreenUpdate,
-    SessionId, SessionMeta, StyleTable, SubscribeMode, Workspace, WorkspaceId,
+    SessionId, SessionMeta, StyleTable, SubscribeMode, TermColors, Workspace, WorkspaceId,
 };
 
 use crate::client::Client;
@@ -306,6 +306,10 @@ pub struct Controller {
     auto_created: bool,
     /// Command for new sessions (`None`: the daemon's login shell).
     pub new_session_command: Option<Vec<String>>,
+    /// The colors the window paints the grid with, sent first on every
+    /// connection (`SetTermColors`) so that berthd answers the programs'
+    /// color queries with them. `None`: not sent.
+    pub term_colors: Option<TermColors>,
     counters: Counters,
     recent: HashMap<SessionId, RecentEvents>,
     resume: HashMap<SessionId, ResumeEntry>,
@@ -340,6 +344,7 @@ impl Controller {
             auto_session: true,
             auto_created: false,
             new_session_command: None,
+            term_colors: None,
             counters: Counters::default(),
             recent: HashMap::new(),
             resume: HashMap::new(),
@@ -661,6 +666,11 @@ impl Controller {
         self.resume.clear();
         self.loaded_workspaces = false;
         self.loaded_sessions = false;
+        if let Some(colors) = self.term_colors.clone() {
+            // Ahead of every request that can start a program, which may
+            // ask for them at once (Codex does, and keeps the answer).
+            self.send(out, Request::SetTermColors(colors), None);
+        }
         self.send(out, Request::ListWorkspaces, Some(Awaiting::ListWorkspaces));
         self.send(out, Request::ListSessions, Some(Awaiting::ListSessions));
     }
@@ -3221,6 +3231,35 @@ mod tests {
         assert!(c.notices().iter().any(|n| n.text.contains("gone")));
         let sent = listed(&mut c, &mut out, vec![w], vec![b.clone()]);
         attach_id(&sent, b.id);
+    }
+
+    /// Every connection starts by telling berthd the window's colors, ahead
+    /// of the listing that leads to Attach / CreateSession / Revive: a
+    /// program a session starts may ask for them at once (Codex does, and
+    /// keeps the answer). A restarted berthd knows nothing, so a reconnect
+    /// sends them again.
+    #[test]
+    fn every_connection_starts_with_the_window_colors() {
+        let mut c = Controller::new(vec![]);
+        let colors = crate::theme::Theme::light().term_colors();
+        c.term_colors = Some(colors.clone());
+        let mut out = Fake::default();
+        for _ in 0..2 {
+            c.on_connected(&mut out);
+            let sent = out.take();
+            assert!(
+                matches!(
+                    sent.as_slice(),
+                    [
+                        (_, Request::SetTermColors(first)),
+                        (_, Request::ListWorkspaces),
+                        (_, Request::ListSessions),
+                    ] if *first == colors
+                ),
+                "{sent:?}"
+            );
+            c.on_disconnected("gone");
+        }
     }
 
     #[test]

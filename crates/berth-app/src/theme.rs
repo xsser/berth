@@ -15,7 +15,7 @@
 //! its colors from the resulting [`Theme`], keyed off [`Theme::is_light`]
 //! (sidebar: [`crate::sidebar::Palette`], pane chrome: `app::pane_chrome`).
 
-use berth_core::{CellFlags, Color, Style};
+use berth_core::{CellFlags, Color, Style, TermColors};
 
 pub type Rgb = [u8; 3];
 
@@ -182,6 +182,19 @@ impl Theme {
         }
     }
 
+    /// What the grid paints cells with that do not spell out their colors,
+    /// for berthd to answer the programs' color queries with
+    /// (`Request::SetTermColors`): a program that picks its colors from the
+    /// terminal's background must see this one, not berthd's own default.
+    pub fn term_colors(&self) -> TermColors {
+        TermColors {
+            foreground: self.foreground,
+            background: self.background,
+            cursor: self.cursor,
+            palette: self.palette.to_vec(),
+        }
+    }
+
     pub fn color(&self, c: Color, default: Rgb) -> Rgb {
         match c {
             Color::Default => default,
@@ -333,6 +346,29 @@ mod tests {
         assert_eq!(t.default_accent(), LIGHT_ACCENT);
         assert_eq!(Theme::dark().accent, DARK_ACCENT);
         assert_eq!(Theme::dark().default_accent(), DARK_ACCENT);
+    }
+
+    /// What berthd is told to answer color queries with is what the grid
+    /// paints: a plain cell's foreground and background, the cursor, and
+    /// every palette entry, in both presets.
+    #[test]
+    fn term_colors_are_the_colors_the_grid_paints() {
+        for t in [Theme::light(), Theme::dark()] {
+            let colors = t.term_colors();
+            let plain = t.resolve(&Style::default(), false);
+            assert_eq!(colors.foreground, plain.fg);
+            assert_eq!(colors.background, plain.bg);
+            assert_eq!(colors.cursor, t.cursor);
+            assert_eq!(colors.palette.len(), 256);
+            for i in 0..=255u8 {
+                let cell = Style {
+                    fg: Color::Indexed(i),
+                    ..Default::default()
+                };
+                assert_eq!(colors.palette[usize::from(i)], t.resolve(&cell, false).fg);
+            }
+        }
+        assert_eq!(Theme::light().term_colors().background, [0xff, 0xff, 0xff]);
     }
 
     #[test]
